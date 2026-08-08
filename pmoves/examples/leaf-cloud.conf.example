@@ -1,0 +1,19 @@
+# leaf-cloud.conf — CLOUD leaf node (Hostinger KVM) config example.
+# Separate trust zone from EDGE. Attaches to the hub's 7422 as a CLOUD-account
+# leaf via the cloud-kvm-1 .creds. Scope: mesh.* + egress/exit-node subjects only.
+
+server_name: pmoves-nats-cloud-kvm-1
+port: 4222
+max_payload: 8MB
+
+leafnodes {
+  remotes: [
+    {
+      urls: [ "nats://<Z890_TS_HOST>:7422" ]
+      credentials: "/etc/nats/creds/cloud-kvm-1.creds"
+    }
+  ]
+}
+
+# CORE <-> CLOUD (spec §5): mesh.* + egress/exit-node subjects only. CLOUD does
+# NOT see CORE-private CHIT/tokenism/archon subjects.
