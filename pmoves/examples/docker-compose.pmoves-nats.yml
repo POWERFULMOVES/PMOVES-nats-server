@@ -1,0 +1,41 @@
+# Example compose stanza the PMOVES.AI repo consumes to replace the flag-launched
+# `nats` service with the PMOVES-nats-server hub image (accounts + leaf + JetStream
+# + websocket). File-mounted Docker secrets for trust material (custody per #1901).
+services:
+  nats:
+    build:
+      context: ./PMOVES-nats-server/pmoves
+      dockerfile: Dockerfile
+    image: ghcr.io/powerfulmoves/pmoves-nats:latest
+    container_name: pmoves-nats-1
+    restart: unless-stopped
+    environment:
+      PMOVES_NATS_SERVER_NAME: pmoves-nats-${PMOVES_NODE:-z890}
+    ports:
+      # client 4222 (cross-node) - leaf 7422 (cross-node) - monitoring LOOPBACK - websocket
+      - "${NATS_BIND:-0.0.0.0}:${NATS_PORT:-4222}:4222"
+      - "${NATS_LEAF_BIND:-0.0.0.0}:${NATS_LEAF_PORT:-7422}:7422"
+      - "${NATS_MONITORING_BIND:-127.0.0.1}:${NATS_MONITORING_PORT:-9223}:8222"
+      - "${NATS_WS_BIND:-0.0.0.0}:${NATS_WS_PORT:-8080}:8080"
+    volumes:
+      - pmoves-nats-jetstream:/data/jetstream
+    secrets:
+      - source: nats_resolver_preload
+        target: /etc/nats/resolver_preload.conf
+      - source: nats_core_creds
+        target: /etc/nats/creds/core-service.creds
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8222/varz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  pmoves-nats-jetstream:
+
+secrets:
+  # Rendered by secrets-funnel from the nsc-minted material in the CHIT vault.
+  nats_resolver_preload:
+    file: ${CHIT_VAULT:-./secrets}/nats/resolver_preload.conf
+  nats_core_creds:
+    file: ${CHIT_VAULT:-./secrets}/nats/core-service.creds

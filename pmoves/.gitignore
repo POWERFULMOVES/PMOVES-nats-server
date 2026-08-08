@@ -1,0 +1,7 @@
+# Never commit rendered trust material — only the *.example shapes are tracked.
+# resolver_preload.conf holds the (public) account JWTs but is funnel-rendered
+# per deploy; .creds and nsc seeds are secrets and live in the CHIT vault only.
+resolver_preload.conf
+*.creds
+*.nk
+creds/

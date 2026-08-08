@@ -1,0 +1,32 @@
+# leaf-edge.conf — EDGE leaf node (jetson) config example.
+# Runs a full nats-server on the jetson that attaches UP to the z890 hub's 7422
+# leafnode listener as an EDGE-account leaf. The account binding is carried by
+# the nsc-minted user .creds (edge-nano-1 -> EDGE account) — NOT by a plaintext
+# user/pass, and NOT against the 4222 client port (the historical bug).
+
+server_name: pmoves-nats-edge-nano-1
+port: 4222                 # local client port for on-jetson services
+max_payload: 8MB
+
+# Local JetStream is optional on the edge; enable if the jetson buffers offline.
+# jetstream { store_dir: /data/jetstream, max_file_store: 2GB }
+
+leafnodes {
+  remotes: [
+    {
+      # Hub leafnode port is 7422 (NOT 4222). Refer to the hub by Tailscale
+      # hostname, never a literal IP.
+      urls: [ "nats://<Z890_TS_HOST>:7422" ]
+      # Account binding + auth ride inside the creds (user -> EDGE account JWT).
+      credentials: "/etc/nats/creds/edge-nano-1.creds"
+    }
+  ]
+}
+
+# What EDGE may see/send is set by CORE's export/import matrix (spec §5):
+#   CORE -> EDGE: image.gen.request.v1, prosodic control (voice-suit param surface)
+#   EDGE -> CORE: mesh.gpu.status.v1, voice.stt.edge.v1, image.prompt.expanded.v1,
+#                 image.analysis.v1, mesh.combiner.heartbeat.v1,
+#                 tokenism.prosodic.bpm.v1 (CHIT-signed), chit.cgp.v1
+# CORE-private subjects (chit.*, tokenism.attribution.*, archon.mint.*) are
+# invisible here by construction.
