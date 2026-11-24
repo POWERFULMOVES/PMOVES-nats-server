@@ -5,7 +5,7 @@ the PMOVES treatment: everything good-for-PMOVES turned **on**, wired to the PMO
 CHIT as an orthogonal payload-trust layer. Upstream repo **+** PMOVES **=** POWERFULMOVES.
 
 This `pmoves/` directory is the PMOVES config + packaging. The runtime image is the official
-`nats:2.11-alpine` with our config baked in — the fork exists to carry this config, track upstream
+`nats:2.15.3-alpine` (pinned by digest) with our config baked in — the fork exists to carry this config, track upstream
 for CVE currency (fork-sync discipline), and be the home for any future PMOVES-specific work.
 
 ## What's turned on (`pmoves-nats.conf`)
