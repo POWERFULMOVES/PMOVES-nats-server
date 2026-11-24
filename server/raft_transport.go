@@ -1,4 +1,4 @@
-// Copyright 2026 The NATS Authors
+// Copyright 2026-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -21,6 +21,10 @@ type raftTransport interface {
 
 	// Account returns the NATS Account this transport operates within.
 	Account() *Account
+
+	// SufficientInterest reports whether enough other nodes have subs
+	// for the given subject.
+	SufficientInterest(subject string, qn int) bool
 
 	// Reset reconfigures the transport for a new account.
 	// This involves tearing down existing client resources and
@@ -63,6 +67,20 @@ func (t *defaultTransport) Node() RaftNode {
 
 func (t *defaultTransport) Account() *Account {
 	return t.acc
+}
+
+func (t *defaultTransport) SufficientInterest(subject string, qn int) bool {
+	if t.acc == nil || t.acc.sl == nil {
+		return false
+	}
+	// Gateway interest signifies that the asset is being migrated, so
+	// must always return that we have enough interest to complete.
+	if t.s.hasGatewayInterest(t.acc.Name, subject) {
+		return true
+	}
+	// The Raft node itself owns one subscription for the vote subject.
+	np, _ := t.acc.sl.NumInterest(subject)
+	return np >= qn
 }
 
 func (t *defaultTransport) Reset(acc *Account) {

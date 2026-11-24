@@ -1,4 +1,4 @@
-// Copyright 2012-2025 The NATS Authors
+// Copyright 2012-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -52,6 +52,8 @@ type pubArg struct {
 	psi       []*serviceImport
 	trace     *msgTrace
 	delivered bool // Only used for service imports
+	jsReply   bool // Only used for service imports, the original reply was a JetStream subject
+	respGrant bool // Only used for service imports, only allowed as a response by allow_responses
 }
 
 // Parser constants
@@ -540,7 +542,7 @@ func (c *client) parse(buf []byte) error {
 			c.pa.arg, c.pa.pacache, c.pa.origin, c.pa.account, c.pa.subject, c.pa.mapped = nil, nil, nil, nil, nil, nil
 			c.pa.reply, c.pa.hdr, c.pa.size, c.pa.szb, c.pa.hdb, c.pa.queues = nil, -1, 0, nil, nil, nil
 			c.pa.trace = nil
-			c.pa.delivered = false
+			c.pa.delivered, c.pa.jsReply, c.pa.respGrant = false, false, false
 			lmsg = false
 		case OP_A:
 			switch b {
@@ -691,12 +693,12 @@ func (c *client) parse(buf []byte) error {
 						if trace {
 							c.traceInOp("RS+", arg)
 						}
-						err = c.processRemoteSub(arg, false)
+						err = c.processRemoteSub(arg, false, false)
 					case 'L', 'l':
 						if trace {
 							c.traceInOp("LS+", arg)
 						}
-						err = c.processRemoteSub(arg, true)
+						err = c.processRemoteSub(arg, true, true)
 					}
 				case GATEWAY:
 					if trace {

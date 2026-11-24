@@ -23,7 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net/url"
 	os "os"
 	"path/filepath"
@@ -261,13 +261,13 @@ func TestJetStreamConsumerMultipleConsumersSingleFilter(t *testing.T) {
 		go func(subject string, messages int, wc bool) {
 			nc, js := jsClientConnect(t, s)
 			defer nc.Close()
-			time.Sleep(time.Duration(rand.Int63n(1000)+1) * time.Millisecond)
+			time.Sleep(time.Duration(rand.Int64N(1000)+1) * time.Millisecond)
 			for i := 0; i < messages; i++ {
-				time.Sleep(time.Duration(rand.Int63n(1000)+1) * time.Microsecond)
+				time.Sleep(time.Duration(rand.Int64N(1000)+1) * time.Microsecond)
 				// If subject has wildcard, add random last subject token.
 				pubSubject := subject
 				if wc {
-					pubSubject = fmt.Sprintf("%v.%v", subject, rand.Int63n(10))
+					pubSubject = fmt.Sprintf("%v.%v", subject, rand.Int64N(10))
 				}
 				_, err := js.PublishAsync(pubSubject, []byte("data"))
 				require_NoError(t, err)
@@ -373,13 +373,13 @@ func TestJetStreamConsumerMultipleConsumersMultipleFilters(t *testing.T) {
 		go func(subject string, messages int, wc bool) {
 			nc, js := jsClientConnect(t, s)
 			defer nc.Close()
-			time.Sleep(time.Duration(rand.Int63n(1000)+1) * time.Millisecond)
+			time.Sleep(time.Duration(rand.Int64N(1000)+1) * time.Millisecond)
 			for i := 0; i < messages; i++ {
-				time.Sleep(time.Duration(rand.Int63n(1000)+1) * time.Microsecond)
+				time.Sleep(time.Duration(rand.Int64N(1000)+1) * time.Microsecond)
 				// If subject has wildcard, add random last subject token.
 				pubSubject := subject
 				if wc {
-					pubSubject = fmt.Sprintf("%v.%v", subject, rand.Int63n(10))
+					pubSubject = fmt.Sprintf("%v.%v", subject, rand.Int64N(10))
 				}
 				ack, err := js.PublishAsync(pubSubject, []byte("data"))
 				require_NoError(t, err)
@@ -944,6 +944,36 @@ func TestJetStreamConsumerIsEqualOrSubsetMatch(t *testing.T) {
 			if res := c.isEqualOrSubsetMatch(test.subject); res != test.result {
 				t.Fatalf("Subject %q subset match of %v, should be %v, got %v",
 					test.subject, test.filterSubjects, test.result, res)
+			}
+		})
+	}
+}
+
+func TestJetStreamConsumerIsFilterSubsetOf(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		filterSubjects []string
+		subject        string
+		result         bool
+	}{
+		{"no filter", nil, ">", false},
+		{"single literal equal", []string{"foo.a"}, "foo.a", true},
+		{"single literal mismatch", []string{"foo.a"}, "foo.b", false},
+		{"all literals contained", []string{"foo.a", "foo.b"}, "foo.>", true},
+		{"one literal outside", []string{"foo.a", "bar.a"}, "foo.>", false},
+		{"wildcards contained", []string{"foo.*", "foo.bar.>"}, "foo.>", true},
+		{"filter wider than subject", []string{"foo.>"}, "foo.bar", false},
+		{"rollup matches only one filter", []string{"events.host", "events.periodic"}, "events.periodic", false},
+		{"partial wildcard intersection", []string{"foo.*.bar"}, "foo.baz.>", false},
+		{"partial wildcard intersection short", []string{"*.bar"}, "foo.*", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			c := consumerWithFilterSubjects(test.filterSubjects)
+			if res := c.isFilterSubsetOf(test.subject); res != test.result {
+				t.Fatalf("Filters %v subset of subject %q should be %v, got %v",
+					test.filterSubjects, test.subject, test.result, res)
 			}
 		})
 	}
@@ -3788,7 +3818,12 @@ func TestJetStreamConsumerAckAck(t *testing.T) {
 }
 
 func TestJetStreamConsumerAckV1NameWithPercent(t *testing.T) {
-	s := RunBasicJetStreamServer(t)
+	opts := DefaultTestOptions
+	opts.Port = -1
+	opts.JetStream = true
+	opts.StoreDir = t.TempDir()
+	opts.FeatureFlags = map[string]bool{FeatureFlagJsAckFormatV2: false}
+	s := RunServer(&opts)
 	defer s.Shutdown()
 
 	mname := "TE%ST"
@@ -3835,7 +3870,6 @@ func TestJetStreamConsumerAckV2NameWithPercent(t *testing.T) {
 	opts.JetStream = true
 	opts.JetStreamDomain = "hu%b"
 	opts.StoreDir = t.TempDir()
-	opts.FeatureFlags = map[string]bool{FeatureFlagJsAckFormatV2: true}
 	s := RunServer(&opts)
 	defer s.Shutdown()
 
@@ -4156,9 +4190,15 @@ func TestJetStreamConsumerMaxDeliveryAndServerRestart(t *testing.T) {
 	// Wait for client to be reconnected.
 	waitForClientReconnect()
 
+	// Wait for the third delivery of order-2.
+	checkSubPending(max * 2)
+
 	// Once we are here send third order.
 	sendStreamMsg(t, nc, mname, "order-3")
 	checkNumMsgs(3)
+
+	// Wait for the first delivery of order-3
+	checkSubPending(max*2 + 1)
 
 	// Restart.
 	restartServer()
@@ -4781,7 +4821,7 @@ func TestJetStreamConsumerReplayRate(t *testing.T) {
 				lst = time.Now()
 				nc.Publish("DC", []byte("OK!"))
 				// Calculate a gap between messages.
-				gap := 10*time.Millisecond + time.Duration(rand.Intn(20))*time.Millisecond
+				gap := 10*time.Millisecond + time.Duration(rand.IntN(20))*time.Millisecond
 				time.Sleep(gap)
 			}
 
@@ -4891,7 +4931,7 @@ func TestJetStreamConsumerReplayRateNoAck(t *testing.T) {
 			totalMsgs := 10
 			for i := 0; i < totalMsgs; i++ {
 				nc.Request("DC", []byte("Hello World"), time.Second)
-				time.Sleep(time.Duration(rand.Intn(5)) * time.Millisecond)
+				time.Sleep(time.Duration(rand.IntN(5)) * time.Millisecond)
 			}
 			if state := mset.state(); state.Msgs != uint64(totalMsgs) {
 				t.Fatalf("Expected %d messages, got %d", totalMsgs, state.Msgs)
@@ -4908,7 +4948,7 @@ func TestJetStreamConsumerReplayRateNoAck(t *testing.T) {
 			}
 			defer o.delete()
 			// Sleep a random amount of time.
-			time.Sleep(time.Duration(rand.Intn(20)) * time.Millisecond)
+			time.Sleep(time.Duration(rand.IntN(20)) * time.Millisecond)
 
 			sub, _ := nc.SubscribeSync(subj)
 			nc.Flush()
@@ -7757,6 +7797,116 @@ func TestJetStreamConsumerPurge(t *testing.T) {
 
 }
 
+func TestJetStreamConsumerRollupMultiFilterDoesNotSkip(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:        "TEST",
+		Subjects:    []string{"events.>"},
+		AllowRollup: true,
+	})
+	require_NoError(t, err)
+
+	deliver := nats.NewInbox()
+	sub, err := nc.SubscribeSync(deliver)
+	require_NoError(t, err)
+	defer sub.Unsubscribe()
+	require_NoError(t, nc.Flush())
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:        "consumer",
+		DeliverSubject: deliver,
+		AckPolicy:      nats.AckExplicitPolicy,
+		MaxAckPending:  1,
+		FilterSubjects: []string{"events.host", "events.periodic"},
+	})
+	require_NoError(t, err)
+
+	_, err = js.Publish("events.host", []byte("A"))
+	require_NoError(t, err)
+	msgA, err := sub.NextMsg(time.Second)
+	require_NoError(t, err)
+
+	_, err = js.Publish("events.host", []byte("B"))
+	require_NoError(t, err)
+	rollup := nats.NewMsg("events.periodic")
+	rollup.Header.Set(JSMsgRollup, JSMsgRollupSubject)
+	rollup.Data = []byte("periodic")
+	_, err = js.PublishMsg(rollup)
+	require_NoError(t, err)
+	require_NoError(t, msgA.AckSync())
+
+	msgB, err := sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	metadata, err := msgB.Metadata()
+	require_NoError(t, err)
+	require_Equal(t, metadata.Sequence.Stream, uint64(2))
+	require_Equal(t, string(msgB.Data), "B")
+	require_NoError(t, msgB.AckSync())
+
+	rollupMsg, err := sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	metadata, err = rollupMsg.Metadata()
+	require_NoError(t, err)
+	require_Equal(t, metadata.Sequence.Stream, uint64(3))
+	require_Equal(t, string(rollupMsg.Data), "periodic")
+}
+
+func TestJetStreamConsumerFilteredPurgeMultiFilterDoesNotSkip(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"events.>"},
+	})
+	require_NoError(t, err)
+
+	deliver := nats.NewInbox()
+	sub, err := nc.SubscribeSync(deliver)
+	require_NoError(t, err)
+	defer sub.Unsubscribe()
+	require_NoError(t, nc.Flush())
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:        "consumer",
+		DeliverSubject: deliver,
+		AckPolicy:      nats.AckExplicitPolicy,
+		MaxAckPending:  1,
+		FilterSubjects: []string{"events.host", "events.periodic"},
+	})
+	require_NoError(t, err)
+
+	_, err = js.Publish("events.host", []byte("A"))
+	require_NoError(t, err)
+	msgA, err := sub.NextMsg(time.Second)
+	require_NoError(t, err)
+
+	_, err = js.Publish("events.host", []byte("B"))
+	require_NoError(t, err)
+	_, err = js.Publish("events.periodic", []byte("P"))
+	require_NoError(t, err)
+
+	// Purge removes every message on one of the two filter subjects.
+	require_NoError(t, js.PurgeStream("TEST",
+		&nats.StreamPurgeRequest{Subject: "events.periodic"}))
+	require_NoError(t, msgA.AckSync())
+
+	msgB, err := sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	metadata, err := msgB.Metadata()
+	require_NoError(t, err)
+	require_Equal(t, metadata.Sequence.Stream, uint64(2))
+	require_Equal(t, string(msgB.Data), "B")
+}
+
 func TestJetStreamConsumerFilterUpdate(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
@@ -7809,10 +7959,10 @@ func TestJetStreamConsumerFilterUpdate(t *testing.T) {
 	checkNumFilter := func(expected int) {
 		t.Helper()
 		mset.mu.RLock()
-		nf := mset.numFilter
+		nf := int(mset.csl.Count())
 		mset.mu.RUnlock()
 		if nf != expected {
-			t.Fatalf("Expected stream's numFilter to be %d, got %d", expected, nf)
+			t.Fatalf("Expected stream's filters to be %d, got %d", expected, nf)
 		}
 	}
 
@@ -7826,7 +7976,7 @@ func TestJetStreamConsumerFilterUpdate(t *testing.T) {
 	})
 	require_NoError(t, err)
 
-	// and expect that numFilter reports correctly.
+	// and expect that it reports correctly.
 	checkNumFilter(0)
 }
 
@@ -7875,65 +8025,74 @@ func TestJetStreamConsumerAckFloorWithExpired(t *testing.T) {
 	require_True(t, ci.NumRedelivered == 0)
 }
 
-func TestJetStreamConsumerIsFiltered(t *testing.T) {
+func TestJetStreamConsumerNeedAckFallbackWithFilter(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
-	acc := s.GlobalAccount()
 
-	tests := []struct {
-		name           string
-		streamSubjects []string
-		filters        []string
-		isFiltered     bool
-	}{
-		{
-			name:           "single_subject",
-			streamSubjects: []string{"one"},
-			filters:        []string{"one"},
-			isFiltered:     false,
-		},
-		{
-			name:           "single_subject_filtered",
-			streamSubjects: []string{"one.>"},
-			filters:        []string{"one.filter"},
-			isFiltered:     true,
-		},
-		{
-			name:           "multi_subject_non_filtered",
-			streamSubjects: []string{"multi", "foo", "bar.>"},
-			filters:        []string{"multi", "bar.>", "foo"},
-			isFiltered:     false,
-		},
-		{
-			name:           "multi_subject_filtered_wc",
-			streamSubjects: []string{"events", "data"},
-			filters:        []string{"data"},
-			isFiltered:     true,
-		},
-		{
-			name:           "multi_subject_filtered",
-			streamSubjects: []string{"machines", "floors"},
-			filters:        []string{"machines"},
-			isFiltered:     true,
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			mset, err := acc.addStream(&StreamConfig{
-				Name:     test.name,
-				Subjects: test.streamSubjects,
-			})
-			require_NoError(t, err)
+	mset, err := s.globalAccount().addStream(&StreamConfig{
+		Name:      "TEST",
+		Subjects:  []string{"foo", "bar"},
+		Retention: InterestPolicy,
+	})
+	require_NoError(t, err)
+	o, err := mset.addConsumer(&ConsumerConfig{Durable: "CONSUMER", FilterSubject: "foo", AckPolicy: AckExplicit})
+	require_NoError(t, err)
 
-			o, err := mset.addConsumer(&ConsumerConfig{
-				FilterSubjects: test.filters,
-				Durable:        test.name,
-			})
-			require_NoError(t, err)
+	_, _, err = mset.store.StoreMsg("foo", nil, nil, 0)
+	require_NoError(t, err)
+	_, _, err = mset.store.StoreMsg("bar", nil, nil, 0)
+	require_NoError(t, err)
 
-			require_True(t, o.isFiltered() == test.isFiltered)
-		})
-	}
+	// A follower whose consumer state can't be loaded falls back to its in-memory ack floor.
+	require_NoError(t, o.setLeader(false, 0))
+	require_NoError(t, o.store.Stop())
+
+	// The matching message is still needed, the other one isn't.
+	subj := _EMPTY_
+	require_True(t, o.needAck(1, &subj))
+	subj = _EMPTY_
+	require_False(t, o.needAck(2, &subj))
+}
+
+type subjectForSeqErrStore struct {
+	StreamStore
+	err error
+}
+
+func (s *subjectForSeqErrStore) SubjectForSeq(seq uint64) (string, error) {
+	return _EMPTY_, s.err
+}
+
+func TestJetStreamConsumerNeedAckSubjectLookupError(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	mset, err := s.globalAccount().addStream(&StreamConfig{
+		Name:      "TEST",
+		Subjects:  []string{"foo"},
+		Retention: InterestPolicy,
+	})
+	require_NoError(t, err)
+	o, err := mset.addConsumer(&ConsumerConfig{Durable: "CONSUMER", FilterSubject: "foo", AckPolicy: AckExplicit})
+	require_NoError(t, err)
+
+	_, _, err = mset.store.StoreMsg("foo", nil, nil, 0)
+	require_NoError(t, err)
+
+	es := &subjectForSeqErrStore{StreamStore: mset.store}
+	mset.mu.Lock()
+	mset.store = es
+	mset.mu.Unlock()
+
+	// The message can't be read, so we can't tell if it matches and must keep it.
+	es.err = errors.New("read failed")
+	subj := _EMPTY_
+	require_True(t, o.needAck(1, &subj))
+
+	// The message is gone, so it's not needed.
+	es.err = ErrStoreMsgNotFound
+	subj = _EMPTY_
+	require_False(t, o.needAck(1, &subj))
 }
 
 func TestJetStreamConsumerWithFormattingSymbol(t *testing.T) {
@@ -8262,6 +8421,84 @@ func TestJetStreamConsumerNakThenAckFloorMove(t *testing.T) {
 	require_Equal(t, ci.NumAckPending, 0)
 }
 
+func TestJetStreamConsumerAckAllNakThenAckFloorMove(t *testing.T) {
+	test := func(t *testing.T, replicas int, storage nats.StorageType) {
+		c := createJetStreamClusterExplicit(t, "R3S", 3)
+		defer c.shutdown()
+
+		nc, js := jsClientConnect(t, c.randomServer())
+		defer nc.Close()
+
+		_, err := js.AddStream(&nats.StreamConfig{
+			Name:     "TEST",
+			Subjects: []string{"foo"},
+			Storage:  storage,
+			Replicas: replicas,
+		})
+		require_NoError(t, err)
+
+		for range 3 {
+			js.Publish("foo", []byte("OK"))
+		}
+
+		sub, err := js.PullSubscribe("foo", "CONSUMER", nats.AckAll(), nats.AckWait(time.Second))
+		require_NoError(t, err)
+		defer sub.Drain()
+
+		msgs, err := sub.Fetch(3)
+		require_NoError(t, err)
+		require_Len(t, len(msgs), 3)
+
+		// Nak first one, then grab it again and ack this time.
+		require_NoError(t, msgs[0].Nak())
+		rmsgs, err := sub.Fetch(1)
+		require_NoError(t, err)
+		require_NoError(t, rmsgs[0].AckSync())
+
+		// The floor must stay below the other pending messages.
+		ci, err := sub.ConsumerInfo()
+		require_NoError(t, err)
+		require_Equal(t, ci.Delivered.Consumer, 4)
+		require_Equal(t, ci.Delivered.Stream, 3)
+		require_Equal(t, ci.AckFloor.Consumer, 1)
+		require_Equal(t, ci.AckFloor.Stream, 1)
+		require_Equal(t, ci.NumAckPending, 2)
+
+		// Acking the last one through its first delivery acks all, and collapses
+		// the AckFloor.Consumer with the higher delivered due to re-deliveries.
+		require_NoError(t, msgs[2].AckSync())
+		checkAckFloor := func() {
+			t.Helper()
+			ci, err = sub.ConsumerInfo()
+			require_NoError(t, err)
+			require_Equal(t, ci.AckFloor.Consumer, 4)
+			require_Equal(t, ci.AckFloor.Stream, 3)
+			require_Equal(t, ci.NumAckPending, 0)
+		}
+		checkAckFloor()
+
+		// The new leader must have the same floor in its store.
+		if replicas > 1 {
+			cl := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")
+			require_NoError(t, cl.JetStreamStepdownConsumer(globalAccountName, "TEST", "CONSUMER"))
+			c.waitOnConsumerLeader(globalAccountName, "TEST", "CONSUMER")
+			checkAckFloor()
+		}
+
+		// Nothing must be redelivered.
+		_, err = sub.Fetch(1, nats.MaxWait(1500*time.Millisecond))
+		require_Error(t, err, nats.ErrTimeout)
+	}
+
+	for _, replicas := range []int{1, 3} {
+		for _, storage := range []nats.StorageType{nats.FileStorage, nats.MemoryStorage} {
+			t.Run(fmt.Sprintf("R%d/%s", replicas, storage), func(t *testing.T) {
+				test(t, replicas, storage)
+			})
+		}
+	}
+}
+
 func TestJetStreamConsumerPauseViaConfig(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
@@ -8484,6 +8721,49 @@ func TestJetStreamConsumerPauseResumeViaEndpoint(t *testing.T) {
 
 	// Ensure the consumer reflects being resumed
 	require_False(t, getConsumerInfo().Paused)
+}
+
+func TestJetStreamConsumerPauseResumeDelivers(t *testing.T) {
+	for _, push := range []bool{false, true} {
+		t.Run(map[bool]string{false: "pull", true: "push"}[push], func(t *testing.T) {
+			s := RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+
+			nc, js := jsClientConnect(t, s)
+			defer nc.Close()
+
+			_, err := js.AddStream(&nats.StreamConfig{
+				Name:     "TEST",
+				Subjects: []string{"foo"},
+			})
+			require_NoError(t, err)
+			_, err = js.Publish("foo", nil)
+			require_NoError(t, err)
+
+			sub, err := nc.SubscribeSync(nats.NewInbox())
+			require_NoError(t, err)
+			deadline := time.Now().Add(time.Hour)
+			cc := ConsumerConfig{Name: "CONSUMER", AckPolicy: AckExplicit, PauseUntil: &deadline}
+			if push {
+				cc.DeliverSubject = sub.Subject
+			}
+			jsTestPause_CreateOrUpdateConsumer(t, nc, ActionCreate, "TEST", cc)
+			if !push {
+				req, err := json.Marshal(&JSApiConsumerGetNextRequest{Batch: 1, Expires: 10 * time.Second})
+				require_NoError(t, err)
+				require_NoError(t, nc.PublishRequest(fmt.Sprintf(JSApiRequestNextT, "TEST", "CONSUMER"), sub.Subject, req))
+			}
+			_, err = sub.NextMsg(250 * time.Millisecond)
+			require_Error(t, err, nats.ErrTimeout)
+
+			// Nothing is published after the resume, so only the resume
+			// itself can get the pending message delivered.
+			jsTestPause_PauseConsumer(t, nc, "TEST", "CONSUMER", time.Time{})
+			msg, err := sub.NextMsg(2 * time.Second)
+			require_NoError(t, err)
+			require_Equal(t, msg.Header.Get("Status"), "")
+		})
+	}
 }
 
 func TestJetStreamConsumerPauseMetadataRace(t *testing.T) {
@@ -9972,6 +10252,95 @@ func TestJetStreamConsumerPullTimeout(t *testing.T) {
 	})
 }
 
+func TestJetStreamConsumerReplicatedPullStatusOrder(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name: "TEST", Replicas: 3, Storage: nats.MemoryStorage,
+	})
+	require_NoError(t, err)
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable: "C", Replicas: 3, AckPolicy: nats.AckExplicitPolicy,
+	})
+	require_NoError(t, err)
+	data := bytes.Repeat([]byte("x"), 200)
+	for i := 0; i < 3; i++ {
+		_, err := js.Publish("TEST", data)
+		require_NoError(t, err)
+	}
+
+	cl := c.consumerLeader(globalAccountName, "TEST", "C")
+	mset, err := cl.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	o := mset.lookupConsumer("C")
+	require_NotNil(t, o)
+
+	for _, test := range []struct {
+		description string
+		status      string
+		batch       int
+		maxBytes    int
+		noWait      bool
+		expires     time.Duration
+	}{
+		{"Batch Completed", "409", 1, 10_000, true, 2 * time.Second},
+		{"Message Size Exceeds MaxBytes", "409", 10, 300, true, 2 * time.Second},
+		{"Request Timeout", "408", 2, 0, false, 200 * time.Millisecond},
+	} {
+		t.Run(test.description, func(t *testing.T) {
+			reply := nc.NewInbox()
+			sub, err := nc.SubscribeSync(reply)
+			require_NoError(t, err)
+			defer sub.Unsubscribe()
+
+			req, err := json.Marshal(JSApiConsumerGetNextRequest{
+				Batch: test.batch, MaxBytes: test.maxBytes, Expires: test.expires, NoWait: test.noWait,
+			})
+			require_NoError(t, err)
+
+			o.mu.Lock()
+			o.switching = true
+			o.mu.Unlock()
+			resumeProposals := func() {
+				o.mu.Lock()
+				defer o.mu.Unlock()
+				o.switching = false
+				select {
+				case o.pch <- struct{}{}:
+				default:
+				}
+			}
+			defer resumeProposals()
+
+			require_NoError(t, nc.PublishRequest(fmt.Sprintf(JSApiRequestNextT, "TEST", "C"), reply, req))
+
+			checkFor(t, time.Second, 10*time.Millisecond, func() error {
+				o.mu.RLock()
+				defer o.mu.RUnlock()
+				if o.waitingDeliveries[reply] == nil || o.waiting.len() != 0 {
+					return errors.New("pull request has not finished queueing")
+				}
+				return nil
+			})
+			_, err = sub.NextMsg(100 * time.Millisecond)
+			require_Error(t, err, nats.ErrTimeout)
+
+			resumeProposals()
+			msg, err := sub.NextMsg(time.Second)
+			require_NoError(t, err)
+			require_Equal(t, msg.Header.Get("Description"), "")
+			require_Equal(t, string(msg.Data), string(data))
+			status, err := sub.NextMsg(time.Second)
+			require_NoError(t, err)
+			require_Equal(t, status.Header.Get("Status"), test.status)
+			require_Equal(t, status.Header.Get("Description"), test.description)
+		})
+	}
+}
+
 func TestJetStreamConsumerPullMaxBytes(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
@@ -10332,6 +10701,17 @@ func TestJetStreamConsumerPullNoWaitBatchLargerThanPending(t *testing.T) {
 			_, err := js.Publish("foo", []byte("OK"))
 			require_NoError(t, err)
 		}
+		// Replication is async, so wait for the consumer to show them as pending.
+		checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+			ci, err := js.ConsumerInfo("TEST", "C")
+			if err != nil {
+				return err
+			}
+			if ci.NumPending != 5 {
+				return fmt.Errorf("expected 5 pending, got %d", ci.NumPending)
+			}
+			return nil
+		})
 
 		sub := sendRequest(t, nc, "rply", req)
 		defer sub.Unsubscribe()
@@ -10485,6 +10865,153 @@ func TestJetStreamConsumerNotInactiveDuringAckWaitBackoff(t *testing.T) {
 
 	t.Run("R1", func(t *testing.T) { test(t, 1) })
 	t.Run("R3", func(t *testing.T) { test(t, 3) })
+}
+
+func TestJetStreamConsumerNotInactiveAfterPullRequestExpires(t *testing.T) {
+	test := func(t *testing.T, replicas int) {
+		c := createJetStreamClusterExplicit(t, "R3S", 3)
+		defer c.shutdown()
+
+		nc, js := jsClientConnect(t, c.randomServer())
+		defer nc.Close()
+
+		_, err := js.AddStream(&nats.StreamConfig{
+			Name:     "TEST",
+			Subjects: []string{"foo"},
+			Replicas: replicas,
+		})
+		require_NoError(t, err)
+
+		inactiveThreshold := time.Second
+		_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+			Durable:           "CONSUMER",
+			AckPolicy:         nats.AckExplicitPolicy,
+			Replicas:          replicas,
+			InactiveThreshold: inactiveThreshold, // Pull mode adds up to 1 second randomly.
+		})
+		require_NoError(t, err)
+
+		// Send a pull request that expires right around the inactive threshold.
+		inbox := nats.NewInbox()
+		sub, err := nc.SubscribeSync(inbox)
+		require_NoError(t, err)
+		defer sub.Unsubscribe()
+
+		req := fmt.Sprintf(`{"batch":1,"expires":%d}`, inactiveThreshold.Nanoseconds())
+		require_NoError(t, nc.PublishRequest(fmt.Sprintf(JSApiRequestNextT, "TEST", "CONSUMER"), inbox, []byte(req)))
+
+		// Wait for the request to time out.
+		msg, err := sub.NextMsg(5 * time.Second)
+		require_NoError(t, err)
+		require_Equal(t, msg.Header.Get("Status"), "408")
+		expired := time.Now()
+
+		// The expired pull request should count as activity, so the consumer
+		// should only be deleted after (at least) the inactive threshold has
+		// passed since the request expired.
+		deleted := false
+		for time.Since(expired) < 4*time.Second {
+			if _, err = js.ConsumerInfo("TEST", "CONSUMER"); err != nil {
+				require_Error(t, err, nats.ErrConsumerNotFound)
+				deleted = true
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		require_True(t, deleted)
+		if since := time.Since(expired); since < inactiveThreshold {
+			t.Fatalf("consumer was deleted %v after the pull request expired, expected at least %v", since, inactiveThreshold)
+		}
+	}
+
+	t.Run("R1", func(t *testing.T) { test(t, 1) })
+	t.Run("R3", func(t *testing.T) { test(t, 3) })
+}
+
+func TestJetStreamConsumerNotInactiveAfterPullRequestExpiresInNextWaiting(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+	})
+	require_NoError(t, err)
+
+	inactiveThreshold := time.Second
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:           "CONSUMER",
+		AckPolicy:         nats.AckExplicitPolicy,
+		InactiveThreshold: inactiveThreshold, // Pull mode adds up to 1 second randomly.
+	})
+	require_NoError(t, err)
+
+	mset, err := s.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	o := mset.lookupConsumer("CONSUMER")
+	require_NotNil(t, o)
+
+	// Send a pull request with a long expiry, so the expiry timer doesn't race with us.
+	inbox := nats.NewInbox()
+	sub, err := nc.SubscribeSync(inbox)
+	require_NoError(t, err)
+	defer sub.Unsubscribe()
+
+	req := fmt.Sprintf(`{"batch":1,"expires":%d}`, (10 * time.Second).Nanoseconds())
+	require_NoError(t, nc.PublishRequest(fmt.Sprintf(JSApiRequestNextT, "TEST", "CONSUMER"), inbox, []byte(req)))
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+		o.mu.RLock()
+		defer o.mu.RUnlock()
+		if o.waiting.len() != 1 {
+			return fmt.Errorf("expected 1 waiting request, got %d", o.waiting.len())
+		}
+		return nil
+	})
+
+	// Let some time pass since the request was received, so that we can distinguish
+	// between the request time and the expiry time being used as last activity.
+	time.Sleep(500 * time.Millisecond)
+
+	// A message wake-up that finds the request expired times it out in nextWaiting,
+	// rather than in processWaiting. Simulate that by backdating the expiry.
+	o.mu.Lock()
+	wr := o.waiting.peek()
+	require_NotNil(t, wr)
+	received := wr.received
+	expires := time.Now()
+	wr.expires = expires
+	require_True(t, o.nextWaiting(0) == nil)
+	require_True(t, o.waiting.isEmpty())
+	last, dthresh := o.waiting.last, o.dthresh
+	o.mu.Unlock()
+
+	// The client should have received the timeout.
+	msg, err := sub.NextMsg(2 * time.Second)
+	require_NoError(t, err)
+	require_Equal(t, msg.Header.Get("Status"), "408")
+
+	// The expiry should have been registered as last activity, not the received time.
+	require_True(t, last.After(received))
+	require_Equal(t, last, expires)
+
+	// The consumer should only be deleted after (at least) the inactive threshold
+	// has passed since the request expired.
+	deleted := false
+	for time.Since(expires) < dthresh+2*time.Second {
+		if _, err = js.ConsumerInfo("TEST", "CONSUMER"); err != nil {
+			require_Error(t, err, nats.ErrConsumerNotFound)
+			deleted = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	require_True(t, deleted)
+	if since := time.Since(expires); since < dthresh {
+		t.Fatalf("consumer was deleted %v after the pull request expired, expected at least %v", since, dthresh)
+	}
 }
 
 func TestSortingConsumerPullRequests(t *testing.T) {
@@ -10922,6 +11449,111 @@ func TestJetStreamConsumerMaxDeliverUnderflow(t *testing.T) {
 	require_Equal(t, maxdc, 0)
 }
 
+func TestJetStreamConsumerMaxDeliverAdvisoryWithoutAnotherPull(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}})
+	require_NoError(t, err)
+	_, err = js.Publish("foo", nil)
+	require_NoError(t, err)
+
+	const maxDeliver = 3
+	sub, err := js.PullSubscribe("foo", "C", nats.BindStream("TEST"), nats.MaxDeliver(maxDeliver), nats.AckWait(50*time.Millisecond))
+	require_NoError(t, err)
+	advisories := natsSubSync(t, nc, JSAdvisoryConsumerMaxDeliveryExceedPre+".TEST.C")
+
+	fetchMsgs(t, sub, maxDeliver, 2*time.Second)
+	msg := natsNexMsg(t, advisories, 2*time.Second)
+	var adv JSConsumerDeliveryExceededAdvisory
+	require_NoError(t, json.Unmarshal(msg.Data, &adv))
+	require_Equal(t, adv.Deliveries, uint64(maxDeliver))
+
+	info, err := sub.ConsumerInfo()
+	require_NoError(t, err)
+	require_Equal(t, info.NumAckPending, 0)
+}
+
+func TestJetStreamConsumerMaxDeliverAdvisoryCount(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}})
+	require_NoError(t, err)
+	_, err = js.Publish("foo", nil)
+	require_NoError(t, err)
+
+	deliveries := make(chan uint64, 1)
+	advSub, err := nc.Subscribe(
+		fmt.Sprintf("%s.TEST.CONSUMER", JSAdvisoryConsumerMaxDeliveryExceedPre),
+		func(m *nats.Msg) {
+			var adv JSConsumerDeliveryExceededAdvisory
+			if json.Unmarshal(m.Data, &adv) == nil {
+				deliveries <- adv.Deliveries
+			}
+		})
+	require_NoError(t, err)
+	defer advSub.Unsubscribe()
+	require_NoError(t, nc.Flush())
+
+	cfg := &nats.ConsumerConfig{
+		Durable:    "CONSUMER",
+		AckPolicy:  nats.AckExplicitPolicy,
+		AckWait:    30 * time.Second,
+		MaxDeliver: -1,
+	}
+	_, err = js.AddConsumer("TEST", cfg)
+	require_NoError(t, err)
+
+	sub, err := js.PullSubscribe("foo", "CONSUMER", nats.BindStream("TEST"))
+	require_NoError(t, err)
+	defer sub.Drain()
+
+	// Deliver the message three times: two NAK rounds plus a final delivery left
+	// pending, so it has been delivered 3 times.
+	for i := 0; i < 2; i++ {
+		msgs, err := sub.Fetch(1, nats.MaxWait(time.Second))
+		require_NoError(t, err)
+		require_Len(t, len(msgs), 1)
+		require_NoError(t, msgs[0].Nak())
+	}
+	msgs, err := sub.Fetch(1, nats.MaxWait(time.Second))
+	require_NoError(t, err)
+	require_Len(t, len(msgs), 1)
+	meta, err := msgs[0].Metadata()
+	require_NoError(t, err)
+	sseq := meta.Sequence.Stream
+
+	// Lower MaxDeliver below the number of deliveries made, then drive the AckWait
+	// expiry path (hasMaxDeliveries) directly.
+	cfg.MaxDeliver = 1
+	_, err = js.UpdateConsumer("TEST", cfg)
+	require_NoError(t, err)
+
+	mset, err := s.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	o := mset.lookupConsumer("CONSUMER")
+	require_NotNil(t, o)
+
+	o.mu.Lock()
+	exceeded := o.hasMaxDeliveries(sseq)
+	o.mu.Unlock()
+	require_True(t, exceeded)
+
+	select {
+	case dc := <-deliveries:
+		require_Equal(t, dc, uint64(3))
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the delivery exceeded advisory")
+	}
+}
+
 // https://github.com/nats-io/nats-server/issues/7457
 func TestJetStreamConsumerNoWaitNoMessagesOnEos(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
@@ -10954,7 +11586,7 @@ func TestJetStreamConsumerNoWaitNoMessagesOnEos(t *testing.T) {
 	req := &JSApiConsumerGetNextRequest{NoWait: true}
 	jreq, err := json.Marshal(req)
 	require_NoError(t, err)
-	o.processNextMsgRequest("reply", jreq)
+	o.processNextMsgRequest("reply", jreq, nil)
 
 	msg, err := sub.NextMsg(time.Second)
 	require_NoError(t, err)
@@ -10991,7 +11623,7 @@ func TestJetStreamConsumerNoWaitNoMessagesOnEosWithDeliveredMsgs(t *testing.T) {
 	req := &JSApiConsumerGetNextRequest{NoWait: true, Batch: 2}
 	jreq, err := json.Marshal(req)
 	require_NoError(t, err)
-	o.processNextMsgRequest("reply", jreq)
+	o.processNextMsgRequest("reply", jreq, nil)
 
 	msg, err := sub.NextMsg(time.Second)
 	require_NoError(t, err)
@@ -11240,6 +11872,16 @@ func TestJetStreamConsumerCheckNumPending(t *testing.T) {
 	o := mset.lookupConsumer("DURABLE")
 	require_NotNil(t, o)
 
+	// Wait for the consumer to see all 5 messages
+	checkFor(t, time.Second, time.Millisecond, func() error {
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		if np := o.numPending(); np != 5 {
+			return fmt.Errorf("pending: %d, want 5", np)
+		}
+		return nil
+	})
+
 	// Initial state should point to the first message, with all 5 pending.
 	o.mu.Lock()
 	sseq, np := o.sseq, o.numPending()
@@ -11345,7 +11987,7 @@ func TestJetStreamConsumerAllowOverlappingSubjectsIfNotSubset(t *testing.T) {
 }
 
 func TestJetStreamConsumerResetToSequence(t *testing.T) {
-	test := func(replicas int) {
+	test := func(replicas int, ackPolicy AckPolicy) {
 		c := createJetStreamClusterExplicit(t, "R3S", 3)
 		defer c.shutdown()
 
@@ -11360,8 +12002,18 @@ func TestJetStreamConsumerResetToSequence(t *testing.T) {
 		_, err := js.AddStream(cfg)
 		require_NoError(t, err)
 
+		var ackOpt nats.SubOpt
+		switch ackPolicy {
+		case AckExplicit:
+			ackOpt = nats.AckExplicit()
+		case AckAll:
+			ackOpt = nats.AckAll()
+		default:
+			t.Fatalf("unsupported ack policy for this test: %v", ackPolicy)
+		}
 		sub, err := js.PullSubscribe(_EMPTY_, "CONSUMER",
 			nats.BindStream("TEST"),
+			ackOpt,
 			nats.MaxAckPending(1),
 			nats.AckWait(time.Second),
 			nats.ConsumerReplicas(replicas),
@@ -11448,6 +12100,12 @@ func TestJetStreamConsumerResetToSequence(t *testing.T) {
 			dseq: 2, adflr: 1,
 			sseq: 2, asflr: 1,
 		})
+		// Confirm the initial pending values.
+		o.mu.RLock()
+		npc, npf := o.npc, o.npf
+		o.mu.RUnlock()
+		require_Equal(t, npc, 2)
+		require_Equal(t, npf, 0)
 
 		// Resetting the consumer with an empty request results in a reset back to the ack floor.
 		var resp JSApiConsumerResetResponse
@@ -11468,6 +12126,17 @@ func TestJetStreamConsumerResetToSequence(t *testing.T) {
 			dseq: 0, adflr: 0,
 			sseq: 1, asflr: 1,
 		})
+		// AckAll can use the ack-floor fast path and leaves the floor as-is;
+		// AckExplicit always requires full recalculation here.
+		o.mu.RLock()
+		npc, npf = o.npc, o.npf
+		o.mu.RUnlock()
+		require_Equal(t, npc, 3)
+		if ackPolicy == AckAll {
+			require_Equal(t, npf, 0)
+		} else {
+			require_Equal(t, npf, 4)
+		}
 
 		// Trying to reset to zero also resets back to the ack floor.
 		req := JSApiConsumerResetRequest{Seq: 0}
@@ -11490,6 +12159,16 @@ func TestJetStreamConsumerResetToSequence(t *testing.T) {
 			dseq: 0, adflr: 0,
 			sseq: 1, asflr: 1,
 		})
+		// Same as above.
+		o.mu.RLock()
+		npc, npf = o.npc, o.npf
+		o.mu.RUnlock()
+		require_Equal(t, npc, 3)
+		if ackPolicy == AckAll {
+			require_Equal(t, npf, 0)
+		} else {
+			require_Equal(t, npf, 4)
+		}
 
 		// Resetting the consumer to the last message's sequence so it can be delivered still.
 		req = JSApiConsumerResetRequest{Seq: 4}
@@ -11513,6 +12192,12 @@ func TestJetStreamConsumerResetToSequence(t *testing.T) {
 			dseq: 0, adflr: 0,
 			sseq: 3, asflr: 3,
 		})
+		// Confirm pending was recalculated.
+		o.mu.RLock()
+		npc, npf = o.npc, o.npf
+		o.mu.RUnlock()
+		require_Equal(t, npc, 1)
+		require_Equal(t, npf, 4)
 
 		// As a result of moving the starting sequence up, some messages
 		// have now lost interest and need to be removed.
@@ -11562,9 +12247,11 @@ func TestJetStreamConsumerResetToSequence(t *testing.T) {
 	}
 
 	for _, replicas := range []int{1, 3} {
-		t.Run(fmt.Sprintf("R%d", replicas), func(t *testing.T) {
-			test(replicas)
-		})
+		for _, ackPolicy := range []AckPolicy{AckExplicit, AckAll} {
+			t.Run(fmt.Sprintf("R%d/%s", replicas, ackPolicy), func(t *testing.T) {
+				test(replicas, ackPolicy)
+			})
+		}
 	}
 }
 
@@ -12081,8 +12768,17 @@ func TestJetStreamConsumerAckFlowControlBasics(t *testing.T) {
 		require_Error(t, err, NewJSConsumerAckFCRequiresFCError())
 
 		cfg.FlowControl = true
+		hbErr := NewJSStreamInvalidConfigError(fmt.Errorf("flow control ack policy heartbeat needs to be between 1s and 1m0s"))
 		_, err = jsConsumerCreate(t, nc, "TEST", cfg, true)
-		require_Error(t, err, NewJSStreamInvalidConfigError(fmt.Errorf("flow control ack policy heartbeat needs to be 1s")))
+		require_Error(t, err, hbErr)
+
+		cfg.Heartbeat = 500 * time.Millisecond
+		_, err = jsConsumerCreate(t, nc, "TEST", cfg, true)
+		require_Error(t, err, hbErr)
+
+		cfg.Heartbeat = time.Minute + time.Second
+		_, err = jsConsumerCreate(t, nc, "TEST", cfg, true)
+		require_Error(t, err, hbErr)
 
 		cfg.Heartbeat = time.Second
 		_, err = jsConsumerCreate(t, nc, "TEST", cfg, true)
@@ -12112,6 +12808,176 @@ func TestJetStreamConsumerAckFlowControlBasics(t *testing.T) {
 		t.Run(fmt.Sprintf("R%d", replicas), func(t *testing.T) {
 			test(replicas)
 		})
+	}
+}
+
+func TestJetStreamConsumerAckFlowControlEndOfBurst(t *testing.T) {
+	test := func(t *testing.T, eosDelay time.Duration) {
+		old := ackFlowControlEOSDelay
+		ackFlowControlEOSDelay = eosDelay
+		defer func() { ackFlowControlEOSDelay = old }()
+
+		s := RunBasicJetStreamServer(t)
+		defer s.Shutdown()
+
+		nc, js := jsClientConnect(t, s)
+		defer nc.Close()
+
+		_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}})
+		require_NoError(t, err)
+
+		sub, err := nc.SubscribeSync("deliver")
+		require_NoError(t, err)
+		defer sub.Unsubscribe()
+		require_NoError(t, nc.Flush())
+
+		_, err = jsConsumerCreate(t, nc, "TEST", ConsumerConfig{
+			Durable:        "CONSUMER",
+			DeliverSubject: "deliver",
+			AckPolicy:      AckFlowControl,
+		}, false)
+		require_NoError(t, err)
+
+		for range 3 {
+			_, err = js.Publish("foo", nil)
+			require_NoError(t, err)
+		}
+		for range 3 {
+			msg, err := sub.NextMsg(time.Second)
+			require_NoError(t, err)
+			require_Equal(t, msg.Header.Get("Status"), _EMPTY_)
+		}
+
+		next := func() *nats.Msg {
+			t.Helper()
+			msg, err := sub.NextMsg(2 * time.Second)
+			require_NoError(t, err)
+			require_Equal(t, msg.Header.Get("Status"), "100")
+			return msg
+		}
+
+		var fc *nats.Msg
+		if eosDelay >= time.Second {
+			// The idle heartbeat sends the flow control, so must not report being stalled on it.
+			msg := next()
+			require_Equal(t, msg.Header.Get("Description"), "Idle Heartbeat")
+			require_Equal(t, msg.Header.Get(JSConsumerStalled), _EMPTY_)
+			fc = next()
+			require_Equal(t, fc.Header.Get("Description"), "FlowControl Request")
+		} else {
+			// Flow control is sent before the idle heartbeat, and we don't reply to it yet.
+			fc = next()
+			require_Equal(t, fc.Header.Get("Description"), "FlowControl Request")
+			start := time.Now()
+
+			// Only a full heartbeat later we should be reported as stalled.
+			msg := next()
+			require_Equal(t, msg.Header.Get("Description"), "Idle Heartbeat")
+			require_Equal(t, msg.Header.Get(JSConsumerStalled), fc.Reply)
+			if elapsed := time.Since(start); elapsed < 800*time.Millisecond {
+				t.Fatalf("Expected stalled heartbeat a full interval after flow control, got %v", elapsed)
+			}
+		}
+
+		// Replying to the flow control acknowledges the burst.
+		reply := nats.NewMsg(fc.Reply)
+		reply.Header.Set(JSLastConsumerSeq, "3")
+		reply.Header.Set(JSLastStreamSeq, "3")
+		require_NoError(t, nc.PublishMsg(reply))
+
+		mset, err := s.globalAccount().lookupStream("TEST")
+		require_NoError(t, err)
+		o := mset.lookupConsumer("CONSUMER")
+		require_NotNil(t, o)
+		checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+			ci := o.info()
+			if ci.AckFloor.Stream != 3 || ci.NumAckPending != 0 {
+				return fmt.Errorf("expected ack floor 3 and no pending, got %d and %d", ci.AckFloor.Stream, ci.NumAckPending)
+			}
+			return nil
+		})
+	}
+
+	t.Run("Default", func(t *testing.T) { test(t, time.Second) })
+	t.Run("BeforeHeartbeat", func(t *testing.T) { test(t, 600*time.Millisecond) })
+}
+
+func TestJetStreamDurableStreamSourceHeartbeat(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := jsStreamCreate(t, nc, &StreamConfig{Name: "O", Subjects: []string{"foo"}, Storage: FileStorage})
+	require_NoError(t, err)
+
+	hb := 20 * time.Second
+	for _, name := range []string{"M", "S"} {
+		ci, err := jsConsumerCreate(t, nc, "O", ConsumerConfig{
+			Durable:        name,
+			DeliverSubject: fmt.Sprintf("deliver.%s", name),
+			AckPolicy:      AckFlowControl,
+			Heartbeat:      hb,
+		}, false)
+		require_NoError(t, err)
+		require_Equal(t, ci.Heartbeat, hb)
+	}
+
+	_, err = js.Publish("foo", nil)
+	require_NoError(t, err)
+
+	_, err = jsStreamCreate(t, nc, &StreamConfig{
+		Name:    "M",
+		Mirror:  &StreamSource{Name: "O", Consumer: &StreamConsumerSource{Name: "M", DeliverSubject: "deliver.M"}},
+		Storage: FileStorage,
+	})
+	require_NoError(t, err)
+	_, err = jsStreamCreate(t, nc, &StreamConfig{
+		Name:    "S",
+		Sources: []*StreamSource{{Name: "O", Consumer: &StreamConsumerSource{Name: "S", DeliverSubject: "deliver.S"}}},
+		Storage: FileStorage,
+	})
+	require_NoError(t, err)
+
+	// Wait for the first message to have been sourced.
+	for _, stream := range []string{"M", "S"} {
+		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+			_, err := js.GetMsg(stream, 1)
+			return err
+		})
+	}
+
+	acc := s.globalAccount()
+	mirror, err := acc.lookupStream("M")
+	require_NoError(t, err)
+	source, err := acc.lookupStream("S")
+	require_NoError(t, err)
+
+	source.mu.RLock()
+	var ssi *sourceInfo
+	for _, si := range source.sources {
+		ssi = si
+	}
+	source.mu.RUnlock()
+	require_NotNil(t, ssi)
+
+	for _, tc := range []struct {
+		mset *stream
+		si   *sourceInfo
+	}{
+		{mirror, mirror.mirror},
+		{source, ssi},
+	} {
+		tc.mset.mu.Lock()
+		require_Equal(t, tc.si.hb, hb)
+		// The stalled threshold is derived from the heartbeat, not the health check interval.
+		tc.si.last.Store(time.Now().Add(-2 * sourceHealthCheckInterval).UnixNano())
+		require_False(t, tc.si.isStalled())
+		tc.si.last.Store(time.Now().Add(-sourceStalledHeartbeats*hb - time.Second).UnixNano())
+		require_True(t, tc.si.isStalled())
+		tc.si.last.Store(time.Now().UnixNano())
+		tc.mset.mu.Unlock()
 	}
 }
 
@@ -12845,6 +13711,103 @@ func TestJetStreamConsumerUpdateConfigStopRace(t *testing.T) {
 }
 
 // Must be run with -race.
+// updateConfig assigns the whole ConsumerConfig under o.mu, while
+// getPublicConsumers/getDirectConsumers used to read o.cfg.Direct holding only
+// mset.clsMu. They read the immutable o.direct now. Real world pairing is
+// jsConsumerCreateRequest (update path) against jsConsumerListRequest.
+func TestJetStreamConsumerConfigDirectRace(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	mset, err := s.globalAccount().addStream(&StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Storage:  MemoryStorage,
+	})
+	require_NoError(t, err)
+
+	o, err := mset.addConsumer(&ConsumerConfig{
+		Durable:   "C",
+		AckPolicy: AckExplicit,
+	})
+	require_NoError(t, err)
+
+	const iters = 500
+	var wg sync.WaitGroup
+	wg.Add(2)
+	start := make(chan struct{})
+
+	// Writer: Description is updatable, and varying it defeats the
+	// DeepEqual early return in checkNewConsumerConfig.
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := range iters {
+			cfg := o.config()
+			cfg.Description = fmt.Sprintf("update-%d", i)
+			_ = o.updateConfig(&cfg)
+		}
+	}()
+
+	// Reader: walks cList without taking the consumer lock.
+	go func() {
+		defer wg.Done()
+		<-start
+		for range iters {
+			if n := len(mset.getPublicConsumers()); n != 1 {
+				t.Errorf("Expected 1 public consumer, got %d", n)
+				return
+			}
+		}
+	}()
+
+	close(start)
+	wg.Wait()
+}
+
+// Direct and Sourcing classify a consumer for its whole lifetime. The stream
+// reads them off the consumer without taking the consumer lock, so an update
+// must not be able to change them.
+func TestJetStreamConsumerUpdateRejectsDirectAndSourcingChange(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	mset, err := s.globalAccount().addStream(&StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Storage:  MemoryStorage,
+	})
+	require_NoError(t, err)
+
+	// Direct consumers need to be push based ephemerals.
+	od, err := mset.addConsumer(&ConsumerConfig{
+		DeliverSubject: "d",
+		AckPolicy:      AckNone,
+		Direct:         true,
+	})
+	require_NoError(t, err)
+
+	cfg := od.config()
+	cfg.Direct = false
+	require_Error(t, od.updateConfig(&cfg), errors.New("direct can not be updated"))
+	require_True(t, od.direct)
+	require_True(t, od.config().Direct)
+
+	os, err := mset.addConsumer(&ConsumerConfig{
+		Durable:   "S",
+		AckPolicy: AckExplicit,
+		Sourcing:  true,
+	})
+	require_NoError(t, err)
+
+	cfg = os.config()
+	cfg.Sourcing = false
+	require_Error(t, os.updateConfig(&cfg), errors.New("sourcing can not be updated"))
+	require_True(t, os.sourcing)
+	require_True(t, os.config().Sourcing)
+}
+
+// Must be run with -race.
 func TestJetStreamConsumerSetRateLimitAccountMpayRace(t *testing.T) {
 	acc := &Account{Name: "A"}
 	acc.mpay = 1024
@@ -12875,6 +13838,107 @@ func TestJetStreamConsumerSetRateLimitAccountMpayRace(t *testing.T) {
 	}()
 
 	wg.Wait()
+}
+
+func TestJetStreamConsumerRateLimitMsgLargerThanBurst(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	// Burst becomes MaxMsgSize (1024 bytes).
+	cfg := &nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}, MaxMsgSize: 1024}
+	_, err := js.AddStream(cfg)
+	require_NoError(t, err)
+
+	// Payload fits MaxMsgSize, but subject+reply+payload exceeds the burst.
+	_, err = js.Publish("foo", make([]byte, 1000))
+	require_NoError(t, err)
+	_, err = js.Publish("foo", []byte("small"))
+	require_NoError(t, err)
+
+	sub, err := nc.SubscribeSync("deliver")
+	require_NoError(t, err)
+	defer sub.Unsubscribe()
+
+	// 1 Mbit/s, so 1 KB should arrive in ~8ms.
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:        "C",
+		DeliverSubject: "deliver",
+		AckPolicy:      nats.AckExplicitPolicy,
+		RateLimit:      1024 * 1024,
+	})
+	require_NoError(t, err)
+
+	for i := range 2 {
+		_, err = sub.NextMsg(2 * time.Second)
+		if err != nil {
+			t.Fatalf("msg %d not delivered: %v", i+1, err)
+		}
+	}
+
+	mset, err := s.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	o := mset.lookupConsumer("C")
+	require_NotNil(t, o)
+	burst := func() int {
+		o.mu.RLock()
+		defer o.mu.RUnlock()
+		return o.rlimit.Burst()
+	}
+	require_Equal(t, burst(), 1024)
+
+	// The burst follows MaxMsgSize updates.
+	for _, size := range []int32{16 * 1024, 2048} {
+		cfg.MaxMsgSize = size
+		_, err = js.UpdateStream(cfg)
+		require_NoError(t, err)
+		require_Equal(t, burst(), int(size))
+	}
+}
+
+func TestJetStreamConsumerRateLimitUnlimitedMaxPayload(t *testing.T) {
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		max_payload: -1
+		jetstream: {store_dir: %q}
+	`, t.TempDir())))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	// The Go client refuses to publish with a negative max payload, so work server-side.
+	// Without MaxMsgSize the burst falls back to max_payload.
+	mset, err := s.globalAccount().addStream(&StreamConfig{Name: "TEST", Subjects: []string{"foo"}})
+	require_NoError(t, err)
+	_, _, err = mset.store.StoreMsg("foo", nil, []byte("hello"), 0)
+	require_NoError(t, err)
+
+	sub, err := nc.SubscribeSync("deliver")
+	require_NoError(t, err)
+	defer sub.Unsubscribe()
+	require_NoError(t, nc.Flush())
+
+	// 4 bps is half a byte per second, which must not round down to no rate at all.
+	o, err := mset.addConsumer(&ConsumerConfig{
+		Durable:        "C",
+		DeliverSubject: "deliver",
+		AckPolicy:      AckNone,
+		RateLimit:      4,
+	})
+	require_NoError(t, err)
+
+	// Fits in the initial burst, so it's delivered right away.
+	_, err = sub.NextMsg(2 * time.Second)
+	require_NoError(t, err)
+
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	require_Equal(t, o.rlimit.Limit(), 0.5)
+	require_Equal(t, o.rlimit.Burst(), MAX_PAYLOAD_SIZE)
 }
 
 // https://github.com/nats-io/nats-server/issues/8381
@@ -13014,4 +14078,861 @@ func TestJetStreamConsumerResetResponseAcrossServiceImport(t *testing.T) {
 			return c.consumerLeader("A", "TEST", "CONSUMER")
 		})
 	})
+}
+
+func TestJetStreamConsumerFlowControlResetOnLeaderChange(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name: "TEST", Subjects: []string{"foo"}, Storage: nats.MemoryStorage,
+	})
+	require_NoError(t, err)
+
+	mset, err := s.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+
+	// A push consumer only delivers while there is interest on the deliver
+	// subject. We never read these, the subscription just keeps it active.
+	dsubj := "d.flowcontrol"
+	_, err = nc.Subscribe(dsubj, func(*nats.Msg) {})
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+
+	o, err := mset.addConsumer(&ConsumerConfig{
+		Durable:        "FC",
+		DeliverSubject: dsubj,
+		AckPolicy:      AckNone,
+		FlowControl:    true,
+		Heartbeat:      100 * time.Millisecond,
+	})
+	require_NoError(t, err)
+
+	state := func() (pbytes, maxpb int, fcid string, dseq uint64) {
+		o.mu.RLock()
+		defer o.mu.RUnlock()
+		return o.pbytes, o.maxpb, o.fcid, o.dseq
+	}
+
+	// Open the window up to the ceiling a long lived consumer reaches on its own,
+	// by doubling in processFlowControl.
+	o.mu.Lock()
+	o.pblimit, o.maxpb = JsFlowControlMaxPending, JsFlowControlMaxPending
+	o.mu.Unlock()
+
+	// Above the post-reset window (limit/16) so delivery gates later, below the
+	// arming threshold (limit/2) so no flow control request goes out.
+	const target = JsFlowControlMaxPending / 8
+	payload := make([]byte, 256*1024)
+	for sent := 0; sent < target; sent += len(payload) {
+		_, err = js.Publish("foo", payload)
+		require_NoError(t, err)
+	}
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		if pbytes, _, _, _ := state(); pbytes < target {
+			return fmt.Errorf("pbytes %d has not reached %d yet", pbytes, target)
+		}
+		return nil
+	})
+
+	// The state we expect to carry into the transition.
+	pbytes, maxpb, fcid, _ := state()
+	require_Equal(t, fcid, _EMPTY_)
+	require_Equal(t, maxpb, JsFlowControlMaxPending)
+	require_True(t, pbytes > JsFlowControlMaxPending/16)
+
+	// This is the sequence processConsumerLeaderChange runs.
+	require_NoError(t, o.setLeader(false, 0))
+	require_NoError(t, o.setLeader(true, 0))
+
+	pbytes, _, _, dseq := state()
+	require_Equal(t, pbytes, 0)
+
+	// And it must still deliver.
+	_, err = js.Publish("foo", []byte("hello"))
+	require_NoError(t, err)
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		if _, _, _, cur := state(); cur <= dseq {
+			return fmt.Errorf("consumer is not delivering, dseq stuck at %d", cur)
+		}
+		return nil
+	})
+}
+
+func TestJetStreamConsumerCreateCollisionPreservesExistingConsumerStore(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	mset, err := s.globalAccount().addStream(&StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Storage:  FileStorage,
+	})
+	require_NoError(t, err)
+
+	// Existing durable consumer registered under "dur" with an on-disk store.
+	o, err := mset.addConsumer(&ConsumerConfig{Durable: "dur", AckPolicy: AckExplicit})
+	require_NoError(t, err)
+
+	cfs, ok := o.store.(*consumerFileStore)
+	require_True(t, ok)
+	odir := cfs.odir
+	require_NotEqual(t, odir, _EMPTY_)
+
+	// Sanity: the existing consumer's store directory exists.
+	_, err = os.Stat(odir)
+	require_NoError(t, err)
+
+	// Trigger the collision path. Since the consumer already exists, this should error.
+	_, err = mset.addConsumerWithAssignment(
+		&ConsumerConfig{AckPolicy: AckExplicit},
+		"dur", nil, false, ActionCreateOrUpdate, false,
+	)
+	require_Error(t, err, NewJSConsumerNameExistError())
+
+	// The existing consumer should still be registered, and its store directory intact.
+	require_Equal(t, mset.lookupConsumer("dur"), o)
+	_, err = os.Stat(odir)
+	require_NoError(t, err)
+}
+
+func TestJetStreamConsumerFailedRecoverStateDoesNotLeakInternalClients(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	acc := s.GlobalAccount()
+	sys := s.SystemAccount()
+
+	// Stream stays empty, so its last sequence is 0 while the recovered consumer below
+	// has a much higher delivered sequence: this drives the reconcile path.
+	mset, err := acc.addStream(&StreamConfig{Name: "TEST", Subjects: []string{"foo"}, Storage: FileStorage})
+	require_NoError(t, err)
+
+	// Set up a consumer store whose delivered sequence is far ahead of the stream.
+	cfg := &ConsumerConfig{Durable: "dur", AckPolicy: AckExplicit}
+	cs, err := mset.store.ConsumerStore("dur", time.Now().UTC(), cfg)
+	require_NoError(t, err)
+	ifn := cs.(*consumerFileStore).ifn // Capture before stop.
+	require_NoError(t, cs.ForceUpdate(&ConsumerState{
+		Delivered: SequencePair{Consumer: 100, Stream: 100},
+		AckFloor:  SequencePair{Consumer: 100, Stream: 100},
+	}))
+	require_NoError(t, cs.Stop())
+
+	// Make a directory where the state file's temporary write target lives
+	// (during writeAtomically) so that it fails with EISDIR when opening it.
+	// This fails even when the tests run as root (usually in container envs).
+	require_NoError(t, os.Mkdir(ifn+".tmp", defaultDirPerms))
+
+	numClients := func(a *Account) int {
+		a.mu.RLock()
+		defer a.mu.RUnlock()
+		return len(a.clients)
+	}
+	accBefore, sysBefore := numClients(acc), numClients(sys)
+
+	// Trigger recovery multiple times to exploit if internal clients are leaked.
+	const iters = 20
+	for range iters {
+		_, err = mset.addConsumerWithAssignment(cfg, _EMPTY_, nil, true, ActionCreateOrUpdate, false)
+		require_Error(t, err)
+		require_Contains(t, err.Error(), "error creating store for consumer")
+	}
+
+	// Validate that no internal clients were leaked.
+	const tolerance = 5
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		if d := numClients(acc) - accBefore; d > tolerance {
+			return fmt.Errorf("account leaked ~%d internal clients over %d failed recovery creates", d, iters)
+		}
+		if d := numClients(sys) - sysBefore; d > tolerance {
+			return fmt.Errorf("system account leaked ~%d internal clients over %d failed recovery creates", d, iters)
+		}
+		return nil
+	})
+}
+
+func TestJetStreamConsumerCreateNameTooLongDoesNotDeleteObsStream(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	// A stream literally named "obs".
+	acc := s.globalAccount()
+	obs, err := acc.addStream(&StreamConfig{Name: "obs", Subjects: []string{"obs.>"}, Storage: FileStorage})
+	require_NoError(t, err)
+	fs, ok := obs.store.(*fileStore)
+	require_True(t, ok)
+	obsDir := fs.fcfg.StoreDir
+	_, err = os.Stat(obsDir)
+	require_NoError(t, err)
+
+	mset, err := acc.addStream(&StreamConfig{Name: "TEST", Subjects: []string{"foo"}, Storage: FileStorage})
+	require_NoError(t, err)
+
+	// Durable name longer than the limit: rejected before the consumer is registered.
+	_, err = mset.addConsumer(&ConsumerConfig{Durable: strings.Repeat("a", JSMaxNameLen+1), AckPolicy: AckExplicit})
+	require_Error(t, err)
+
+	// The unrelated "obs" stream's directory must still exist.
+	_, err = os.Stat(obsDir)
+	require_NoError(t, err)
+}
+
+func TestJetStreamConsumerCreateCollisionPreservesExistingConsumerQueues(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	mset, err := s.globalAccount().addStream(&StreamConfig{Name: "TEST", Subjects: []string{"foo"}, Storage: FileStorage})
+	require_NoError(t, err)
+	o, err := mset.addConsumer(&ConsumerConfig{Durable: "dur", AckPolicy: AckExplicit})
+	require_NoError(t, err)
+
+	// A pull consumer registers two queues in the server's ipQueues map.
+	ackKey, reqKey := o.ackMsgs.name, o.nextMsgReqs.name
+	if _, ok := s.ipQueues.Load(ackKey); !ok {
+		t.Fatal("precondition: existing consumer ackMsgs queue not registered")
+	}
+
+	// Trigger the name collision path.
+	_, err = mset.addConsumerWithAssignment(
+		&ConsumerConfig{AckPolicy: AckExplicit}, "dur", nil, false, ActionCreateOrUpdate, false,
+	)
+	require_Error(t, err)
+
+	// The existing registry entries must still be present and still point at its queues.
+	v, ok := s.ipQueues.Load(ackKey)
+	require_True(t, ok)
+	require_Equal(t, v.(*ipQueue[*jsAckMsg]), o.ackMsgs)
+	v, ok = s.ipQueues.Load(reqKey)
+	require_True(t, ok)
+	require_Equal(t, v.(*ipQueue[*nextMsgReq]), o.nextMsgReqs)
+}
+
+func TestJetStreamConsumerDeliveryCountUnderflow(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+	})
+	require_NoError(t, err)
+
+	_, err = js.Publish("foo", nil)
+	require_NoError(t, err)
+
+	acc, err := s.lookupAccount(globalAccountName)
+	require_NoError(t, err)
+	mset, err := acc.lookupStream("TEST")
+	require_NoError(t, err)
+
+	o, err := mset.addConsumer(&ConsumerConfig{
+		Durable:    "CONSUMER",
+		AckPolicy:  AckExplicit,
+		MaxDeliver: 3,
+	})
+	require_NoError(t, err)
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	// A failed delivery attempt on a message that was never redelivered must
+	// not fabricate redelivery state for it.
+	o.decDeliveryCount(1)
+	require_True(t, o.rdc == nil)
+	require_Equal(t, o.deliveryCount(1), 1)
+	// Underflow used to report a delivery count of 2^64-1 here, which is
+	// >= any configured MaxDeliver, so the message was immediately treated as
+	// having exhausted its delivery attempts.
+	require_False(t, o.hasMaxDeliveries(1))
+
+	// A failed delivery attempt after a redelivery has to be reversible, all
+	// the way back to no redelivery state at all.
+	require_Equal(t, o.incDeliveryCount(1), 2)
+	require_Equal(t, o.deliveryCount(1), 1)
+	require_Equal(t, o.incDeliveryCount(1), 3)
+	require_Equal(t, o.deliveryCount(1), 2)
+	o.decDeliveryCount(1)
+	require_Equal(t, o.deliveryCount(1), 1)
+	o.decDeliveryCount(1)
+	require_Equal(t, o.deliveryCount(1), 1)
+	_, present := o.rdc[1]
+	require_False(t, present)
+}
+
+func TestJetStreamConsumerR1CreateAndDeleteAppliedTogetherBothRespond(t *testing.T) {
+	c := createJetStreamClusterWithTemplateAndModHook(t, jsClusterTempl, "R3S", 3,
+		func(serverName, _, _, conf string) string {
+			return fmt.Sprintf("%s\nserver_tags: [%s]", conf, serverName)
+		})
+	defer c.shutdown()
+
+	// The R1 consumer is on rs, so rs responds for it.
+	rs := c.randomNonLeader()
+	nc, js := jsClientConnect(t, c.leader())
+	defer nc.Close()
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Placement: &nats.Placement{Tags: []string{rs.Name()}}})
+	require_NoError(t, err)
+
+	// Pause rs's meta applies, so the create and delete are applied right after each other.
+	meta := rs.getJetStream().getMetaGroup().(*raft)
+	require_NoError(t, meta.PauseApply())
+
+	mjs := c.leader().getJetStream()
+	waitApplied := func(assigned bool) {
+		t.Helper()
+		checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+			mjs.mu.RLock()
+			defer mjs.mu.RUnlock()
+			if (mjs.consumerAssignment(globalAccountName, "TEST", "C") != nil) != assigned {
+				return errors.New("not applied on meta leader")
+			}
+			return nil
+		})
+	}
+	sub := natsSubSync(t, nc, "reply")
+	req, err := json.Marshal(&CreateConsumerRequest{Stream: "TEST", Config: ConsumerConfig{Durable: "C"}})
+	require_NoError(t, err)
+	require_NoError(t, nc.PublishRequest(fmt.Sprintf(JSApiDurableCreateT, "TEST", "C"), "reply", req))
+	waitApplied(true)
+	require_NoError(t, nc.PublishRequest(fmt.Sprintf(JSApiConsumerDeleteT, "TEST", "C"), "reply", nil))
+	waitApplied(false)
+
+	// Only resume once rs knows both are committed.
+	_, lcommit, _ := mjs.getMetaGroup().Progress()
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+		meta.RLock()
+		defer meta.RUnlock()
+		if meta.hcommit < lcommit {
+			return errors.New("not committed yet")
+		}
+		return nil
+	})
+	meta.ResumeApply()
+
+	for _, typ := range []string{JSApiConsumerCreateResponseType, JSApiConsumerDeleteResponseType} {
+		msg, err := sub.NextMsg(2 * time.Second)
+		require_NoError(t, err)
+		var resp ApiResponse
+		require_NoError(t, json.Unmarshal(msg.Data, &resp))
+		require_Equal(t, resp.Type, typ)
+		require_True(t, resp.Error == nil)
+	}
+}
+
+func TestJetStreamConsumerEphemeralPullDefaultInactiveThresholdAfterRestart(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}})
+	require_NoError(t, err)
+
+	// Ephemeral pull consumer without an explicit InactiveThreshold.
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Name: "CONSUMER", AckPolicy: nats.AckExplicitPolicy})
+	require_NoError(t, err)
+	nc.Close()
+
+	sd := s.JetStreamConfig().StoreDir
+	s.Shutdown()
+	s = RunJetStreamServerOnPort(-1, sd)
+	defer s.Shutdown()
+
+	mset, err := s.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	o := mset.lookupConsumer("CONSUMER")
+	require_NotNil(t, o)
+	require_Equal(t, o.config().InactiveThreshold, JsDeleteWaitTimeDefault)
+
+	// Shorten the threshold, this only re-arms the delete timer if it was already running.
+	require_NoError(t, o.setInActiveDeleteThreshold(10*time.Millisecond))
+	checkFor(t, time.Second, 50*time.Millisecond, func() error {
+		if mset.lookupConsumer("CONSUMER") != nil {
+			return errors.New("consumer still exists")
+		}
+		return nil
+	})
+}
+
+func TestJetStreamConsumerResetLastPerSubjectLeaderChange(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo.*"}, Replicas: 3})
+	require_NoError(t, err)
+	for _, subject := range []string{"foo.a", "foo.a", "foo.b", "foo.b", "foo.c", "foo.c", "foo.d", "foo.d"} {
+		_, err = js.Publish(subject, nil)
+		require_NoError(t, err)
+	}
+	sub, err := js.PullSubscribe("foo.*", "CONSUMER", nats.DeliverLastPerSubject(), nats.AckWait(time.Hour))
+	require_NoError(t, err)
+	fetch := func(streamSeq, consumerSeq uint64) {
+		t.Helper()
+		msgs, err := sub.Fetch(1, nats.MaxWait(time.Second))
+		require_NoError(t, err)
+		require_Len(t, len(msgs), 1)
+		meta, err := msgs[0].Metadata()
+		require_NoError(t, err)
+		require_Equal(t, meta.Sequence.Stream, streamSeq)
+		require_Equal(t, meta.Sequence.Consumer, consumerSeq)
+		require_Equal(t, meta.NumDelivered, uint64(1))
+		require_NoError(t, msgs[0].AckSync())
+	}
+	fetch(2, 1)
+	msg, err := nc.Request(fmt.Sprintf(JSApiConsumerResetT, "TEST", "CONSUMER"), nil, 2*time.Second)
+	require_NoError(t, err)
+	var resp JSApiConsumerResetResponse
+	require_NoError(t, json.Unmarshal(msg.Data, &resp))
+	require_True(t, resp.Error == nil)
+	require_Equal(t, resp.NumPending, uint64(3))
+
+	for i, seq := range []uint64{4, 6, 8} {
+		fetch(seq, uint64(i+1))
+		s := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")
+		mset, err := s.globalAccount().lookupStream("TEST")
+		require_NoError(t, err)
+		o := mset.lookupConsumer("CONSUMER")
+		o.mu.RLock()
+		node := o.node
+		o.mu.RUnlock()
+		require_NoError(t, node.StepDown())
+		c.waitOnConsumerLeader(globalAccountName, "TEST", "CONSUMER")
+		require_True(t, c.consumerLeader(globalAccountName, "TEST", "CONSUMER") != s)
+	}
+	_, err = js.Publish("foo.a", nil)
+	require_NoError(t, err)
+	fetch(9, 4)
+}
+
+func TestJetStreamConsumerResetLastPerSubjectError(t *testing.T) {
+	for _, replicas := range []int{1, 3} {
+		t.Run(fmt.Sprintf("R%d", replicas), func(t *testing.T) {
+			c := createJetStreamClusterExplicit(t, "R3S", 3)
+			defer c.shutdown()
+			nc, js := jsClientConnect(t, c.randomServer())
+			defer nc.Close()
+			_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo.*"}, Replicas: replicas})
+			require_NoError(t, err)
+			for _, subject := range []string{"foo.a", "foo.a", "foo.b", "foo.b"} {
+				_, err = js.Publish(subject, nil)
+				require_NoError(t, err)
+			}
+			sub, err := js.PullSubscribe("foo.*", "CONSUMER", nats.DeliverLastPerSubject(), nats.AckWait(time.Hour))
+			require_NoError(t, err)
+			_, err = sub.Fetch(1, nats.MaxWait(time.Second))
+			require_NoError(t, err)
+			s := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")
+			mset, err := s.globalAccount().lookupStream("TEST")
+			require_NoError(t, err)
+			o := mset.lookupConsumer("CONSUMER")
+			o.mu.RLock()
+			sseq, dseq, lss := o.sseq, o.dseq, o.lss
+			o.mu.RUnlock()
+			require_NoError(t, mset.store.Stop())
+
+			msg, err := nc.Request(fmt.Sprintf(JSApiConsumerResetT, "TEST", "CONSUMER"), nil, 2*time.Second)
+			require_NoError(t, err)
+			var resp JSApiConsumerResetResponse
+			require_NoError(t, json.Unmarshal(msg.Data, &resp))
+			require_Error(t, resp.Error, NewJSConsumerInvalidResetError(ErrStoreClosed))
+			o.mu.RLock()
+			sseqAfter, dseqAfter, lssAfter := o.sseq, o.dseq, o.lss
+			writeErr, resets := o.werr, len(o.rsm)
+			o.mu.RUnlock()
+			require_Equal(t, sseqAfter, sseq)
+			require_Equal(t, dseqAfter, dseq)
+			require_Equal(t, lssAfter, lss)
+			require_NoError(t, writeErr)
+			require_Equal(t, resets, 0)
+		})
+	}
+}
+
+func TestJetStreamConsumerResetLastPerSubject(t *testing.T) {
+	for _, replicas := range []int{1, 3} {
+		for _, delivered := range []int{1, 3} {
+			t.Run(fmt.Sprintf("R%d/Delivered%d", replicas, delivered), func(t *testing.T) {
+				c := createJetStreamClusterExplicit(t, "R3S", 3)
+				defer c.shutdown()
+				nc, js := jsClientConnect(t, c.randomServer())
+				defer nc.Close()
+				_, err := js.AddStream(&nats.StreamConfig{
+					Name: "TEST", Subjects: []string{"foo.*"}, Replicas: replicas,
+				})
+				require_NoError(t, err)
+				for _, subject := range []string{"foo.a", "foo.a", "foo.b", "foo.b", "foo.c", "foo.c"} {
+					_, err = js.Publish(subject, nil)
+					require_NoError(t, err)
+				}
+				sub, err := js.PullSubscribe("foo.*", "CONSUMER", nats.DeliverLastPerSubject(), nats.AckExplicit(), nats.AckWait(time.Hour))
+				require_NoError(t, err)
+				msgs, err := sub.Fetch(delivered, nats.MaxWait(time.Second))
+				require_NoError(t, err)
+				require_Len(t, len(msgs), delivered)
+				for i, msg := range msgs {
+					meta, err := msg.Metadata()
+					require_NoError(t, err)
+					require_Equal(t, meta.Sequence.Stream, uint64((i+1)*2))
+				}
+				require_NoError(t, msgs[0].AckSync())
+				ci, err := js.ConsumerInfo("TEST", "CONSUMER")
+				require_NoError(t, err)
+				resetSeq := ci.AckFloor.Stream + 1
+				_, err = js.Publish("foo.b", nil)
+				require_NoError(t, err)
+				for range 2 {
+					msg, err := nc.Request(fmt.Sprintf(JSApiConsumerResetT, "TEST", "CONSUMER"), nil, 2*time.Second)
+					require_NoError(t, err)
+					var resp JSApiConsumerResetResponse
+					require_NoError(t, json.Unmarshal(msg.Data, &resp))
+					require_True(t, resp.Error == nil)
+					require_Equal(t, resp.ResetSeq, resetSeq)
+					require_Equal(t, resp.NumPending, uint64(2))
+					msgs, err := sub.Fetch(2, nats.MaxWait(time.Second))
+					require_NoError(t, err)
+					require_Len(t, len(msgs), 2)
+					for i, seq := range []uint64{6, 7} {
+						meta, err := msgs[i].Metadata()
+						require_NoError(t, err)
+						require_Equal(t, meta.Sequence.Stream, seq)
+						require_Equal(t, meta.Sequence.Consumer, uint64(i+1))
+					}
+				}
+				_, err = js.Publish("foo.a", nil)
+				require_NoError(t, err)
+				msgs, err = sub.Fetch(1, nats.MaxWait(time.Second))
+				require_NoError(t, err)
+				require_Len(t, len(msgs), 1)
+				meta, err := msgs[0].Metadata()
+				require_NoError(t, err)
+				require_Equal(t, meta.Sequence.Stream, uint64(8))
+			})
+		}
+	}
+}
+
+func TestJetStreamConsumerResetResponseReportsResetSeq(t *testing.T) {
+	test := func(t *testing.T, replicas int) {
+		c := createJetStreamClusterExplicit(t, "R3S", 3)
+		defer c.shutdown()
+
+		nc := clientConnectToServer(t, c.randomServer())
+		defer nc.Close()
+
+		_, err := jsStreamCreate(t, nc, &StreamConfig{
+			Name:     "TEST",
+			Subjects: []string{"foo"},
+			Replicas: replicas,
+			Storage:  FileStorage,
+		})
+		require_NoError(t, err)
+		for range 200 {
+			_, err = nc.Request("foo", nil, time.Second)
+			require_NoError(t, err)
+		}
+
+		// Answer flow control so the consumer keeps delivering.
+		sub, err := nc.Subscribe("deliver", func(m *nats.Msg) {
+			if m.Reply != _EMPTY_ {
+				m.Respond(nil)
+			}
+		})
+		require_NoError(t, err)
+		defer sub.Unsubscribe()
+
+		_, err = jsConsumerCreate(t, nc, "TEST", ConsumerConfig{
+			Durable:        "CONSUMER",
+			DeliverSubject: "deliver",
+			AckPolicy:      AckFlowControl,
+			Replicas:       replicas,
+		}, false)
+		require_NoError(t, err)
+		c.waitOnConsumerLeader(globalAccountName, "TEST", "CONSUMER")
+
+		// Delivery resumes right after the reset, the response must still report the reset point.
+		for range 500 {
+			msg, err := nc.Request(fmt.Sprintf(JSApiConsumerResetT, "TEST", "CONSUMER"), nil, 2*time.Second)
+			require_NoError(t, err)
+			var resp JSApiConsumerResetResponse
+			require_NoError(t, json.Unmarshal(msg.Data, &resp))
+			require_True(t, resp.Error == nil)
+			require_Equal(t, resp.Delivered.Stream, resp.ResetSeq-1)
+			require_Equal(t, resp.AckFloor.Stream, resp.ResetSeq-1)
+		}
+	}
+
+	for _, replicas := range []int{1, 3} {
+		t.Run(fmt.Sprintf("R%d", replicas), func(t *testing.T) { test(t, replicas) })
+	}
+}
+
+func TestJetStreamConsumerResetPendingHoldsDeliveries(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc := clientConnectToServer(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := jsStreamCreate(t, nc, &StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+		Storage:  FileStorage,
+	})
+	require_NoError(t, err)
+	for range 30 {
+		_, err = nc.Request("foo", nil, time.Second)
+		require_NoError(t, err)
+	}
+
+	// No interest on the deliver subject, so we drive deliveries ourselves.
+	_, err = jsConsumerCreate(t, nc, "TEST", ConsumerConfig{
+		Durable:        "CONSUMER",
+		DeliverSubject: "deliver",
+		AckPolicy:      AckFlowControl,
+		Replicas:       3,
+	}, false)
+	require_NoError(t, err)
+	c.waitOnConsumerLeader(globalAccountName, "TEST", "CONSUMER")
+
+	lookupConsumer := func() *consumer {
+		t.Helper()
+		cl := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")
+		require_NotNil(t, cl)
+		mset, err := cl.globalAccount().lookupStream("TEST")
+		require_NoError(t, err)
+		o := mset.lookupConsumer("CONSUMER")
+		require_NotNil(t, o)
+		return o
+	}
+	o := lookupConsumer()
+
+	// Same as loopAndGatherMsgs, lock should be held.
+	deliverNext := func() error {
+		pmsg, dc, err := o.getNextMsg()
+		if err != nil {
+			return err
+		}
+		o.deliverMsg(o.cfg.DeliverSubject, o.ackReply(pmsg.seq, o.dseq, dc, pmsg.ts, o.numPending()), pmsg, dc, LimitsPolicy)
+		return nil
+	}
+	reset := func(seq uint64) {
+		t.Helper()
+		o.mu.Lock()
+		_, _, err := o.resetStartingSeqLocked(seq, _EMPTY_, false, false)
+		o.mu.Unlock()
+		require_NoError(t, err)
+		checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+			o.mu.RLock()
+			defer o.mu.RUnlock()
+			if o.dseq != 1 || o.sseq != seq {
+				return fmt.Errorf("reset not applied yet: dseq=%d sseq=%d", o.dseq, o.sseq)
+			}
+			return nil
+		})
+	}
+	deliver := func(n int) {
+		t.Helper()
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		for range n {
+			require_NoError(t, deliverNext())
+		}
+	}
+
+	// Deliver d1..d5 = s15..s19.
+	reset(15)
+	deliver(5)
+
+	// Reset back to s11, nothing must be delivered until it's applied.
+	// Otherwise d6 = s20 is applied after the reset and mixes into the delivered state.
+	o.mu.Lock()
+	_, _, err = o.resetStartingSeqLocked(11, "reply", false, false)
+	if err == nil {
+		err = deliverNext()
+	}
+	o.mu.Unlock()
+	require_Error(t, err, errResetPending)
+
+	// Deliver d1..d8 = s11..s18.
+	reset(11)
+	deliver(8)
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		for _, s := range c.servers {
+			mset, err := s.globalAccount().lookupStream("TEST")
+			if err != nil {
+				return err
+			}
+			state, err := mset.lookupConsumer("CONSUMER").store.State()
+			if err != nil {
+				return err
+			}
+			if state.Delivered.Consumer != 8 || state.Delivered.Stream != 18 {
+				return fmt.Errorf("%s: unexpected delivered state %+v", s, state.Delivered)
+			}
+		}
+		return nil
+	})
+
+	// A new leader must continue at d9 = s19.
+	o.mu.RLock()
+	node := o.node
+	o.mu.RUnlock()
+	require_NoError(t, node.StepDown())
+	c.waitOnConsumerLeader(globalAccountName, "TEST", "CONSUMER")
+	o = lookupConsumer()
+	o.mu.RLock()
+	dseq, sseq := o.dseq, o.sseq
+	o.mu.RUnlock()
+	require_Equal(t, dseq, 9)
+	require_Equal(t, sseq, 19)
+}
+
+// https://github.com/nats-io/nats-server/issues/8704
+func TestJetStreamConsumerInactiveThresholdRestartsOnBoot(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Storage:  nats.FileStorage,
+	})
+	require_NoError(t, err)
+
+	const inactiveThresh = 200 * time.Millisecond
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:           "DURABLE_INACTIVE",
+		AckPolicy:         nats.AckExplicitPolicy,
+		InactiveThreshold: inactiveThresh,
+	})
+	require_NoError(t, err)
+
+	// Verify consumer exists before shutdown.
+	_, err = js.ConsumerInfo("TEST", "DURABLE_INACTIVE")
+	require_NoError(t, err)
+
+	sd := s.JetStreamConfig().StoreDir
+	nc.Close()
+	s.Shutdown()
+	s.WaitForShutdown()
+
+	// In pull mode, updateInactiveThreshold adds up to 1s of jitter
+	// (dthresh is at most inactiveThresh + 1s = 1.2s). Keep the server
+	// down for longer than the maximum possible threshold (1.5s > 1.2s).
+	time.Sleep(1500 * time.Millisecond)
+
+	// Restart server.
+	s = RunJetStreamServerOnPort(-1, sd)
+	defer s.Shutdown()
+
+	nc, js = jsClientConnect(t, s)
+	defer nc.Close()
+
+	// Consumer must still exist immediately after boot to grant the client
+	// time to reconnect and resume activity, proving the threshold restarted on boot.
+	_, err = js.ConsumerInfo("TEST", "DURABLE_INACTIVE")
+	require_NoError(t, err)
+
+	// Once the inactivity threshold of active server uptime has elapsed without
+	// client activity, the consumer should be cleaned up.
+	checkFor(t, 3*time.Second, 50*time.Millisecond, func() error {
+		if _, err := js.ConsumerInfo("TEST", "DURABLE_INACTIVE"); err == nil {
+			return errors.New("consumer still exists")
+		}
+		return nil
+	})
+}
+
+func TestJetStreamConsumerRedeliveryQueueOperations(t *testing.T) {
+	var o consumer
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	require_Equal(t, o.getNextToRedeliver(), uint64(0))
+	o.addToRedeliverQueue(10, 20, 30, 40)
+	require_Equal(t, o.getNextToRedeliver(), uint64(10))
+	require_False(t, o.onRedeliverQueue(10))
+	// Exercise removal and append after the head has advanced.
+	require_True(t, o.removeFromRedeliverQueue(30))
+	require_False(t, o.removeFromRedeliverQueue(30))
+	o.addToRedeliverQueue(50, 60)
+	for _, seq := range []uint64{20, 40, 50, 60} {
+		require_Equal(t, o.getNextToRedeliver(), seq)
+		require_False(t, o.onRedeliverQueue(seq))
+	}
+	require_True(t, o.rdq == nil)
+	require_Equal(t, o.rdqi.Size(), 0)
+	require_False(t, o.hasRedeliveries())
+	o.addToRedeliverQueue(70)
+	require_Equal(t, o.getNextToRedeliver(), uint64(70))
+	require_Equal(t, o.getNextToRedeliver(), uint64(0))
+	require_True(t, o.rdq == nil)
+	require_Equal(t, o.rdqi.Size(), 0)
+}
+
+func TestJetStreamConsumerRedeliveryQueueInterleaved(t *testing.T) {
+	var o consumer
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	rng := rand.New(rand.NewPCG(42, 42))
+	var expected []uint64
+	var next uint64
+	for i := 0; i < 10000; i++ {
+		switch rng.IntN(3) {
+		case 0:
+			next++
+			o.addToRedeliverQueue(next)
+			expected = append(expected, next)
+		case 1:
+			var want uint64
+			if len(expected) > 0 {
+				want, expected = expected[0], expected[1:]
+			}
+			require_Equal(t, o.getNextToRedeliver(), want)
+		case 2:
+			if len(expected) > 0 {
+				index := rng.IntN(len(expected))
+				require_True(t, o.removeFromRedeliverQueue(expected[index]))
+				expected = slices.Delete(expected, index, index+1)
+			}
+		}
+		require_True(t, slices.Equal(o.rdq, expected))
+		require_Equal(t, o.rdqi.Size(), len(expected))
+		for _, seq := range expected {
+			require_True(t, o.onRedeliverQueue(seq))
+		}
+	}
+}
+
+func BenchmarkJetStreamConsumerRedeliveryQueue(b *testing.B) {
+	for _, size := range []int{1, 64, 4096, 1000000} {
+		b.Run(strconv.Itoa(size), func(b *testing.B) {
+			var o consumer
+			seqs := make([]uint64, size)
+			for i := range seqs {
+				seqs[i] = uint64(i) + 1
+			}
+			o.addToRedeliverQueue(seqs...)
+			o.mu.Lock()
+			defer o.mu.Unlock()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				seq := o.getNextToRedeliver()
+				o.addToRedeliverQueue(seq)
+			}
+		})
+	}
 }

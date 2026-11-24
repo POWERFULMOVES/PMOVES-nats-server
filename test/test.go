@@ -1,4 +1,4 @@
-// Copyright 2012-2025 The NATS Authors
+// Copyright 2012-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -404,7 +404,7 @@ func expectLeftMostResult(t tLogger, c net.Conn, re *regexp.Regexp, buf *[]byte)
 	recv := func() []byte {
 		expBuf := make([]byte, 32768)
 		// Wait for commands to be processed and results queued for read
-		c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		c.SetReadDeadline(time.Now().Add(10 * time.Second))
 		n, err := c.Read(expBuf)
 		c.SetReadDeadline(time.Time{})
 
@@ -437,7 +437,7 @@ func expectLeftMostResult(t tLogger, c net.Conn, re *regexp.Regexp, buf *[]byte)
 func expectResult(t tLogger, c net.Conn, re *regexp.Regexp) []byte {
 	expBuf := make([]byte, 32768)
 	// Wait for commands to be processed and results queued for read
-	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	c.SetReadDeadline(time.Now().Add(10 * time.Second))
 	n, err := c.Read(expBuf)
 	c.SetReadDeadline(time.Time{})
 

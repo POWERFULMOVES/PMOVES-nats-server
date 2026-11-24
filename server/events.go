@@ -1,4 +1,4 @@
-// Copyright 2018-2025 The NATS Authors
+// Copyright 2018-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -22,7 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"runtime"
 	"runtime/debug"
@@ -432,6 +432,8 @@ type pubMsg struct {
 	oct  compressionType
 	echo bool
 	last bool
+	// Only send to this outbound gateway, skipping local interest.
+	gw *client
 }
 
 var pubMsgPool sync.Pool
@@ -449,7 +451,7 @@ func newPubMsg(c *client, sub, rply string, si *ServerInfo, hdr []byte,
 	// When getting something from a pool it is critical that all fields are
 	// initialized. Doing this way guarantees that if someone adds a field to
 	// the structure, the compiler will fail the build if this line is not updated.
-	(*m) = pubMsg{c, sub, rply, si, hdr, msg, oct, echo, last}
+	(*m) = pubMsg{c, sub, rply, si, hdr, msg, oct, echo, last, nil}
 	return m
 }
 
@@ -457,7 +459,7 @@ func (pm *pubMsg) returnToPool() {
 	if pm == nil {
 		return
 	}
-	pm.c, pm.sub, pm.rply, pm.si, pm.hdr, pm.msg = nil, _EMPTY_, _EMPTY_, nil, nil, nil
+	pm.c, pm.sub, pm.rply, pm.si, pm.hdr, pm.msg, pm.gw = nil, _EMPTY_, _EMPTY_, nil, nil, nil, nil
 	pubMsgPool.Put(pm)
 }
 
@@ -640,8 +642,12 @@ RESET:
 					c.traceMsg(b)
 				}
 
-				// Process like a normal inbound msg.
-				c.processInboundClientMsg(b)
+				if pm.gw != nil {
+					c.sendMsgToGatewaysVia(c.acc, b, c.pa.subject, c.pa.reply, nil, false, pm.gw)
+				} else {
+					// Process like a normal inbound msg.
+					c.processInboundClientMsg(b)
+				}
 
 				// Put echo back if needed.
 				if replaceEcho {
@@ -682,7 +688,7 @@ func (s *Server) sendLDMShutdownEventLocked() {
 	}
 	subj := fmt.Sprintf(lameDuckEventSubj, s.info.ID)
 	si := &ServerInfo{}
-	s.sys.sendq.push(newPubMsg(nil, subj, _EMPTY_, si, nil, si, noCompression, false, true))
+	s.sys.sendq.push(newPubMsg(nil, subj, _EMPTY_, si, nil, si, noCompression, false, false))
 }
 
 // Will send a shutdown message.
@@ -756,6 +762,20 @@ func (s *Server) sendInternalMsgLocked(subj, rply string, si *ServerInfo, msg an
 	s.mu.RLock()
 	s.sendInternalMsg(subj, rply, si, msg)
 	s.mu.RUnlock()
+}
+
+// This will queue up a message to be sent to one remote cluster only.
+// A queue group then gets the message in that cluster, even if it has local members.
+// Lock should not be held.
+func (s *Server) sendInternalGatewayMsgLocked(gw *client, subj, rply string, msg any) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.sys == nil || s.sys.sendq == nil {
+		return
+	}
+	pm := newPubMsg(nil, subj, rply, nil, nil, msg, noCompression, false, false)
+	pm.gw = gw
+	s.sys.sendq.push(pm)
 }
 
 // This will queue up a message to be sent.
@@ -1044,21 +1064,29 @@ func (s *Server) sendStatsz(subj string) {
 			if mg.Leader() {
 				if ci := s.raftNodeToClusterInfo(mg); ci != nil {
 					jStat.Meta = &MetaClusterInfo{
-						Name:     ci.Name,
-						Leader:   ci.Leader,
-						Peer:     getHash(ci.Leader),
-						Replicas: ci.Replicas,
-						Size:     mg.ClusterSize(),
+						Name:         ci.Name,
+						Leader:       ci.Leader,
+						Replicas:     ci.Replicas,
+						Size:         mg.ClusterSize(),
+						QuorumNeeded: mg.QuorumNeeded(),
+						Rescue:       mg.InRescue(),
+					}
+					if ci.Leader != _EMPTY_ {
+						jStat.Meta.Peer = getHash(ci.Leader)
 					}
 				}
 			} else {
 				// non leader only include a shortened version without peers
 				leader := s.serverNameForNode(mg.GroupLeader())
 				jStat.Meta = &MetaClusterInfo{
-					Name:   mg.Group(),
-					Leader: leader,
-					Peer:   getHash(leader),
-					Size:   mg.ClusterSize(),
+					Name:         mg.Group(),
+					Leader:       leader,
+					Size:         mg.ClusterSize(),
+					QuorumNeeded: mg.QuorumNeeded(),
+					Rescue:       mg.InRescue(),
+				}
+				if leader != _EMPTY_ {
+					jStat.Meta.Peer = getHash(leader)
 				}
 			}
 			if jStat.Meta != nil {
@@ -1092,6 +1120,12 @@ func (s *Server) limitStatsz(subj string) bool {
 	// Only limit the normal broadcast subject.
 	if subj != fmt.Sprintf(serverStatsSubj, s.ID()) {
 		return false
+	}
+
+	// Peers mark us offline when we enter lame duck mode. A broadcast
+	// statsz would mark us online again and make us a placement target.
+	if s.ldm {
+		return true
 	}
 
 	interval := statszRateLimit
@@ -1765,7 +1799,7 @@ func (s *Server) remoteServerUpdate(sub *subscription, c *client, _ *Account, su
 
 	node := getHash(si.Name)
 	accountNRG := si.AccountNRG()
-	oldInfo, _ := s.nodeToInfo.Swap(node, nodeInfo{
+	newInfo := nodeInfo{
 		name:            si.Name,
 		version:         si.Version,
 		cluster:         si.Cluster,
@@ -1778,12 +1812,20 @@ func (s *Server) remoteServerUpdate(sub *subscription, c *client, _ *Account, su
 		js:              si.JetStreamEnabled(),
 		binarySnapshots: si.BinaryStreamSnapshot(),
 		accountNRG:      accountNRG,
-	})
+	}
+	oldInfo, _ := s.nodeToInfo.Swap(node, newInfo)
 	if oldInfo == nil || accountNRG != oldInfo.(nodeInfo).accountNRG {
 		// One of the servers we received statsz from changed its mind about
 		// whether or not it supports in-account NRG, so update the groups
 		// with this information.
 		s.updateNRGAccountStatus()
+	}
+
+	// Process a peer's statsz when it has sufficient information.
+	if newInfo.selectable() {
+		if js := s.getJetStream(); js != nil {
+			js.processPeerStatsz(node)
+		}
 	}
 }
 
@@ -2436,7 +2478,7 @@ func (s *Server) sendLeafNodeConnectMsg(accName string) {
 
 // sendAccConnsUpdate is called to send out our information on the
 // account's local connections.
-// Lock should be held on entry.
+// Server lock should be held on entry (read or write, it is not modified).
 func (s *Server) sendAccConnsUpdate(a *Account, subj ...string) {
 	if !s.eventsEnabled() || a == nil {
 		return
@@ -2537,29 +2579,37 @@ func (a *Account) statz() *AccountStat {
 // number of active connections, or during a heartbeat.
 // We will not send for $G.
 func (s *Server) accConnsUpdate(a *Account) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// A read lock is enough: this only reads s.sys (to check that events are
+	// enabled and to get the send queue) and s.gacc (to skip $G). The account's
+	// own state is guarded by a.mu, event ids by eventIdsMu, and the queue by
+	// its own lock.
+	// This is called for every client added to or removed from an account, so
+	// holding the server lock exclusively here made concurrent connects queue up.
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if !s.eventsEnabled() || a == nil || a == s.gacc {
 		return
 	}
 	s.sendAccConnsUpdate(a, fmt.Sprintf(accConnsEventSubjOld, a.Name), fmt.Sprintf(accConnsEventSubjNew, a.Name))
 }
 
-// server lock should be held
 func (s *Server) nextEventID() string {
-	return s.eventIds.Next()
+	s.eventIdsMu.Lock()
+	id := s.eventIds.Next()
+	s.eventIdsMu.Unlock()
+	return id
 }
 
 // accountConnectEvent will send an account client connect event if there is interest.
 // This is a billing event.
 func (s *Server) accountConnectEvent(c *client) {
-	s.mu.Lock()
-	if !s.eventsEnabled() {
-		s.mu.Unlock()
+	s.mu.RLock()
+	eventsEnabled := s.eventsEnabled()
+	s.mu.RUnlock()
+	if !eventsEnabled {
 		return
 	}
 	eid := s.nextEventID()
-	s.mu.Unlock()
 
 	c.mu.Lock()
 	if c.acc == nil {
@@ -2600,13 +2650,13 @@ func (s *Server) accountConnectEvent(c *client) {
 // accountDisconnectEvent will send an account client disconnect event if there is interest.
 // This is a billing event.
 func (s *Server) accountDisconnectEvent(c *client, now time.Time, reason string) {
-	s.mu.Lock()
-	if !s.eventsEnabled() {
-		s.mu.Unlock()
+	s.mu.RLock()
+	eventsEnabled := s.eventsEnabled()
+	s.mu.RUnlock()
+	if !eventsEnabled {
 		return
 	}
 	eid := s.nextEventID()
-	s.mu.Unlock()
 
 	c.mu.Lock()
 
@@ -2662,13 +2712,13 @@ func (s *Server) accountDisconnectEvent(c *client, now time.Time, reason string)
 
 // This is the system level event sent to the system account for operators.
 func (s *Server) sendAuthErrorEvent(c *client, reason string) {
-	s.mu.Lock()
-	if !s.eventsEnabled() {
-		s.mu.Unlock()
+	s.mu.RLock()
+	eventsEnabled := s.eventsEnabled()
+	s.mu.RUnlock()
+	if !eventsEnabled {
 		return
 	}
 	eid := s.nextEventID()
-	s.mu.Unlock()
 
 	now := time.Now().UTC()
 	c.mu.Lock()
@@ -2724,13 +2774,13 @@ func (s *Server) sendAccountAuthErrorEvent(c *client, acc *Account, reason strin
 	if acc == nil {
 		return
 	}
-	s.mu.Lock()
-	if !s.eventsEnabled() {
-		s.mu.Unlock()
+	s.mu.RLock()
+	eventsEnabled := s.eventsEnabled()
+	s.mu.RUnlock()
+	if !eventsEnabled {
 		return
 	}
 	eid := s.nextEventID()
-	s.mu.Unlock()
 
 	now := time.Now().UTC()
 	c.mu.Lock()
@@ -2917,8 +2967,8 @@ func (s *Server) remoteLatencyUpdate(sub *subscription, _ *client, _ *Account, s
 	}
 	// Now get the request id / reply. We need to see if we have a GW prefix and if so strip that off.
 	reply := rl.ReqId
-	if gwPrefix, old := isGWRoutedSubjectAndIsOldPrefix([]byte(reply)); gwPrefix {
-		reply = string(getSubjectFromGWRoutedReply([]byte(reply), old))
+	if isGWRoutedReply([]byte(reply)) {
+		reply = string(getSubjectFromGWRoutedReply([]byte(reply)))
 	}
 	acc.mu.RLock()
 	si := acc.exports.responses[reply]
@@ -2987,7 +3037,7 @@ func (s *Server) newRespInbox() string {
 	var b [respInboxPrefixLen + replySuffixLen]byte
 	pres := b[:respInboxPrefixLen]
 	copy(pres, s.sys.inboxPre)
-	rn := rand.Int63()
+	rn := rand.Int64()
 	for i, l := respInboxPrefixLen, rn; i < len(b); i++ {
 		b[i] = digits[l%base]
 		l /= base
@@ -3007,13 +3057,15 @@ func totalSubs(rr *SublistResult, qg []byte) (nsubs int32) {
 	if rr == nil {
 		return
 	}
+	var total uint64
 	checkSub := func(sub *subscription) {
 		// TODO(dlc) - This could be smarter.
 		if qg != nil && !bytes.Equal(qg, sub.queue) {
 			return
 		}
+		// A leaf queue sub counts as the number of members it represents.
 		if sub.client.kind == CLIENT || sub.client.isHubLeafNode() {
-			nsubs++
+			total += qsubWeight(sub)
 		}
 	}
 	if qg == nil {
@@ -3026,7 +3078,7 @@ func totalSubs(rr *SublistResult, qg []byte) (nsubs int32) {
 			checkSub(sub)
 		}
 	}
-	return
+	return int32(min(total, math.MaxInt32))
 }
 
 // Allows users of large systems to debug active subscribers for a given subject.
@@ -3298,9 +3350,11 @@ func (s *Server) wrapChk(f func()) func() {
 // sendOCSPPeerRejectEvent sends a system level event to system account when a peer connection is
 // rejected due to OCSP invalid status of its trust chain(s).
 func (s *Server) sendOCSPPeerRejectEvent(kind string, peer *x509.Certificate, reason string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.eventsEnabled() {
+	s.mu.RLock()
+	eventsEnabled := s.eventsEnabled()
+	serverID := s.info.ID
+	s.mu.RUnlock()
+	if !eventsEnabled {
 		return
 	}
 	if peer == nil {
@@ -3324,16 +3378,18 @@ func (s *Server) sendOCSPPeerRejectEvent(kind string, peer *x509.Certificate, re
 		},
 		Reason: reason,
 	}
-	subj := fmt.Sprintf(ocspPeerRejectEventSubj, s.info.ID)
-	s.sendInternalMsg(subj, _EMPTY_, &m.Server, &m)
+	subj := fmt.Sprintf(ocspPeerRejectEventSubj, serverID)
+	s.sendInternalMsgLocked(subj, _EMPTY_, &m.Server, &m)
 }
 
 // sendOCSPPeerChainlinkInvalidEvent sends a system level event to system account when a link in a peer's trust chain
 // is OCSP invalid.
 func (s *Server) sendOCSPPeerChainlinkInvalidEvent(peer *x509.Certificate, link *x509.Certificate, reason string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.eventsEnabled() {
+	s.mu.RLock()
+	eventsEnabled := s.eventsEnabled()
+	serverID := s.info.ID
+	s.mu.RUnlock()
+	if !eventsEnabled {
 		return
 	}
 	if peer == nil || link == nil {
@@ -3362,6 +3418,6 @@ func (s *Server) sendOCSPPeerChainlinkInvalidEvent(peer *x509.Certificate, link 
 		},
 		Reason: reason,
 	}
-	subj := fmt.Sprintf(ocspPeerChainlinkInvalidEventSubj, s.info.ID)
-	s.sendInternalMsg(subj, _EMPTY_, &m.Server, &m)
+	subj := fmt.Sprintf(ocspPeerChainlinkInvalidEventSubj, serverID)
+	s.sendInternalMsgLocked(subj, _EMPTY_, &m.Server, &m)
 }

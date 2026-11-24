@@ -1,4 +1,4 @@
-// Copyright 2016-2025 The NATS Authors
+// Copyright 2016-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"errors"
 	"iter"
+	"math/rand/v2"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -59,7 +60,12 @@ const (
 type SublistResult struct {
 	psubs []*subscription
 	qsubs [][]*subscription // don't make this a map, too expensive to iterate
+	qwn   []int             // number of weighted remote qsubs at the front of each queue group
 }
+
+// SublistFilter is a function that is used to decide if a subscription should
+// be returned by the Filter() call.
+type SublistFilter func(sub *subscription) bool
 
 // A Sublist stores and efficiently retrieves subscriptions.
 type Sublist struct {
@@ -175,7 +181,9 @@ func (s *Sublist) registerNotification(subject, queue string, notify chan<- bool
 	}
 
 	var hasInterest bool
-	r := s.Match(subject)
+	// Match under the lock so a concurrent insert or remove can't be missed.
+	s.Lock()
+	r := s.matchNoLock(subject)
 
 	if len(r.psubs)+len(r.qsubs) > 0 {
 		if queue == _EMPTY_ {
@@ -199,7 +207,6 @@ func (s *Sublist) registerNotification(subject, queue string, notify chan<- bool
 	key := keyFromSubjectAndQueue(subject, queue)
 	var err error
 
-	s.Lock()
 	if s.notify == nil {
 		s.notify = &notifyMaps{
 			insert: make(map[string][]chan<- bool),
@@ -465,6 +472,7 @@ func copyResult(r *SublistResult) *SublistResult {
 		nqr := append([]*subscription(nil), qr...)
 		nr.qsubs = append(nr.qsubs, nqr)
 	}
+	nr.qwn = append([]int(nil), r.qwn...)
 	return nr
 }
 
@@ -475,13 +483,28 @@ func (r *SublistResult) addSubToResult(sub *subscription) *SublistResult {
 	if sub.queue == nil {
 		nr.psubs = append(nr.psubs, sub)
 	} else {
-		if i := findQSlot(sub.queue, nr.qsubs); i >= 0 {
-			nr.qsubs[i] = append(nr.qsubs[i], sub)
-		} else {
-			nr.qsubs = append(nr.qsubs, []*subscription{sub})
+		i := findQSlot(sub.queue, nr.qsubs)
+		if i < 0 {
+			i = len(nr.qsubs)
+			nr.qsubs = append(nr.qsubs, nil)
 		}
+		nr.addQSub(i, sub)
 	}
 	return nr
+}
+
+// Adds a queue sub to queue group i, keeping weighted remote qsubs at the front.
+func (r *SublistResult) addQSub(i int, sub *subscription) {
+	r.qsubs[i] = append(r.qsubs[i], sub)
+	if qsubWeight(sub) == 1 {
+		return
+	}
+	for len(r.qwn) <= i {
+		r.qwn = append(r.qwn, 0)
+	}
+	qs, n := r.qsubs[i], r.qwn[i]
+	qs[n], qs[len(qs)-1] = qs[len(qs)-1], qs[n]
+	r.qwn[i]++
 }
 
 // addToCache will add the new entry to the existing cache
@@ -698,9 +721,44 @@ func (s *Sublist) reduceCacheCount() {
 	s.Unlock()
 }
 
-// Helper function for auto-expanding remote qsubs.
+// Helper function for weighted remote qsubs.
 func isRemoteQSub(sub *subscription) bool {
 	return sub != nil && sub.queue != nil && sub.client != nil && (sub.client.kind == ROUTER || sub.client.kind == LEAF)
+}
+
+// Returns the selection weight of a queue sub.
+// Remote queue subs represent qw members on the remote side.
+func qsubWeight(sub *subscription) uint64 {
+	if isRemoteQSub(sub) {
+		if qw := atomic.LoadInt32(&sub.qw); qw > 1 {
+			return uint64(qw)
+		}
+	}
+	return 1
+}
+
+// Picks a random index into qsubs, weighted by qsubWeight.
+// The first nw subs are weighted remote qsubs, the rest have weight 1.
+func weightedQSubIndex(qsubs []*subscription, nw int) int {
+	// All weights are 1, so pick uniformly.
+	if nw == 0 {
+		return int(rand.Uint64N(uint64(len(qsubs))))
+	}
+	total := uint64(len(qsubs) - nw)
+	for _, sub := range qsubs[:nw] {
+		total += qsubWeight(sub)
+	}
+	n := rand.Uint64N(total)
+	for i, sub := range qsubs[:nw] {
+		w := qsubWeight(sub)
+		if n < w {
+			return i
+		}
+		n -= w
+	}
+	// Past the weighted prefix every sub has weight 1.
+	// Clamp in case a weight was lowered concurrently.
+	return min(nw+int(n), len(qsubs)-1)
 }
 
 // UpdateRemoteQSub should be called when we update the weight of an existing
@@ -737,16 +795,9 @@ func addNodeToResults(n *node, results *SublistResult) {
 			nqsub := make([]*subscription, 0, len(qr))
 			results.qsubs = append(results.qsubs, nqsub)
 		}
+		// Remote queue subs are added once, their weight is applied on delivery.
 		for sub := range qr {
-			if isRemoteQSub(sub) {
-				ns := atomic.LoadInt32(&sub.qw)
-				// Shadow these subscriptions
-				for n := 0; n < int(ns); n++ {
-					results.qsubs[i] = append(results.qsubs[i], sub)
-				}
-			} else {
-				results.qsubs[i] = append(results.qsubs[i], sub)
-			}
+			results.addQSub(i, sub)
 		}
 	}
 }
@@ -796,23 +847,31 @@ func matchLevel(l *level, toks []string, results *SublistResult) {
 }
 
 func matchLevelForAny(l *level, toks []string, np, nq *int) bool {
+	// When counting, keep going after a match so every matching
+	// subscription is counted, not just those on the first match found.
+	counting := np != nil && nq != nil
+	var matched bool
 	var pwc, n *node
 	for i, t := range toks {
 		if l == nil {
-			return false
+			return matched
 		}
 		if l.fwc != nil {
-			if np != nil && nq != nil {
-				*np += len(l.fwc.psubs)
-				for _, qsub := range l.fwc.qsubs {
-					*nq += len(qsub)
-				}
+			if !counting {
+				return true
 			}
-			return true
+			*np += len(l.fwc.psubs)
+			for _, qsub := range l.fwc.qsubs {
+				*nq += len(qsub)
+			}
+			matched = true
 		}
 		if pwc = l.pwc; pwc != nil {
 			if match := matchLevelForAny(pwc.next, toks[i+1:], np, nq); match {
-				return true
+				if !counting {
+					return true
+				}
+				matched = true
 			}
 		}
 		n = l.nodes[t]
@@ -823,26 +882,29 @@ func matchLevelForAny(l *level, toks []string, np, nq *int) bool {
 		}
 	}
 	if n != nil {
-		if np != nil && nq != nil {
+		if counting {
 			*np += len(n.psubs)
 			for _, qsub := range n.qsubs {
 				*nq += len(qsub)
 			}
 		}
 		if len(n.plist) > 0 || len(n.psubs) > 0 || len(n.qsubs) > 0 {
-			return true
+			if !counting {
+				return true
+			}
+			matched = true
 		}
 	}
 	if pwc != nil {
-		if np != nil && nq != nil {
+		if counting {
 			*np += len(pwc.psubs)
 			for _, qsub := range pwc.qsubs {
 				*nq += len(qsub)
 			}
 		}
-		return len(pwc.plist) > 0 || len(pwc.psubs) > 0 || len(pwc.qsubs) > 0
+		matched = matched || len(pwc.plist) > 0 || len(pwc.psubs) > 0 || len(pwc.qsubs) > 0
 	}
-	return false
+	return matched
 }
 
 // lnt is used to track descent into levels for a removal for pruning.
@@ -1280,7 +1342,12 @@ func ValidateMapping(src string, dest string) error {
 		}
 
 		// if it looks like it contains a mapping function, it should be a valid mapping function
-		if length > 4 && t[0] == '{' && t[1] == '{' && t[length-2] == '}' && t[length-1] == '}' {
+		if isMappingFunctionToken(t) {
+			// Account scoped functions must have been resolved before the mapping is validated.
+			// Better error in case some (future) code path builds a transform without expanding it first.
+			if isAccountMappingFunction(t) {
+				return &mappingDestinationErr{t, ErrMappingFunctionNotAvailable}
+			}
 			if !partitionMappingFunctionRegEx.MatchString(t) &&
 				!wildcardMappingFunctionRegEx.MatchString(t) &&
 				!splitFromLeftMappingFunctionRegEx.MatchString(t) &&
@@ -1288,6 +1355,8 @@ func ValidateMapping(src string, dest string) error {
 				!sliceFromLeftMappingFunctionRegEx.MatchString(t) &&
 				!sliceFromRightMappingFunctionRegEx.MatchString(t) &&
 				!splitMappingFunctionRegEx.MatchString(t) &&
+				!leftMappingFunctionRegEx.MatchString(t) &&
+				!rightMappingFunctionRegEx.MatchString(t) &&
 				!randomMappingFunctionRegEx.MatchString(t) {
 				return &mappingDestinationErr{t, ErrUnknownMappingDestinationFunction}
 			} else {
@@ -1328,8 +1397,7 @@ func tokensCanMatch(t1, t2 string) bool {
 	if len(t1) == 0 || len(t2) == 0 {
 		return false
 	}
-	t1c, t2c := t1[0], t2[0]
-	if t1c == pwc || t2c == pwc || t1c == fwc || t2c == fwc {
+	if t1 == pwcs || t2 == pwcs || t1 == fwcs || t2 == fwcs {
 		return true
 	}
 	return t1 == t2
@@ -1485,7 +1553,7 @@ func isSubsetMatchTokenized(tokens, test []string) bool {
 			}
 			continue
 		}
-		if t2[0] != pwc && strings.Compare(t1, t2) != 0 {
+		if t2 != pwcs && strings.Compare(t1, t2) != 0 {
 			return false
 		}
 	}
@@ -1617,39 +1685,59 @@ func (s *Sublist) localSubs(subs *[]*subscription, includeLeafHubs bool) {
 // All is used to collect all subscriptions.
 func (s *Sublist) All(subs *[]*subscription) {
 	s.RLock()
-	s.collectAllSubs(s.root, subs)
+	s.collectAllSubs(s.root, subs, nil)
 	s.RUnlock()
 }
 
-func (s *Sublist) addAllNodeToSubs(n *node, subs *[]*subscription) {
+func (s *Sublist) Filter(subs *[]*subscription, filter SublistFilter) {
+	s.RLock()
+	s.collectAllSubs(s.root, subs, filter)
+	s.RUnlock()
+}
+
+func (s *Sublist) addAllNodeToSubs(n *node, subs *[]*subscription, filter SublistFilter) {
 	// Normal subscriptions
 	if n.plist != nil {
-		*subs = append(*subs, n.plist...)
+		if filter == nil {
+			*subs = append(*subs, n.plist...)
+		} else {
+			for _, sub := range n.plist {
+				if filter(sub) {
+					*subs = append(*subs, sub)
+				}
+			}
+		}
 	} else {
 		for sub := range n.psubs {
+			if filter != nil && !filter(sub) {
+				continue
+			}
 			*subs = append(*subs, sub)
 		}
 	}
 	// Queue subscriptions
 	for _, qr := range n.qsubs {
 		for sub := range qr {
+			if filter != nil && !filter(sub) {
+				continue
+			}
 			*subs = append(*subs, sub)
 		}
 	}
 }
 
-func (s *Sublist) collectAllSubs(l *level, subs *[]*subscription) {
+func (s *Sublist) collectAllSubs(l *level, subs *[]*subscription, filter SublistFilter) {
 	for _, n := range l.nodes {
-		s.addAllNodeToSubs(n, subs)
-		s.collectAllSubs(n.next, subs)
+		s.addAllNodeToSubs(n, subs, filter)
+		s.collectAllSubs(n.next, subs, filter)
 	}
 	if l.pwc != nil {
-		s.addAllNodeToSubs(l.pwc, subs)
-		s.collectAllSubs(l.pwc.next, subs)
+		s.addAllNodeToSubs(l.pwc, subs, filter)
+		s.collectAllSubs(l.pwc.next, subs, filter)
 	}
 	if l.fwc != nil {
-		s.addAllNodeToSubs(l.fwc, subs)
-		s.collectAllSubs(l.fwc.next, subs)
+		s.addAllNodeToSubs(l.fwc, subs, filter)
+		s.collectAllSubs(l.fwc.next, subs, filter)
 	}
 }
 

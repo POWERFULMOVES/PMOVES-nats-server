@@ -1,4 +1,4 @@
-// Copyright 2018-2025 The NATS Authors
+// Copyright 2018-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,13 +19,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"reflect"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1331,6 +1332,17 @@ func TestAccountReqMonitoring(t *testing.T) {
 
 	// Test ping from within account, send extra message to check counters.
 	require_NoError(t, nc.Publish("foo", nil))
+	require_NoError(t, nc.Flush())
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		acc.mu.RLock()
+		stats := acc.statz()
+		acc.mu.RUnlock()
+		if stats.Received.Msgs == 0 {
+			return fmt.Errorf("publish not accounted for yet")
+		}
+		return nil
+	})
+
 	ib := nc.NewRespInbox()
 	rSub, err = nc.SubscribeSync(ib)
 	require_NoError(t, err)
@@ -3740,7 +3752,7 @@ func Benchmark_GetHash(b *testing.B) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < b.N; i++ {
-				idx := rand.Intn(100)
+				idx := rand.IntN(100)
 				if h := getHash(names[idx]); h != hashes[idx] {
 					errCh <- fmt.Errorf("Hash for name %q was %q, but should be %q", names[idx], h, hashes[idx])
 					return
@@ -4289,5 +4301,76 @@ func TestEventsRemoteLatencyUpdateNilLatency(t *testing.T) {
 
 	if recovered != nil {
 		t.Fatalf("remoteLatencyUpdate panicked on nil si.latency: %v", recovered)
+	}
+}
+
+// runServerWithAccounts runs a server with a system account and n other accounts,
+// each with one user named "u<i>" with the password "p".
+func runServerWithAccounts(b testing.TB, n int) *Server {
+	b.Helper()
+	var conf strings.Builder
+	conf.WriteString("host: 127.0.0.1\nport: -1\nsystem_account: SYS\naccounts: {\n  SYS: {users: [{user: s, password: s}]}\n")
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&conf, "  A%d: {users: [{user: u%d, password: p}]}\n", i, i)
+	}
+	conf.WriteString("}\n")
+	s, _ := RunServerWithConfig(createConfFile(b, []byte(conf.String())))
+	return s
+}
+
+// benchConnectClose connects, authenticates and closes clients from many
+// goroutines, each as the user "u<i>" of one of the given number of accounts.
+// The clients are in memory (net.Pipe), so a long run does not use up the
+// ephemeral ports, but they go through the same CONNECT, authentication and
+// account registration as any other client. Besides the time per connection,
+// it reports the median and 99th percentile of the time from CONNECT to PONG.
+func benchConnectClose(b *testing.B, s *Server, accounts int) {
+	var (
+		next atomic.Uint32
+		mu   sync.Mutex
+		lats []time.Duration
+	)
+	b.SetParallelism(4)
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		user := fmt.Sprintf("u%d", int(next.Add(1)-1)%accounts)
+		connect := []byte(fmt.Sprintf("CONNECT {\"user\":%q,\"pass\":\"p\"}\r\nPING\r\n", user))
+		var local []time.Duration
+		defer func() {
+			mu.Lock()
+			lats = append(lats, local...)
+			mu.Unlock()
+		}()
+		for pb.Next() {
+			c, cr, _ := newClientForServer(s)
+			start := time.Now()
+			if err := c.parse(connect); err != nil {
+				b.Errorf("Error on connect: %v", err)
+				return
+			}
+			if l, err := cr.ReadString('\n'); err != nil || l != "PONG\r\n" {
+				b.Errorf("Expected PONG, got %q, %v", l, err)
+				return
+			}
+			local = append(local, time.Since(start))
+			c.close()
+		}
+	})
+	b.StopTimer()
+	if len(lats) > 0 {
+		slices.Sort(lats)
+		b.ReportMetric(float64(lats[len(lats)/2].Nanoseconds()), "p50-ns/connect")
+		b.ReportMetric(float64(lats[len(lats)*99/100].Nanoseconds()), "p99-ns/connect")
+	}
+}
+
+func BenchmarkConnectCloseParallel(b *testing.B) {
+	for _, accounts := range []int{1, 16} {
+		b.Run(fmt.Sprintf("accounts=%d", accounts), func(b *testing.B) {
+			s := runServerWithAccounts(b, accounts)
+			defer s.Shutdown()
+			benchConnectClose(b, s, accounts)
+		})
 	}
 }

@@ -1,4 +1,4 @@
-// Copyright 2012-2025 The NATS Authors
+// Copyright 2012-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -102,7 +102,7 @@ loop:
 				// File log re-open for rotating file logs.
 				w.server.ReOpenLogFile()
 			case ldmCmd:
-				go w.server.lameDuckMode()
+				w.server.startLameDuckMode()
 			case svc.ParamChange:
 				if err := w.server.Reload(); err != nil {
 					w.server.Errorf("Failed to reload server configuration: %s", err)

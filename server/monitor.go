@@ -277,6 +277,8 @@ func (s *Server) Connz(opts *ConnzOptions) (*Connz, error) {
 
 	// Open clients
 	var openClients []*client
+	// Selected client
+	var cidClient *client
 	// Hold for closed clients if requested.
 	var closedClients []*closedClient
 
@@ -298,7 +300,7 @@ func (s *Server) Connz(opts *ConnzOptions) (*Connz, error) {
 		a.mu.RUnlock()
 	}
 
-	// Walk the open client list with server lock held.
+	// Snapshot server connection state.
 	s.mu.RLock()
 	// Default to all client unless filled in above.
 	if clist == nil {
@@ -309,6 +311,11 @@ func (s *Server) Connz(opts *ConnzOptions) (*Connz, error) {
 
 	// copy the server id for monitoring
 	c.ID = s.info.ID
+	// select client by CID
+	if cid > 0 {
+		cidClient = clist[cid]
+	}
+	s.mu.RUnlock()
 
 	// Number of total clients. The resulting ConnInfo array
 	// may be smaller if pagination is used.
@@ -365,9 +372,17 @@ func (s *Server) Connz(opts *ConnzOptions) (*Connz, error) {
 		// Let's first check if user also selects on ConnOpen or ConnAll
 		// and look for opened connections.
 		if state == ConnOpen || state == ConnAll {
-			if client := s.clients[cid]; client != nil {
-				openClients = append(openClients, client)
-				closedClients = nil
+			if cidClient != nil {
+				// The account filter was already applied by scoping clist,
+				// but user and MQTT client ID filters still need to be applied.
+				cidClient.mu.RLock()
+				cAuthUser := cidClient.getRawAuthUser()
+				cMQTTID := cidClient.getMQTTClientID()
+				cidClient.mu.RUnlock()
+				if (user == _EMPTY_ || cAuthUser == user) && (mqttCID == _EMPTY_ || cMQTTID == mqttCID) {
+					openClients = append(openClients, cidClient)
+					closedClients = nil
+				}
 			}
 		}
 		// If we did not find, and the user selected for ConnClosed or ConnAll,
@@ -412,7 +427,6 @@ func (s *Server) Connz(opts *ConnzOptions) (*Connz, error) {
 			}
 		}
 	}
-	s.mu.RUnlock()
 
 	// Filter by subject now if needed. We do this outside of server lock.
 	if filter != _EMPTY_ {
@@ -432,6 +446,7 @@ func (s *Server) Connz(opts *ConnzOptions) (*Connz, error) {
 
 	// Just return with empty array if nothing here.
 	if len(openClients) == 0 && len(closedClients) == 0 {
+		c.Total = 0
 		c.Conns = ConnInfos{}
 		return c, nil
 	}
@@ -521,6 +536,8 @@ func (s *Server) Connz(opts *ConnzOptions) (*Connz, error) {
 		pconns = pconns[:i]
 		totalClients = i
 	}
+	// Total reflects all connections that matched the query, before pagination.
+	c.Total = i
 
 	switch sortOpt {
 	case ByCid, ByStart:
@@ -1080,6 +1097,10 @@ func (s *Server) Subsz(opts *SubszOptions) (*Subsz, error) {
 			sub.client.mu.Unlock()
 			i++
 		}
+		// Sort for a consistent order across paged requests, since subs were collected from maps.
+		slices.SortFunc(details, func(a, b SubDetail) int {
+			return cmp.Or(cmp.Compare(a.Cid, b.Cid), strings.Compare(a.Sid, b.Sid), strings.Compare(a.Subject, b.Subject))
+		})
 		// Make sure these are sane.
 		maxIndex := i
 		minoff := min(max(sz.Offset, 0), maxIndex)
@@ -1587,9 +1608,16 @@ func (s *Server) updateJszVarz(js *jetStream, v *JetStreamVarz, doConfig bool) {
 	v.Limits = &s.getOpts().JetStreamLimits
 	if mg := js.getMetaGroup(); mg != nil {
 		if ci := s.raftNodeToClusterInfo(mg); ci != nil {
-			v.Meta = &MetaClusterInfo{Name: ci.Name, Leader: ci.Leader, Peer: getHash(ci.Leader), Size: mg.ClusterSize()}
-			if ci.Leader == s.info.Name {
-				v.Meta.Replicas = ci.Replicas
+			v.Meta = &MetaClusterInfo{
+				Name:         ci.Name,
+				Leader:       ci.Leader,
+				Replicas:     ci.Replicas,
+				Size:         mg.ClusterSize(),
+				QuorumNeeded: mg.QuorumNeeded(),
+				Rescue:       mg.InRescue(),
+			}
+			if ci.Leader != _EMPTY_ {
+				v.Meta.Peer = getHash(ci.Leader)
 			}
 			if ipq := s.jsAPIRoutedReqs; ipq != nil {
 				v.Meta.PendingRequests = ipq.len()
@@ -2438,6 +2466,7 @@ type LeafInfo struct {
 	NumSubs     uint32     `json:"subscriptions"`
 	Subs        []string   `json:"subscriptions_list,omitempty"`
 	Compression string     `json:"compression,omitempty"`
+	Websocket   bool       `json:"websocket,omitempty"`
 	Proxy       *ProxyInfo `json:"proxy,omitempty"`
 }
 
@@ -2482,6 +2511,7 @@ func (s *Server) Leafz(opts *LeafzOptions) (*Leafz, error) {
 				OutBytes:    ln.outBytes,
 				NumSubs:     uint32(len(ln.subs)),
 				Compression: ln.leaf.compression,
+				Websocket:   ln.isWebsocket(),
 				Proxy:       createProxyInfo(ln),
 			}
 			if opts != nil && opts.Subscriptions {
@@ -2994,14 +3024,15 @@ type JSzOptions struct {
 // HealthzOptions are options passed to Healthz
 type HealthzOptions struct {
 	// Deprecated: Use JSEnabledOnly instead
-	JSEnabled     bool   `json:"js-enabled,omitempty"`
-	JSEnabledOnly bool   `json:"js-enabled-only,omitempty"`
-	JSServerOnly  bool   `json:"js-server-only,omitempty"`
-	JSMetaOnly    bool   `json:"js-meta-only,omitempty"`
-	Account       string `json:"account,omitempty"`
-	Stream        string `json:"stream,omitempty"`
-	Consumer      string `json:"consumer,omitempty"`
-	Details       bool   `json:"details,omitempty"`
+	JSEnabled            bool   `json:"js-enabled,omitempty"`
+	JSEnabledOnly        bool   `json:"js-enabled-only,omitempty"`
+	JSServerOnly         bool   `json:"js-server-only,omitempty"`
+	JSMetaOnly           bool   `json:"js-meta-only,omitempty"`
+	LeafRemotesConnected bool   `json:"leaf-remotes-connected,omitempty"`
+	Account              string `json:"account,omitempty"`
+	Stream               string `json:"stream,omitempty"`
+	Consumer             string `json:"consumer,omitempty"`
+	Details              bool   `json:"details,omitempty"`
 }
 
 // ProfilezOptions are options passed to Profilez
@@ -3092,6 +3123,8 @@ type MetaClusterInfo struct {
 	Peer            string             `json:"peer,omitempty"`     // Peer is unique ID of the leader
 	Replicas        []*PeerInfo        `json:"replicas,omitempty"` // Replicas is a list of known peers
 	Size            int                `json:"cluster_size"`       // Size is the known size of the cluster
+	QuorumNeeded    int                `json:"quorum_needed"`      // QuorumNeeded is this server's current effective quorum size
+	Rescue          bool               `json:"rescue,omitempty"`   // Rescue indicates the quorum is unsafely lowered by an active rescue
 	Pending         int                `json:"pending"`            // Pending is how many RAFT messages are not yet processed
 	PendingRequests int                `json:"pending_requests"`   // PendingRequests is how many CRUD operations are queued for processing
 	PendingInfos    int                `json:"pending_infos"`      // PendingInfos is how many info operations are queued for processing
@@ -3160,7 +3193,9 @@ func (s *Server) accountDetail(jsa *jsAccount, optStreams, optConsumers, optDire
 			ci := js.clusterInfo(rgroup)
 			var cfg *StreamConfig
 			if optCfg {
-				c := stream.config()
+				// Report the config as requested, the stream can still be running at its origin.
+				// Must be consistent with the desired state reported as part of the cluster info.
+				c := js.targetStreamConfig(stream, stream.config())
 				cfg = &c
 			}
 			// Skip if we are only looking for stream leaders.
@@ -3312,9 +3347,16 @@ func (s *Server) Jsz(opts *JSzOptions) (*JSInfo, error) {
 
 	if mg := js.getMetaGroup(); mg != nil {
 		if ci := s.raftNodeToClusterInfo(mg); ci != nil {
-			jsi.Meta = &MetaClusterInfo{Name: ci.Name, Leader: ci.Leader, Peer: getHash(ci.Leader), Size: mg.ClusterSize()}
-			if isLeader {
-				jsi.Meta.Replicas = ci.Replicas
+			jsi.Meta = &MetaClusterInfo{
+				Name:         ci.Name,
+				Leader:       ci.Leader,
+				Replicas:     ci.Replicas,
+				Size:         mg.ClusterSize(),
+				QuorumNeeded: mg.QuorumNeeded(),
+				Rescue:       mg.InRescue(),
+			}
+			if ci.Leader != _EMPTY_ {
+				jsi.Meta.Peer = getHash(ci.Leader)
 			}
 			if ipq := s.jsAPIRoutedReqs; ipq != nil {
 				jsi.Meta.PendingRequests = ipq.len()
@@ -3564,6 +3606,10 @@ func (s *Server) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	leafRemotesConnected, err := decodeBool(w, r, "leaf-remotes-connected")
+	if err != nil {
+		return
+	}
 
 	includeDetails, err := decodeBool(w, r, "details")
 	if err != nil {
@@ -3571,14 +3617,15 @@ func (s *Server) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hs := s.healthz(&HealthzOptions{
-		JSEnabled:     jsEnabled,
-		JSEnabledOnly: jsEnabledOnly,
-		JSServerOnly:  jsServerOnly,
-		JSMetaOnly:    jsMetaOnly,
-		Account:       r.URL.Query().Get("account"),
-		Stream:        r.URL.Query().Get("stream"),
-		Consumer:      r.URL.Query().Get("consumer"),
-		Details:       includeDetails,
+		JSEnabled:            jsEnabled,
+		JSEnabledOnly:        jsEnabledOnly,
+		JSServerOnly:         jsServerOnly,
+		JSMetaOnly:           jsMetaOnly,
+		LeafRemotesConnected: leafRemotesConnected,
+		Account:              r.URL.Query().Get("account"),
+		Stream:               r.URL.Query().Get("stream"),
+		Consumer:             r.URL.Query().Get("consumer"),
+		Details:              includeDetails,
 	})
 
 	code := hs.StatusCode
@@ -3601,6 +3648,7 @@ func (s *Server) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 // Generate health status.
 func (s *Server) healthz(opts *HealthzOptions) *HealthStatus {
 	var health = &HealthStatus{Status: "ok"}
+	const na = "unavailable"
 
 	// set option defaults
 	if opts == nil {
@@ -3668,6 +3716,22 @@ func (s *Server) healthz(opts *HealthzOptions) *HealthStatus {
 		return health
 	}
 
+	// If requested, make sure every enabled solicited leafnode remote is connected.
+	if opts.LeafRemotesConnected {
+		if errs := s.disconnectedLeafRemotes(); len(errs) > 0 {
+			health.StatusCode = http.StatusServiceUnavailable
+			health.Status = na
+			if !details {
+				health.Error = errs[0]
+				return health
+			}
+			for _, e := range errs {
+				health.Errors = append(health.Errors, HealthzError{Type: HealthzErrorConn, Error: e})
+			}
+			return health
+		}
+	}
+
 	// If JSServerOnly is true, then do not check further accounts, streams and consumers.
 	if opts.JSServerOnly {
 		return health
@@ -3682,7 +3746,6 @@ func (s *Server) healthz(opts *HealthzOptions) *HealthStatus {
 
 	// Access the Jetstream state to perform additional checks.
 	js := s.getJetStream()
-	const na = "unavailable"
 	if !js.isEnabled() {
 		health.StatusCode = http.StatusServiceUnavailable
 		health.Status = na
@@ -4104,7 +4167,7 @@ func (s *Server) healthz(opts *HealthzOptions) *HealthStatus {
 			mset, _ := acc.lookupStream(stream)
 			// Now check consumers.
 			for consumer, ca := range sa.consumers {
-				if err := js.isConsumerHealthy(mset, consumer, ca); err != nil {
+				if err := js.isConsumerHealthy(mset, sa, consumer, ca); err != nil {
 					if !details {
 						health.Status = na
 						health.Error = fmt.Sprintf("JetStream consumer '%s > %s > %s' is not current: %s", acc, stream, consumer, err)
@@ -4356,4 +4419,39 @@ func (s *Server) Raftz(opts *RaftzOptions) *RaftzStatus {
 	}
 
 	return &infos
+}
+
+// disconnectedLeafRemotes returns a description of each enabled solicited
+// leafnode remote that does not currently have an established connection.
+func (s *Server) disconnectedLeafRemotes() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.leafRemoteCfgs) == 0 {
+		return nil
+	}
+	connected := make(map[*leafNodeCfg]struct{}, len(s.leafs))
+	for _, c := range s.leafs {
+		c.mu.Lock()
+		if c.leaf != nil && c.leaf.remote != nil {
+			connected[c.leaf.remote] = struct{}{}
+		}
+		c.mu.Unlock()
+	}
+	var errs []string
+	for cfg := range s.leafRemoteCfgs {
+		if !cfg.stillValid() {
+			continue
+		}
+		if _, ok := connected[cfg]; !ok {
+			// Only report the account and redacted URLs. The remote name also includes
+			// the credentials file path, which should not be exposed on this endpoint.
+			acc := cfg.LocalAccount
+			if acc == _EMPTY_ {
+				acc = globalAccountName
+			}
+			errs = append(errs, fmt.Sprintf("leafnode remote for account %q (urls=%q) is not connected", acc, redactURLList(cfg.URLs)))
+		}
+	}
+	sort.Strings(errs)
+	return errs
 }

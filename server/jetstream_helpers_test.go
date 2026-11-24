@@ -1,4 +1,4 @@
-// Copyright 2020-2025 The NATS Authors
+// Copyright 2020-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,17 +19,19 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/url"
 	"os"
 	"path"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -49,7 +51,7 @@ func init() {
 	hbInterval = 50 * time.Millisecond
 	minElectionTimeout = 1500 * time.Millisecond
 	maxElectionTimeout = 3500 * time.Millisecond
-	lostQuorumInterval = 2 * time.Second
+	lostQuorumInterval = 5 * time.Second
 	lostQuorumCheck = 4 * hbInterval
 
 	// For statz and jetstream placement speedups as well.
@@ -102,10 +104,23 @@ func (sc *supercluster) waitOnStreamLeader(account, stream string) {
 	expires := time.Now().Add(30 * time.Second)
 	for time.Now().Before(expires) {
 		for _, c := range sc.clusters {
-			if leader := c.streamLeader(account, stream); leader != nil {
-				time.Sleep(200 * time.Millisecond)
-				return
+			leader := c.streamLeader(account, stream)
+			if leader == nil {
+				time.Sleep(100 * time.Millisecond)
+				continue
 			}
+			// Also wait for the stream leader to finish any scales/moves.
+			js := leader.getJetStream()
+			js.mu.RLock()
+			sa := js.streamAssignment(account, stream)
+			wait := sa == nil || (sa.Group != nil && sa.Group.Desired != nil)
+			js.mu.RUnlock()
+			if wait {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			time.Sleep(200 * time.Millisecond)
+			return
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -153,6 +168,25 @@ var jsClusterTempl = `
 	listen: 127.0.0.1:-1
 	server_name: %s
 	jetstream: {max_mem_store: 2GB, max_file_store: 2GB, store_dir: '%s'}
+
+	leaf {
+		listen: 127.0.0.1:-1
+	}
+
+	cluster {
+		name: %s
+		listen: 127.0.0.1:%d
+		routes = [%s]
+	}
+
+	# For access to system account.
+	accounts { $SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] } }
+`
+
+var jsClusterSyncAlwaysTempl = `
+	listen: 127.0.0.1:-1
+	server_name: %s
+	jetstream: {max_mem_store: 2GB, max_file_store: 2GB, store_dir: '%s', sync_interval: always}
 
 	leaf {
 		listen: 127.0.0.1:-1
@@ -425,8 +459,8 @@ func createJetStreamSuperClusterWithTemplateAndModHook(t *testing.T, tmpl string
 
 	startClusterPorts := []int{20_022, 22_022, 24_022}
 	startGatewayPorts := []int{20_122, 22_122, 24_122}
-	startClusterPort := startClusterPorts[rand.Intn(len(startClusterPorts))]
-	startGWPort := startGatewayPorts[rand.Intn(len(startGatewayPorts))]
+	startClusterPort := startClusterPorts[rand.IntN(len(startClusterPorts))]
+	startGWPort := startGatewayPorts[rand.IntN(len(startGatewayPorts))]
 
 	// Make the GWs form faster for the tests.
 	SetGatewaysSolicitDelay(10 * time.Millisecond)
@@ -504,6 +538,7 @@ func createJetStreamSuperClusterWithTemplateAndModHook(t *testing.T, tmpl string
 	}
 
 	sc := &supercluster{t, clusters, nproxies}
+	sc.campaignMetaImmediately()
 	sc.waitOnLeader()
 	sc.waitOnAllCurrent()
 
@@ -567,7 +602,7 @@ func (sc *supercluster) waitOnLeader() {
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	antithesis.AssertUnreachable(sc.t, "Timeout in supercluster.waitOnStreamLeader", nil)
+	antithesis.AssertUnreachable(sc.t, "Timeout in supercluster.waitOnLeader", nil)
 	sc.t.Fatalf("Expected a cluster leader, got none")
 }
 
@@ -590,6 +625,14 @@ func (sc *supercluster) waitOnAccount(account string) {
 	}
 
 	sc.t.Fatalf("Expected account %q to exist but didn't", account)
+}
+
+func (sc *supercluster) campaignMetaImmediately() {
+	var servers []*Server
+	for _, c := range sc.clusters {
+		servers = append(servers, c.servers...)
+	}
+	campaignMetaImmediately(servers)
 }
 
 func (sc *supercluster) waitOnAllCurrent() {
@@ -753,6 +796,7 @@ func createMixedModeCluster(t testing.TB, tmpl string, clusterName, snPre string
 	// Wait til we are formed and have a leader.
 	c.checkClusterFormed()
 	if numJsServers > 0 {
+		c.campaignMetaImmediately()
 		c.waitOnPeerCount(numJsServers)
 	}
 
@@ -771,7 +815,7 @@ func createJetStreamClusterWithTemplate(t testing.TB, tmpl string, clusterName s
 
 func createJetStreamClusterWithTemplateAndModHook(t testing.TB, tmpl string, clusterName string, numServers int, modify modifyCb) *cluster {
 	startPorts := []int{7_022, 9_022, 11_022, 15_022}
-	port := startPorts[rand.Intn(len(startPorts))]
+	port := startPorts[rand.IntN(len(startPorts))]
 	return createJetStreamClusterAndModHook(t, tmpl, clusterName, _EMPTY_, numServers, port, true, modify)
 }
 
@@ -787,7 +831,7 @@ func createJetStreamClusterAndModHook(t testing.TB, tmpl, cName, snPre string, n
 
 func createJetStreamClusterWithNetProxy(t testing.TB, cName string, numServers int, cnp *clusterProxy) *cluster {
 	startPorts := []int{7_122, 9_122, 11_122, 15_122}
-	port := startPorts[rand.Intn(len(startPorts))]
+	port := startPorts[rand.IntN(len(startPorts))]
 	return createJetStreamClusterEx(t, jsClusterTempl, cName, _EMPTY_, numServers, port, true, nil, cnp)
 }
 
@@ -850,10 +894,39 @@ func createJetStreamClusterEx(t testing.TB, tmpl, cName, snPre string, numServer
 	// Wait til we are formed and have a leader.
 	c.checkClusterFormed()
 	if wait {
+		c.campaignMetaImmediately()
 		c.waitOnClusterReady()
 	}
 
 	return c
+}
+
+func (c *cluster) campaignMetaImmediately() {
+	campaignMetaImmediately(c.servers)
+}
+
+func campaignMetaImmediately(servers []*Server) {
+	// Only campaign on a single meta group, but check all servers first
+	// since one could already know of a leader. Pick the campaigning server
+	// at random so tests don't always end up with the same meta leader.
+	var nodes []RaftNode
+	for _, s := range servers {
+		js := s.getJetStream()
+		if js == nil {
+			continue
+		}
+		n := js.getMetaGroup()
+		if n == nil {
+			continue
+		}
+		if n.GroupLeader() != _EMPTY_ {
+			return
+		}
+		nodes = append(nodes, n)
+	}
+	if len(nodes) > 0 {
+		nodes[rand.IntN(len(nodes))].CampaignImmediately()
+	}
 }
 
 func (c *cluster) addInNewServer() *Server {
@@ -1439,11 +1512,23 @@ func (c *cluster) waitOnConsumerLeader(account, stream, consumer string) {
 	c.t.Helper()
 	expires := time.Now().Add(30 * time.Second)
 	for time.Now().Before(expires) {
-		if leader := c.consumerLeader(account, stream, consumer); leader != nil {
-			time.Sleep(200 * time.Millisecond)
-			return
+		leader := c.consumerLeader(account, stream, consumer)
+		if leader == nil {
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
-		time.Sleep(100 * time.Millisecond)
+		// Also wait for the consumer leader to finish any scales/moves.
+		js := leader.getJetStream()
+		js.mu.RLock()
+		ca := js.consumerAssignment(account, stream, consumer)
+		wait := ca == nil || (ca.Group != nil && ca.Group.Desired != nil)
+		js.mu.RUnlock()
+		if wait {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		time.Sleep(200 * time.Millisecond)
+		return
 	}
 	antithesis.AssertUnreachable(c.t, "Timeout in cluster.waitOnConsumerLeader", map[string]any{
 		"cluster":  c.name,
@@ -1474,15 +1559,69 @@ func (c *cluster) randomNonConsumerLeader(account, stream, consumer string) *Ser
 	return nil
 }
 
+// stepDownStreamLeader steps the stream leader down to the given server if it's not equal.
+func (c *cluster) stepDownStreamLeader(nc *nats.Conn, account, stream string, s *Server) {
+	c.t.Helper()
+	req, err := json.Marshal(JSApiLeaderStepdownRequest{Placement: &Placement{Preferred: s.Name()}})
+	require_NoError(c.t, err)
+	// The leader skips the preferred peer if it hasn't heard from it yet, retry until it's picked.
+	checkFor(c.t, 10*time.Second, 100*time.Millisecond, func() error {
+		c.waitOnStreamLeader(account, stream)
+		if sl := c.streamLeader(account, stream); sl == s {
+			return nil
+		}
+		_, err = nc.Request(fmt.Sprintf(JSApiStreamLeaderStepDownT, stream), req, 5*time.Second)
+		require_NoError(c.t, err)
+		c.waitOnStreamLeader(account, stream)
+		if sl := c.streamLeader(account, stream); sl != s {
+			return fmt.Errorf("expected stream leader %s, got %s", s, sl)
+		}
+		return nil
+	})
+}
+
+// stepDownConsumerLeader steps the consumer leader down to the given server if it's not equal.
+func (c *cluster) stepDownConsumerLeader(nc *nats.Conn, account, stream, consumer string, s *Server) {
+	c.t.Helper()
+	req, err := json.Marshal(JSApiLeaderStepdownRequest{Placement: &Placement{Preferred: s.Name()}})
+	require_NoError(c.t, err)
+	// The leader skips the preferred peer if it hasn't heard from it yet, retry until it's picked.
+	checkFor(c.t, 10*time.Second, 100*time.Millisecond, func() error {
+		c.waitOnConsumerLeader(account, stream, consumer)
+		if cl := c.consumerLeader(account, stream, consumer); cl == s {
+			return nil
+		}
+		_, err = nc.Request(fmt.Sprintf(JSApiConsumerLeaderStepDownT, stream, consumer), req, 5*time.Second)
+		require_NoError(c.t, err)
+		c.waitOnConsumerLeader(account, stream, consumer)
+		if cl := c.consumerLeader(account, stream, consumer); cl != s {
+			return fmt.Errorf("expected consumer leader %s, got %s", s, cl)
+		}
+		return nil
+	})
+}
+
 func (c *cluster) waitOnStreamLeader(account, stream string) {
 	c.t.Helper()
 	expires := time.Now().Add(30 * time.Second)
 	for time.Now().Before(expires) {
-		if leader := c.streamLeader(account, stream); leader != nil {
-			time.Sleep(200 * time.Millisecond)
-			return
+		leader := c.streamLeader(account, stream)
+		if leader == nil {
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
-		time.Sleep(100 * time.Millisecond)
+		// Also wait for the stream leader to finish any scales/moves.
+		js := leader.getJetStream()
+		js.mu.RLock()
+		sa := js.streamAssignment(account, stream)
+		wait := sa == nil || (sa.Group != nil && sa.Group.Desired != nil)
+		js.mu.RUnlock()
+		if wait {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		time.Sleep(200 * time.Millisecond)
+		return
 	}
 	antithesis.AssertUnreachable(c.t, "Timeout in cluster.waitOnStreamLeader", map[string]any{
 		"cluster": c.name,
@@ -1565,9 +1704,27 @@ func (c *cluster) waitOnServerCurrent(s *Server) {
 
 func (c *cluster) waitOnAllCurrent() {
 	c.t.Helper()
-	for _, cs := range c.servers {
-		c.waitOnServerCurrent(cs)
+	// Callers use this to wait for a proposal they just made to be applied,
+	// so give it a chance to be committed before checking for currency.
+	time.Sleep(100 * time.Millisecond)
+	expires := time.Now().Add(30 * time.Second)
+	for time.Now().Before(expires) {
+		current := true
+		for _, s := range c.servers {
+			if s.JetStreamEnabled() && !s.JetStreamIsCurrent() {
+				current = false
+				break
+			}
+		}
+		if current {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	antithesis.AssertUnreachable(c.t, "Timeout in cluster.waitOnAllCurrent", map[string]any{
+		"cluster": c.name,
+	})
+	c.t.Fatalf("Expected all servers in cluster %q to eventually be current", c.name)
 }
 
 func (c *cluster) serverByName(sname string) *Server {
@@ -1592,7 +1749,14 @@ func (c *cluster) randomNonLeader() *Server {
 func (c *cluster) leader() *Server {
 	for _, s := range c.servers {
 		if s.JetStreamIsLeader() {
-			return s
+			// The upper layer is only signaled asynchronously, so also require the meta
+			// group to still be leader. Otherwise, a leader that just stepped down could
+			// still be returned until it processes the leader change.
+			if js := s.getJetStream(); js != nil {
+				if meta := js.getMetaGroup(); meta != nil && meta.Leader() {
+					return s
+				}
+			}
 		}
 	}
 	return nil
@@ -1661,7 +1825,6 @@ func (c *cluster) waitOnAccount(account string) {
 func (c *cluster) waitOnClusterReady() {
 	c.t.Helper()
 	c.waitOnClusterReadyWithNumPeers(len(c.servers))
-	c.waitOnLeader()
 }
 
 func (c *cluster) waitOnClusterReadyWithNumPeers(numPeersExpected int) {
@@ -1675,8 +1838,16 @@ func (c *cluster) waitOnClusterReadyWithNumPeers(numPeersExpected int) {
 			continue
 		}
 		if len(leader.JetStreamClusterPeers()) == numPeersExpected {
-			time.Sleep(100 * time.Millisecond)
-			return
+			current := true
+			for _, s := range c.servers {
+				if s.Running() && s.JetStreamEnabled() && !s.JetStreamIsCurrent() {
+					current = false
+					break
+				}
+			}
+			if current {
+				return
+			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -1754,6 +1925,8 @@ func (c *cluster) restartAll() {
 			c.opts[i] = o
 		}
 	}
+	c.checkClusterFormed()
+	c.campaignMetaImmediately()
 	c.waitOnClusterReady()
 }
 
@@ -1771,6 +1944,8 @@ func (c *cluster) lameDuckRestartAll() {
 			c.opts[i] = o
 		}
 	}
+	c.checkClusterFormed()
+	c.campaignMetaImmediately()
 	c.waitOnClusterReady()
 }
 
@@ -1783,6 +1958,8 @@ func (c *cluster) restartAllSamePorts() {
 			c.servers[i] = s
 		}
 	}
+	c.checkClusterFormed()
+	c.campaignMetaImmediately()
 	c.waitOnClusterReady()
 }
 
@@ -2123,7 +2300,22 @@ func copyDir(t *testing.T, dst, src string) error {
 	srcFS := os.DirFS(src)
 	return fs.WalkDir(srcFS, ".", func(p string, d os.DirEntry, err error) error {
 		if err != nil {
+			// The entry is gone, don't include it in the copy.
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
 			return err
+		}
+		// Skip stream purge directories.
+		if d.IsDir() && (d.Name() == purgeDir || d.Name() == newMsgDir) {
+			return fs.SkipDir
+		}
+		// Atomic writes use .tmp files that are renamed into place when complete.
+		if strings.HasSuffix(d.Name(), blkTmpSuffix) {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
 		}
 		newPath := path.Join(dst, p)
 		if d.IsDir() {
@@ -2131,6 +2323,10 @@ func copyDir(t *testing.T, dst, src string) error {
 		}
 		r, err := srcFS.Open(p)
 		if err != nil {
+			// The entry is gone, don't include it in the copy.
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
 			return err
 		}
 		defer r.Close()
@@ -2256,4 +2452,142 @@ func checkStateAndErr(t *testing.T, c *cluster, accountName, streamName string) 
 		return StreamState{}, errors.Join(errs...)
 	}
 	return streamLeader.State, nil
+}
+
+// Helpers for the meta leader peer reconciliation tests.
+func metaStreamPeers(s *Server, account, stream string) []string {
+	js := s.getJetStream()
+	js.mu.RLock()
+	defer js.mu.RUnlock()
+	sa := js.streamAssignmentOrInflight(account, stream)
+	if sa == nil {
+		return nil
+	}
+	peers := copyStrings(sa.Group.Peers)
+	slices.Sort(peers)
+	return peers
+}
+
+func metaConsumerPeers(s *Server, account, stream, consumer string) []string {
+	js := s.getJetStream()
+	js.mu.RLock()
+	defer js.mu.RUnlock()
+	ca := js.consumerAssignmentOrInflight(account, stream, consumer)
+	if ca == nil {
+		return nil
+	}
+	peers := copyStrings(ca.Group.Peers)
+	slices.Sort(peers)
+	return peers
+}
+
+func performStreamBackup(t *testing.T, nc *nats.Conn, streamName string) (StreamConfig, StreamState, []byte) {
+	t.Helper()
+	endpoint := fmt.Sprintf(JSApiStreamSnapshotT, streamName)
+	inbox := nc.NewRespInbox()
+
+	sub, err := nc.SubscribeSync(inbox)
+	require_NoError(t, err)
+
+	resp, err := nc.RequestMsg(&nats.Msg{
+		Subject: endpoint,
+		Data:    fmt.Appendf(nil, `{"deliver_subject": %q}`, inbox),
+	}, 5*time.Second)
+	require_NoError(t, err)
+
+	var body struct {
+		StreamState  `json:"state"`
+		StreamConfig `json:"config"`
+	}
+	require_NoError(t, json.Unmarshal(resp.Data, &body))
+
+	buf := bytes.NewBuffer(nil)
+	for {
+		msg, err := sub.NextMsg(5 * time.Second)
+		require_NoError(t, err)
+		if msg.Reply != _EMPTY_ {
+			require_NoError(t, msg.Respond(nil))
+		}
+		if len(msg.Data) == 0 {
+			break
+		}
+		_, err = buf.Write(msg.Data)
+		require_NoError(t, err)
+	}
+	return body.StreamConfig, body.StreamState, buf.Bytes()
+}
+
+func performStreamRestore(t *testing.T, nc *nats.Conn, sc StreamConfig, ss StreamState, archive []byte) bool {
+	t.Helper()
+	endpoint := fmt.Sprintf(JSApiStreamRestoreT, sc.Name)
+
+	req, err := json.Marshal(struct {
+		StreamState  `json:"state"`
+		StreamConfig `json:"config"`
+	}{
+		StreamState:  ss,
+		StreamConfig: sc,
+	})
+	require_NoError(t, err)
+
+	resp, err := nc.RequestMsg(&nats.Msg{
+		Subject: endpoint,
+		Data:    req,
+	}, 5*time.Second)
+	require_NoError(t, err)
+
+	var res struct {
+		DeliverSubject string `json:"deliver_subject"`
+	}
+	require_NoError(t, json.Unmarshal(resp.Data, &res))
+	if !IsValidLiteralSubject(res.DeliverSubject) {
+		return false
+	}
+
+	reader := bytes.NewReader(archive)
+	buf := make([]byte, 128*1024)
+	for {
+		n, err := reader.Read(buf)
+		if err == io.EOF {
+			break
+		}
+		require_NoError(t, err)
+
+		_, err = nc.Request(res.DeliverSubject, buf[:n], time.Second)
+		require_NoError(t, err)
+	}
+
+	_, err = nc.Request(res.DeliverSubject, nil, time.Second)
+	require_NoError(t, err)
+	return true
+}
+
+// publishAsync publishes a message asynchronously, retrying if we're stalled
+// on async publishes.
+func publishAsync(t testing.TB, js nats.JetStreamContext, subj string, msg []byte) nats.PubAckFuture {
+	t.Helper()
+	for {
+		pubAck, err := js.PublishAsync(subj, msg)
+		if err == nil {
+			return pubAck
+		}
+		require_Error(t, err, nats.ErrTooManyStalledMsgs)
+	}
+}
+
+// requireFileStoreStopped checks that the named filestore has already logged
+// to l that it stopped.
+func requireFileStoreStopped(t *testing.T, l *captureDebugLogger, name string) {
+	t.Helper()
+	stopped := fmt.Sprintf("Filestore [%s] Stopped", name)
+	for {
+		select {
+		case msg := <-l.dbgCh:
+			if msg == stopped {
+				return
+			}
+		default:
+			t.Fatalf("Filestore %q not stopped", name)
+		}
+	}
 }

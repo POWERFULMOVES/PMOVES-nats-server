@@ -1,4 +1,4 @@
-// Copyright 2012-2025 The NATS Authors
+// Copyright 2012-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -174,6 +174,9 @@ var (
 	// ErrServerNotRunning is used to signal an error that a server is not running.
 	ErrServerNotRunning = errors.New("server is not running")
 
+	// ErrConfigReloadNotSupported signals a config change that requires a restart instead of a reload.
+	ErrConfigReloadNotSupported = errors.New("config reload not supported")
+
 	// ErrServerNameHasSpaces signals that the server name contains spaces, which is not allowed.
 	ErrServerNameHasSpaces = errors.New("server name cannot contain spaces")
 
@@ -196,6 +199,9 @@ var (
 
 	// ErrClusterNameHasSpaces signals that the cluster name contains spaces, which is not allowed.
 	ErrClusterNameHasSpaces = errors.New("cluster name cannot contain spaces")
+
+	// ErrClusterNameReserved signals that the cluster name is reserved for internal protocol use.
+	ErrClusterNameReserved = errors.New("cluster name is reserved")
 
 	// ErrMalformedSubject is returned when a subscription is made with a subject that does not conform to subject rules.
 	ErrMalformedSubject = errors.New("malformed subject")
@@ -245,6 +251,10 @@ var (
 
 	// ErrMappingDestinationNotSupportedForImport is returned when you try to use a mapping function other than wildcard in a transform that needs to be reversible (i.e. an import)
 	ErrMappingDestinationNotSupportedForImport = fmt.Errorf("%w: the only mapping function allowed for import transforms is {{Wildcard()}}", ErrInvalidMappingDestination)
+
+	// ErrMappingFunctionNotAvailable is returned when an account scoped mapping function (e.g. {{account-hash()}}) is used
+	// somewhere its value is not available, or where such functions are not supported.
+	ErrMappingFunctionNotAvailable = fmt.Errorf("%w: function is not available in this context", ErrInvalidMappingDestination)
 )
 
 // mappingDestinationErr is a type of subject mapping destination error

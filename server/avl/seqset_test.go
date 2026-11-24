@@ -1,4 +1,4 @@
-// Copyright 2023 The NATS Authors
+// Copyright 2023-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,7 +16,8 @@ package avl
 import (
 	"encoding/base64"
 	"encoding/binary"
-	"math/rand"
+	"fmt"
+	"math/rand/v2"
 	"testing"
 )
 
@@ -72,7 +73,7 @@ func TestSeqSetCorrectness(t *testing.T) {
 	set := make(map[uint64]struct{}, num)
 	var ss SequenceSet
 	for i := 0; i < num; i++ {
-		n := uint64(rand.Int63n(int64(max + 1)))
+		n := uint64(rand.Int64N(int64(max + 1)))
 		ss.Insert(n)
 		set[n] = struct{}{}
 	}
@@ -215,7 +216,7 @@ func TestSeqSetClone(t *testing.T) {
 
 	var ss SequenceSet
 	for i := 0; i < num; i++ {
-		ss.Insert(uint64(rand.Int63n(int64(max + 1))))
+		ss.Insert(uint64(rand.Int64N(int64(max + 1))))
 	}
 
 	ssc := ss.Clone()
@@ -530,6 +531,61 @@ func BenchmarkSeqSetDeleteNotPresent(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		for s := uint64(1); s < 200_000; s += 2 {
 			ss.Delete(s)
+		}
+	}
+}
+
+// Compare finding a span's inclusive end with one SpanEnd call versus Exists
+// calls through the first missing sequence. Vary tree size and alignment since
+// both affect the crossover; each measured operation uses the same warm lookup.
+func BenchmarkSeqSetSpanEnd(b *testing.B) {
+	for _, nodes := range []uint64{8, 1024} {
+		for _, offset := range []uint64{0, 61, numEntries - 3} {
+			for _, span := range []uint64{1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 256, 2048, 4096} {
+				b.Run(fmt.Sprintf("Nodes=%d/Offset=%d/Span=%d", nodes, offset, span), func(b *testing.B) {
+					var ss SequenceSet
+					// Keep all background nodes populated even when the span's
+					// first missing sequence coincides with a background bit.
+					for i := uint64(0); i < nodes; i++ {
+						ss.Insert(i * numEntries)
+						ss.Insert(i*numEntries + numEntries - 1)
+					}
+					start := (nodes/2)*numEntries + offset
+					for seq := start; seq < start+span; seq++ {
+						ss.Insert(seq)
+					}
+					ss.Delete(start + span)
+					want := start + span - 1
+
+					b.Run("SpanEnd", func(b *testing.B) {
+						b.ReportAllocs()
+						var end uint64
+						var found bool
+						for b.Loop() {
+							end, found = ss.SpanEnd(start)
+						}
+						if !found || end != want {
+							b.Fatalf("SpanEnd returned (%d, %v), want (%d, true)", end, found, want)
+						}
+					})
+					b.Run("Exists", func(b *testing.B) {
+						b.ReportAllocs()
+						var end uint64
+						var found bool
+						for b.Loop() {
+							seq := start
+							for ss.Exists(seq) {
+								seq++
+							}
+							found = seq > start
+							end = seq - 1
+						}
+						if !found || end != want {
+							b.Fatalf("Exists loop returned (%d, %v), want (%d, true)", end, found, want)
+						}
+					})
+				})
+			}
 		}
 	}
 }

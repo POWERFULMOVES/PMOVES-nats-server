@@ -1,4 +1,4 @@
-// Copyright 2025 The NATS Authors
+// Copyright 2025-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -531,6 +531,188 @@ func TestJetStreamAtomicBatchPublishLimits(t *testing.T) {
 	t.Run("R3", func(t *testing.T) { test(t, 3) })
 }
 
+func TestJetStreamAtomicBatchPublishAccountLimits(t *testing.T) {
+	test := func(t *testing.T, replicas int) {
+		c := createJetStreamClusterExplicit(t, "R3S", 3)
+		defer c.shutdown()
+
+		nc := clientConnectToServer(t, c.randomServer())
+		defer nc.Close()
+
+		_, err := jsStreamCreate(t, nc, &StreamConfig{
+			Name:               "TEST",
+			Subjects:           []string{"foo", "bar"},
+			Storage:            MemoryStorage,
+			Replicas:           replicas,
+			AllowMsgCounter:    true,
+			AllowAtomicPublish: true,
+		})
+		require_NoError(t, err)
+
+		increment := func(subject, batchId string, seq int, commit bool) *nats.Msg {
+			m := nats.NewMsg(subject)
+			m.Header.Set(JSMessageIncr, "1")
+			m.Header.Set(JSBatchId, batchId)
+			m.Header.Set(JSBatchSeq, strconv.Itoa(seq))
+			if commit {
+				m.Header.Set(JSBatchCommit, "1")
+			}
+			return m
+		}
+		commit := func(m *nats.Msg) *JSPubAckResponse {
+			t.Helper()
+			rmsg, err := nc.RequestMsg(m, time.Second)
+			require_NoError(t, err)
+			var pubAck JSPubAckResponse
+			require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+			return &pubAck
+		}
+
+		// Measure what one stored increment uses.
+		pubAck := commit(increment("foo", "a", 1, true))
+		require_True(t, pubAck.Error == nil)
+		sl := c.streamLeader(globalAccountName, "TEST")
+		acc := sl.GlobalAccount()
+		mset, err := acc.lookupStream("TEST")
+		require_NoError(t, err)
+		stored, r := int64(mset.state().Bytes), int64(replicas)
+
+		// The leader checks the limits against the usage of all replicas, which they report periodically.
+		checkFor(t, 5*time.Second, 50*time.Millisecond, func() error {
+			if used := int64(acc.JetStreamUsage().Memory); used != r*stored {
+				return fmt.Errorf("expected usage %d, got %d", r*stored, used)
+			}
+			return nil
+		})
+
+		// Room for one more increment, not two.
+		for _, s := range c.servers {
+			require_NoError(t, s.GlobalAccount().UpdateJetStreamLimits(map[string]JetStreamAccountLimits{
+				_EMPTY_: {MaxMemory: 2 * r * stored, MaxStore: -1, MaxStreams: -1, MaxConsumers: -1},
+			}))
+		}
+
+		// Each increment fits on its own, but the batch doesn't, so none of it must be stored.
+		require_NoError(t, nc.PublishMsg(increment("foo", "b", 1, false)))
+		pubAck = commit(increment("bar", "b", 2, true))
+		require_Error(t, pubAck.Error, NewJSAccountResourcesExceededError())
+		require_Equal(t, mset.state().Msgs, 1)
+	}
+
+	t.Run("R1", func(t *testing.T) { test(t, 1) })
+	t.Run("R3", func(t *testing.T) { test(t, 3) })
+}
+
+func TestJetStreamAtomicBatchPublishScheduleAccountLimits(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+
+	_, err := jsStreamCreate(t, nc, &StreamConfig{
+		Name:               "TEST",
+		Subjects:           []string{"foo.>"},
+		Storage:            MemoryStorage,
+		AllowAtomicPublish: true,
+		AllowMsgSchedules:  true,
+	})
+	require_NoError(t, err)
+
+	// The scheduled message copies the batch headers of the schedule, but isn't part of a batch.
+	at := time.Now().Add(500 * time.Millisecond)
+	m := nats.NewMsg("foo.schedule")
+	m.Header.Set(JSSchedulePattern, fmt.Sprintf("@at %s", at.Format(time.RFC3339Nano)))
+	m.Header.Set(JSScheduleTarget, "foo.target")
+	m.Header.Set(JSBatchId, "uuid")
+	m.Header.Set(JSBatchSeq, "1")
+	m.Header.Set(JSBatchCommit, "1")
+	rmsg, err := nc.RequestMsg(m, time.Second)
+	require_NoError(t, err)
+	var pubAck JSPubAckResponse
+	require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+	require_True(t, pubAck.Error == nil)
+
+	// No room for the scheduled message.
+	acc := s.GlobalAccount()
+	used := int64(acc.JetStreamUsage().Memory)
+	require_NoError(t, acc.UpdateJetStreamLimits(map[string]JetStreamAccountLimits{
+		_EMPTY_: {MaxMemory: used + 1, MaxStore: -1, MaxStreams: -1, MaxConsumers: -1},
+	}))
+
+	// After the schedule fired, the scheduled message must not have been stored.
+	time.Sleep(time.Until(at) + time.Second)
+	mset, err := acc.lookupStream("TEST")
+	require_NoError(t, err)
+	_, err = mset.store.LoadLastMsg("foo.target", nil)
+	require_Error(t, err, ErrStoreMsgNotFound)
+	require_Equal(t, int64(acc.JetStreamUsage().Memory), used)
+}
+
+// Grows the account usage on the next stored message, as if another stream used it up.
+// Protected by the stream lock.
+type atomicBatchUsageStore struct {
+	StreamStore
+	jsa  *jsAccount
+	grow int64
+}
+
+func (s *atomicBatchUsageStore) StoreMsg(subject string, hdr, msg []byte, ttl int64) (uint64, int64, error) {
+	if s.grow > 0 {
+		s.jsa.usageMu.Lock()
+		if s.jsa.usage[_EMPTY_] == nil {
+			s.jsa.usage[_EMPTY_] = &jsaStorage{}
+		}
+		s.jsa.usage[_EMPTY_].total.mem.Add(s.grow)
+		s.jsa.usageMu.Unlock()
+		s.grow = 0
+	}
+	return s.StreamStore.StoreMsg(subject, hdr, msg, ttl)
+}
+
+func TestJetStreamAtomicBatchPublishAccountLimitsDuringCommit(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+
+	_, err := jsStreamCreate(t, nc, &StreamConfig{
+		Name:               "TEST",
+		Subjects:           []string{"foo"},
+		Storage:            MemoryStorage,
+		AllowAtomicPublish: true,
+	})
+	require_NoError(t, err)
+
+	// Room for the batch, until the account usage grows while the batch is being stored.
+	acc := s.GlobalAccount()
+	require_NoError(t, acc.UpdateJetStreamLimits(map[string]JetStreamAccountLimits{
+		_EMPTY_: {MaxMemory: 1024, MaxStore: -1, MaxStreams: -1, MaxConsumers: -1},
+	}))
+	mset, err := acc.lookupStream("TEST")
+	require_NoError(t, err)
+	mset.mu.Lock()
+	mset.store = &atomicBatchUsageStore{StreamStore: mset.store, jsa: mset.jsa, grow: 1024}
+	mset.mu.Unlock()
+
+	m := nats.NewMsg("foo")
+	m.Header.Set(JSBatchId, "uuid")
+	m.Header.Set(JSBatchSeq, "1")
+	require_NoError(t, nc.PublishMsg(m))
+	m.Header.Set(JSBatchSeq, "2")
+	m.Header.Set(JSBatchCommit, "1")
+	rmsg, err := nc.RequestMsg(m, time.Second)
+	require_NoError(t, err)
+
+	// The batch was checked as a whole before committing, so it must be stored as a whole.
+	var pubAck JSPubAckResponse
+	require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+	require_True(t, pubAck.Error == nil)
+	require_Equal(t, pubAck.BatchSize, 2)
+	require_Equal(t, mset.state().Msgs, 2)
+}
+
 func TestJetStreamAtomicBatchPublishDedupeNotAllowed(t *testing.T) {
 	test := func(
 		t *testing.T,
@@ -694,12 +876,14 @@ func TestJetStreamAtomicBatchPublishSourceAndMirror(t *testing.T) {
 		rsm, err = js.GetMsg("S", 1)
 		require_NoError(t, err)
 		require_Len(t, len(rsm.Header), 1)
-		require_Equal(t, rsm.Header.Get(JSStreamSource), "TEST 1 > > foo")
+		src := rsm.Header.Get(JSStreamSource)
+		require_True(t, strings.HasPrefix(src, "TEST 1 > > foo"))
 
 		rsm, err = js.GetMsg("S", 2)
 		require_NoError(t, err)
 		require_Len(t, len(rsm.Header), 1)
-		require_Equal(t, rsm.Header.Get(JSStreamSource), "TEST 3 > > foo")
+		src = rsm.Header.Get(JSStreamSource)
+		require_True(t, strings.HasPrefix(src, "TEST 3 > > foo"))
 	}
 
 	t.Run("R1", func(t *testing.T) { test(t, 1) })
@@ -842,7 +1026,8 @@ func TestJetStreamAtomicBatchPublishConfigOpts(t *testing.T) {
 		}
 	}`
 
-	cf := createConfFile(t, []byte(fmt.Sprintf(batchingConf, t.TempDir(), 10, 20, 100, "5s")))
+	storeDir := t.TempDir()
+	cf := createConfFile(t, []byte(fmt.Sprintf(batchingConf, storeDir, 10, 20, 100, "5s")))
 	s, _ := RunServerWithConfig(cf)
 	defer s.Shutdown()
 
@@ -852,9 +1037,26 @@ func TestJetStreamAtomicBatchPublishConfigOpts(t *testing.T) {
 	require_Equal(t, opts.JetStreamLimits.MaxBatchSize, 100)
 	require_Equal(t, opts.JetStreamLimits.MaxBatchTimeout, 5*time.Second)
 
-	// Reloading is not supported, that would potentially mean dropping random batches when lowering limits.
-	changeCurrentConfigContentWithNewContent(t, cf, []byte(fmt.Sprintf(batchingConf, t.TempDir(), 20, 40, 200, "10s")))
-	require_Error(t, s.Reload(), fmt.Errorf("config reload not supported for JetStreamLimits"))
+	// The limits are all read at the point of use, so they can be reloaded. Raising them.
+	reloadUpdateConfig(t, s, cf, fmt.Sprintf(batchingConf, storeDir, 20, 40, 200, "10s"))
+	opts = s.getOpts()
+	require_Equal(t, opts.JetStreamLimits.MaxBatchInflightPerStream, 20)
+	require_Equal(t, opts.JetStreamLimits.MaxBatchInflightTotal, 40)
+	require_Equal(t, opts.JetStreamLimits.MaxBatchSize, 200)
+	require_Equal(t, opts.JetStreamLimits.MaxBatchTimeout, 10*time.Second)
+
+	// As well as lowering them again. In-flight batches are not silently dropped, the
+	// publisher is always responded to with an error and an advisory is sent.
+	reloadUpdateConfig(t, s, cf, fmt.Sprintf(batchingConf, storeDir, 5, 10, 50, "2s"))
+	opts = s.getOpts()
+	require_Equal(t, opts.JetStreamLimits.MaxBatchInflightPerStream, 5)
+	require_Equal(t, opts.JetStreamLimits.MaxBatchInflightTotal, 10)
+	require_Equal(t, opts.JetStreamLimits.MaxBatchSize, 50)
+	require_Equal(t, opts.JetStreamLimits.MaxBatchTimeout, 2*time.Second)
+
+	// Changing the storage directory remains unsupported.
+	changeCurrentConfigContentWithNewContent(t, cf, []byte(fmt.Sprintf(batchingConf, t.TempDir(), 5, 10, 50, "2s")))
+	require_Error(t, s.Reload(), fmt.Errorf("config reload not supported for jetstream storage directory"))
 }
 
 func TestJetStreamAtomicBatchPublishDenyHeaders(t *testing.T) {
@@ -1669,7 +1871,7 @@ func TestJetStreamAtomicBatchPublishStageAndCommit(t *testing.T) {
 				if m.rsubject != _EMPTY_ {
 					rsubject = m.rsubject
 				}
-				_, _, _, _, err = checkMsgHeadersPreClusteredProposal(diff, mset, m.subject, rsubject, hdr, m.msg, false, "TEST", nil, test.allowRollup, test.denyPurge, test.allowTTL, test.allowMsgCounter, test.allowMsgSchedules, discard, discardNewPer, -1, maxMsgs, maxMsgsPer, maxBytes)
+				_, _, _, _, err = checkMsgHeadersPreClusteredProposal(diff, mset, m.subject, rsubject, hdr, m.msg, false, "TEST", nil, _EMPTY_, 1, test.allowRollup, test.denyPurge, test.allowTTL, test.allowMsgCounter, test.allowMsgSchedules, discard, discardNewPer, -1, maxMsgs, maxMsgsPer, maxBytes)
 				if m.err != nil {
 					require_Error(t, err, m.err)
 				} else if err != nil {
@@ -1742,7 +1944,7 @@ func TestJetStreamCounterNullSourcesHeaderDoesNotPanic(t *testing.T) {
 	hdr = genHeader(hdr, JSStreamSource, "O1 1 > > foo.1")
 	diff := &batchStagedDiff{}
 	mset.clMu.Lock()
-	_, _, _, _, err = checkMsgHeadersPreClusteredProposal(diff, mset, "foo", "foo", hdr, []byte(`{"val":"5"}`), true, "M", nil, false, false, false, true, false, DiscardOld, false, -1, -1, -1, -1)
+	_, _, _, _, err = checkMsgHeadersPreClusteredProposal(diff, mset, "foo", "foo", hdr, []byte(`{"val":"5"}`), true, "M", nil, _EMPTY_, 1, false, false, false, true, false, DiscardOld, false, -1, -1, -1, -1)
 	mset.clMu.Unlock()
 	require_NoError(t, err)
 	require_Equal(t, diff.counter["foo"].sources["O1"]["foo.1"], "5")
@@ -1817,7 +2019,7 @@ func TestJetStreamCounterStagingDoesNotCorruptCommittedTotal(t *testing.T) {
 	msg := []byte(`{"val":"5"}`)
 	diff := &batchStagedDiff{}
 	mset.clMu.Lock()
-	_, _, _, _, err = checkMsgHeadersPreClusteredProposal(diff, mset, "foo", "foo", hdr, msg, true, "TEST", nil, false, false, false, true, false, DiscardOld, false, -1, -1, -1, -1)
+	_, _, _, _, err = checkMsgHeadersPreClusteredProposal(diff, mset, "foo", "foo", hdr, msg, true, "TEST", nil, _EMPTY_, 1, false, false, false, true, false, DiscardOld, false, -1, -1, -1, -1)
 	mset.clMu.Unlock()
 	require_NoError(t, err)
 
@@ -2104,6 +2306,269 @@ func TestJetStreamAtomicBatchPublishSingleServerRecovery(t *testing.T) {
 			require_Equal(t, string(getHeader("Nats-Batch-Commit", sm.Header)), "1")
 		}
 	}
+}
+
+func TestJetStreamAtomicBatchStoreReadyForCommitSyncs(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+
+	_, err := jsStreamCreate(t, nc, &StreamConfig{
+		Name:               "TEST",
+		Subjects:           []string{"foo"},
+		Storage:            FileStorage,
+		Replicas:           1,
+		AllowAtomicPublish: true,
+	})
+	require_NoError(t, err)
+
+	mset, err := s.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	mset.jsa.mu.RLock()
+	storeDir := mset.jsa.storeDir
+	mset.jsa.mu.RUnlock()
+
+	store, err := newBatchStore(mset, "durable-staging", 1, FileStorage, storeDir, "TEST")
+	require_NoError(t, err)
+	defer store.Delete(true)
+
+	fs := store.(*fileStore)
+	require_True(t, fs.fcfg.AsyncFlush)
+	require_True(t, fs.syncOnFlush.Load())
+
+	_, _, err = store.StoreMsg("foo", nil, []byte("payload"), 0)
+	require_NoError(t, err)
+
+	fs.mu.RLock()
+	blks := append([]*msgBlock(nil), fs.blks...)
+	fs.mu.RUnlock()
+	require_NotEqual(t, len(blks), 0)
+
+	var pendingOrDirty bool
+	for _, mb := range blks {
+		mb.mu.RLock()
+		pendingOrDirty = pendingOrDirty || mb.pendingWriteSizeLocked() > 0 || mb.needSync
+		mb.mu.RUnlock()
+	}
+	require_True(t, pendingOrDirty)
+
+	b := &atomicBatch{timer: time.NewTimer(time.Minute), store: store}
+	require_True(t, b.readyForCommit() == nil)
+
+	for _, mb := range blks {
+		mb.mu.RLock()
+		pending, needsSync := mb.pendingWriteSizeLocked(), mb.needSync
+		mb.mu.RUnlock()
+		require_Equal(t, pending, 0)
+		require_False(t, needsSync)
+	}
+}
+
+func TestJetStreamAtomicBatchPublishFinalSyncState(t *testing.T) {
+	type result struct {
+		responseErr     error
+		trace           MsgTraceJetStream
+		traceBeforeSync bool
+	}
+	test := func(t *testing.T, mutate func(*stream, *fileStore) func()) result {
+		storeDir := t.TempDir()
+		conf := createConfFile(t, []byte(fmt.Sprintf(`
+			listen: 127.0.0.1:-1
+			jetstream: {
+				store_dir: %q
+				sync_interval: always
+			}
+		`, storeDir)))
+		s, _ := RunServerWithConfig(conf)
+		defer s.Shutdown()
+
+		nc, _ := jsClientConnect(t, s)
+		defer nc.Close()
+		_, err := jsStreamCreate(t, nc, &StreamConfig{
+			Name:               "TEST",
+			Subjects:           []string{"state.*"},
+			Storage:            FileStorage,
+			Replicas:           1,
+			AllowAtomicPublish: true,
+		})
+		require_NoError(t, err)
+		mset, err := s.globalAccount().lookupStream("TEST")
+		require_NoError(t, err)
+		fs := mset.store.(*fileStore)
+
+		reply := nats.NewInbox()
+		sub, err := nc.SubscribeSync(reply)
+		require_NoError(t, err)
+		traceSub := natsSubSync(t, nc, nats.NewInbox())
+		require_NoError(t, nc.Flush())
+
+		first := nats.NewMsg("state.a")
+		first.Header.Set(JSBatchId, "sync-state")
+		first.Header.Set(JSBatchSeq, "1")
+		require_NoError(t, nc.PublishMsg(first))
+		require_NoError(t, nc.Flush())
+
+		fs.syncMu.Lock()
+		locked := true
+		defer func() {
+			if locked {
+				fs.syncMu.Unlock()
+			}
+		}()
+		commit := nats.NewMsg("state.b")
+		commit.Reply = reply
+		commit.Header.Set(JSBatchId, "sync-state")
+		commit.Header.Set(JSBatchSeq, "2")
+		commit.Header.Set(JSBatchCommit, "1")
+		commit.Header.Set(MsgTraceDest, traceSub.Subject)
+		require_NoError(t, nc.PublishMsg(commit))
+
+		checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+			mset.mu.RLock()
+			lseq := mset.lseq
+			mset.mu.RUnlock()
+			if lseq != 2 || !fs.syncOnFlush.Load() {
+				return fmt.Errorf("atomic batch has not reached final sync")
+			}
+			return nil
+		})
+		mset.mu.RLock()
+		batches := mset.batches
+		mset.mu.RUnlock()
+		batches.mu.Lock()
+		batch := batches.atomic["sync-state"]
+		batches.mu.Unlock()
+		require_NotNil(t, batch)
+		staging := batch.store.(*fileStore)
+		staging.mu.RLock()
+		stagingBlocks := append([]*msgBlock(nil), staging.blks...)
+		staging.mu.RUnlock()
+		require_NotEqual(t, len(stagingBlocks), 0)
+		for _, mb := range stagingBlocks {
+			mb.mu.RLock()
+			pending, needsSync := mb.pendingWriteSizeLocked(), mb.needSync
+			mb.mu.RUnlock()
+			require_Equal(t, pending, 0)
+			require_False(t, needsSync)
+		}
+		_, ackErr := sub.NextMsg(50 * time.Millisecond)
+		require_Error(t, ackErr, nats.ErrTimeout)
+		traceMsg, traceErr := traceSub.NextMsg(50 * time.Millisecond)
+		traceBeforeSync := traceErr == nil
+		if traceErr != nil {
+			require_Error(t, traceErr, nats.ErrTimeout)
+		}
+		cleanup := mutate(mset, fs)
+		if cleanup != nil {
+			defer cleanup()
+		}
+		fs.syncMu.Unlock()
+		locked = false
+		if traceMsg == nil {
+			traceMsg = natsNexMsg(t, traceSub, time.Second)
+		}
+		var traceEvent MsgTraceEvent
+		require_NoError(t, json.Unmarshal(traceMsg.Data, &traceEvent))
+		jsTrace := traceEvent.JetStream()
+		require_NotNil(t, jsTrace)
+		response, err := sub.NextMsg(250 * time.Millisecond)
+		if err == nil {
+			var ack JSPubAckResponse
+			require_NoError(t, json.Unmarshal(response.Data, &ack))
+			require_True(t, ack.Error == nil)
+			require_Equal(t, ack.Sequence, 2)
+			require_Equal(t, ack.BatchId, "sync-state")
+			require_Equal(t, ack.BatchSize, 2)
+		}
+		require_True(t, fs.syncAlways.Load())
+		require_False(t, fs.syncOnFlush.Load())
+		return result{err, *jsTrace, traceBeforeSync}
+	}
+
+	t.Run("RespondsAfterSync", func(t *testing.T) {
+		result := test(t, func(_ *stream, _ *fileStore) func() {
+			return nil
+		})
+		require_NoError(t, result.responseErr)
+		require_False(t, result.traceBeforeSync)
+		require_Equal(t, result.trace.Error, _EMPTY_)
+	})
+
+	t.Run("RecordsSyncFailure", func(t *testing.T) {
+		writeErr := errors.New("atomic batch final sync failed")
+		var mset *stream
+		result := test(t, func(s *stream, fs *fileStore) func() {
+			mset = s
+			fs.mu.RLock()
+			lmb := fs.lmb
+			fs.mu.RUnlock()
+			lmb.mu.Lock()
+			lmb.werr = writeErr
+			lmb.mu.Unlock()
+			return nil
+		})
+		require_Error(t, result.responseErr, nats.ErrTimeout)
+		require_False(t, result.traceBeforeSync)
+		require_Equal(t, result.trace.Error, writeErr.Error())
+		checkFor(t, time.Second, 10*time.Millisecond, func() error {
+			if !errors.Is(mset.getWriteErr(), writeErr) {
+				return errors.New("stream did not record final sync failure")
+			}
+			return nil
+		})
+	})
+}
+
+func TestJetStreamAtomicBatchPublishTraceOnlyNoAck(t *testing.T) {
+	storeDir := t.TempDir()
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		jetstream: {
+			store_dir: %q
+			sync_interval: always
+		}
+	`, storeDir)))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+	_, err := jsStreamCreate(t, nc, &StreamConfig{
+		Name:               "TEST",
+		Subjects:           []string{"state.*"},
+		Storage:            FileStorage,
+		Replicas:           1,
+		AllowAtomicPublish: true,
+	})
+	require_NoError(t, err)
+
+	replySub := natsSubSync(t, nc, nats.NewInbox())
+	traceSub := natsSubSync(t, nc, nats.NewInbox())
+	require_NoError(t, nc.Flush())
+
+	commit := nats.NewMsg("state.a")
+	commit.Reply = replySub.Subject
+	commit.Header.Set(JSBatchId, "trace-only")
+	commit.Header.Set(JSBatchSeq, "1")
+	commit.Header.Set(JSBatchCommit, "1")
+	commit.Header.Set(MsgTraceDest, traceSub.Subject)
+	commit.Header.Set(MsgTraceOnly, "true")
+	require_NoError(t, nc.PublishMsg(commit))
+
+	traceMsg := natsNexMsg(t, traceSub, time.Second)
+	var traceEvent MsgTraceEvent
+	require_NoError(t, json.Unmarshal(traceMsg.Data, &traceEvent))
+	jsTrace := traceEvent.JetStream()
+	require_NotNil(t, jsTrace)
+	require_Equal(t, jsTrace.Error, errBatchTraceOnly.Error())
+
+	_, err = replySub.NextMsg(250 * time.Millisecond)
+	require_Error(t, err, nats.ErrTimeout)
+	streamInfo, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+	require_Equal(t, streamInfo.State.Msgs, 0)
 }
 
 func TestJetStreamAtomicBatchPublishSingleServerRecoveryCommitEob(t *testing.T) {
@@ -3151,7 +3616,7 @@ func TestJetStreamAtomicBatchPublishPartialBatchInSharedAppendEntry(t *testing.T
 			newEntry(EntryNormal, esm2),
 		})
 		batch := &batchApply{}
-		_, err = js.applyStreamEntries(mset, ce, false, batch)
+		_, err = js.applyStreamEntries(mset, mset.raftNode(), ce, false, batch)
 		require_NoError(t, err)
 		entryStart, maxApplied := batch.entryStart, batch.maxApplied
 
@@ -3205,7 +3670,7 @@ func TestJetStreamAtomicBatchPublishCatchupMarkerMidBatch(t *testing.T) {
 	esm1 := encodeStreamMsgAllowCompressAndBatch("foo", _EMPTY_, hdr1, []byte("hello"), 0, ts, false, "uuid", 1, false)
 	ce1 := newCommittedEntry(1, []*Entry{newEntry(EntryNormal, esm1)})
 	batch := &batchApply{}
-	_, err = js.applyStreamEntries(mset, ce1, false, batch)
+	_, err = js.applyStreamEntries(mset, mset.raftNode(), ce1, false, batch)
 	require_NoError(t, err)
 
 	// Confirm the batch is in progress.
@@ -3215,7 +3680,7 @@ func TestJetStreamAtomicBatchPublishCatchupMarkerMidBatch(t *testing.T) {
 	//    Type==EntryCatchup and Data==nil (see raft.sendCatchupSignal). The
 	//    in-progress batch must remain intact and buffer this marker.
 	catchupCE := newCommittedEntry(0, []*Entry{{EntryCatchup, nil}})
-	_, err = js.applyStreamEntries(mset, catchupCE, false, batch)
+	_, err = js.applyStreamEntries(mset, mset.raftNode(), catchupCE, false, batch)
 	require_NoError(t, err)
 
 	// 3) Apply the batch commit (seq 2). The replay loop must skip the buffered
@@ -3231,7 +3696,7 @@ func TestJetStreamAtomicBatchPublishCatchupMarkerMidBatch(t *testing.T) {
 	var panicked any
 	func() {
 		defer func() { panicked = recover() }()
-		_, err = js.applyStreamEntries(mset, ce2, false, batch)
+		_, err = js.applyStreamEntries(mset, mset.raftNode(), ce2, false, batch)
 	}()
 	if panicked != nil {
 		mset.mu.Unlock()
@@ -3285,7 +3750,7 @@ func TestJetStreamAtomicBatchPublishRejectPartialBatchOnLeaderChange(t *testing.
 			}
 			rn := mset2.raftNode().(*raft)
 			rn.RLock()
-			prop, pindex, processed := rn.prop.len(), rn.pindex, rn.processed
+			prop, pindex, processed := rn.prop.len()+int(rn.prop.inProgress()), rn.pindex, rn.processed
 			rn.RUnlock()
 			if prop > 0 {
 				return fmt.Errorf("still has inflight proposals")
@@ -4117,12 +4582,14 @@ func TestJetStreamFastBatchPublishSourceAndMirror(t *testing.T) {
 		rsm, err = js.GetMsg("S", 1)
 		require_NoError(t, err)
 		require_Len(t, len(rsm.Header), 1)
-		require_Equal(t, rsm.Header.Get(JSStreamSource), "TEST 1 > > foo")
+		src := rsm.Header.Get(JSStreamSource)
+		require_True(t, strings.HasPrefix(src, "TEST 1 > > foo"))
 
 		rsm, err = js.GetMsg("S", 2)
 		require_NoError(t, err)
 		require_Len(t, len(rsm.Header), 1)
-		require_Equal(t, rsm.Header.Get(JSStreamSource), "TEST 3 > > foo")
+		src = rsm.Header.Get(JSStreamSource)
+		require_True(t, strings.HasPrefix(src, "TEST 3 > > foo"))
 	}
 
 	t.Run("R1", func(t *testing.T) { test(t, 1) })
@@ -4717,6 +5184,54 @@ func TestJetStreamFastBatchPublishPing(t *testing.T) {
 	require_Equal(t, pubAck.BatchSize, 100)
 }
 
+func TestJetStreamFastBatchPublishPingCannotStartBatch(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+
+	_, err := jsStreamCreate(t, nc, &StreamConfig{
+		Name:              "TEST",
+		Subjects:          []string{"foo"},
+		Storage:           FileStorage,
+		AllowBatchPublish: true,
+	})
+	require_NoError(t, err)
+
+	inbox := nats.NewInbox()
+	sub, err := nc.SubscribeSync(fmt.Sprintf("%s.>", inbox))
+	require_NoError(t, err)
+	defer sub.Drain()
+
+	// A ping at batch sequence 1 must not start a new batch.
+	for _, gapMode := range []string{FastBatchGapFail, FastBatchGapOk} {
+		m := nats.NewMsg("foo")
+		m.Reply = generateFastBatchReply(inbox, "uuid", 1, 2, gapMode, FastBatchOpPing)
+		require_NoError(t, nc.PublishMsg(m))
+		rmsg, err := sub.NextMsg(time.Second)
+		require_NoError(t, err)
+		var pubAck JSPubAckResponse
+		require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+		require_Error(t, pubAck.Error, NewJSBatchPublishUnknownBatchIDError())
+	}
+
+	mset, err := s.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	mset.mu.RLock()
+	batches := mset.batches
+	mset.mu.RUnlock()
+	if batches != nil {
+		batches.mu.Lock()
+		inflight := len(batches.fast)
+		batches.mu.Unlock()
+		require_Len(t, inflight, 0)
+	}
+	require_Equal(t, globalInflightFastBatches.Load(), 0)
+	_, err = sub.NextMsg(250 * time.Millisecond)
+	require_Error(t, err, nats.ErrTimeout)
+}
+
 func TestJetStreamFastBatchPublishGapOkBackwardSeq(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
@@ -4757,9 +5272,15 @@ func TestJetStreamFastBatchPublishGapOkBackwardSeq(t *testing.T) {
 	require_Equal(t, batchFlowGap.CurrentSequence, 5)
 
 	// A backward batch.seq must not rewind b.lseq; it aborts the batch.
-	// No BatchFlowGap should be sent, since gap notifications are only for forward gaps.
+	// A BatchFlowGap is sent for the backward gap.
 	m.Reply = generateFastBatchReply(inbox, "uuid", 3, 0, FastBatchGapOk, FastBatchOpAppend)
 	require_NoError(t, nc.PublishMsg(m))
+	rmsg, err = sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	batchFlowGap = BatchFlowGap{}
+	require_NoError(t, json.Unmarshal(rmsg.Data, &batchFlowGap))
+	require_Equal(t, batchFlowGap.ExpectedLastSequence, 6)
+	require_Equal(t, batchFlowGap.CurrentSequence, 3)
 
 	// The batch is committed directly and a PubAck is delivered (would never arrive if the
 	// backward seq were silently accepted and the batch kept running).
@@ -4770,9 +5291,114 @@ func TestJetStreamFastBatchPublishGapOkBackwardSeq(t *testing.T) {
 	require_True(t, pubAck.Error == nil)
 	require_Equal(t, pubAck.BatchId, "uuid")
 
-	// Ensure no stray BatchFlowGap arrived alongside the PubAck.
+	// Ensure no other messages arrived after the PubAck.
 	_, err = sub.NextMsg(200 * time.Millisecond)
 	require_Error(t, err, nats.ErrTimeout)
+}
+
+func TestJetStreamFastBatchPublishBackwardGapDuplicateAndLowerSeq(t *testing.T) {
+	type step struct {
+		seq uint64
+		op  int
+	}
+	test := func(t *testing.T, replicas int, gapMode string, steps []step, abort step, count uint64) {
+		c := createJetStreamClusterExplicit(t, "R3S", 3)
+		defer c.shutdown()
+
+		nc, js := jsClientConnect(t, c.randomServer())
+		defer nc.Close()
+
+		_, err := jsStreamCreate(t, nc, &StreamConfig{
+			Name:              "TEST",
+			Subjects:          []string{"foo"},
+			Storage:           FileStorage,
+			Replicas:          replicas,
+			AllowBatchPublish: true,
+		})
+		require_NoError(t, err)
+
+		inbox := nats.NewInbox()
+		sub, err := nc.SubscribeSync(fmt.Sprintf("%s.>", inbox))
+		require_NoError(t, err)
+		defer sub.Drain()
+
+		m := nats.NewMsg("foo")
+		for _, st := range steps {
+			m.Reply = generateFastBatchReply(inbox, "uuid", st.seq, 0, gapMode, st.op)
+			require_NoError(t, nc.PublishMsg(m))
+			if st.seq == 1 {
+				rmsg, err := sub.NextMsg(time.Second)
+				require_NoError(t, err)
+				var batchFlowAck BatchFlowAck
+				require_NoError(t, json.Unmarshal(rmsg.Data, &batchFlowAck))
+				require_Equal(t, batchFlowAck.Sequence, 0)
+			}
+		}
+
+		// The duplicate or lower sequence reports a backward gap and ends the batch.
+		m.Reply = generateFastBatchReply(inbox, "uuid", abort.seq, 0, gapMode, abort.op)
+		require_NoError(t, nc.PublishMsg(m))
+		rmsg, err := sub.NextMsg(time.Second)
+		require_NoError(t, err)
+		require_True(t, strings.HasPrefix(string(rmsg.Data), "{\"type\":\"gap\","))
+		var batchFlowGap BatchFlowGap
+		require_NoError(t, json.Unmarshal(rmsg.Data, &batchFlowGap))
+		require_Equal(t, batchFlowGap.ExpectedLastSequence, count+1)
+		require_Equal(t, batchFlowGap.CurrentSequence, abort.seq)
+
+		rmsg, err = sub.NextMsg(time.Second)
+		require_NoError(t, err)
+		var pubAck JSPubAckResponse
+		require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+		require_True(t, pubAck.Error == nil)
+		require_Equal(t, pubAck.BatchId, "uuid")
+		require_Equal(t, pubAck.BatchSize, count)
+		require_Equal(t, pubAck.Sequence, count)
+
+		// No additional messages are sent.
+		_, err = sub.NextMsg(200 * time.Millisecond)
+		require_Error(t, err, nats.ErrTimeout)
+
+		// The duplicate or lower sequence message is not stored.
+		si, err := js.StreamInfo("TEST")
+		require_NoError(t, err)
+		require_Equal(t, si.State.Msgs, count)
+		require_Equal(t, si.State.LastSeq, count)
+
+		// The batch is gone, continuing it is rejected.
+		m.Reply = generateFastBatchReply(inbox, "uuid", count+1, 0, gapMode, FastBatchOpAppend)
+		require_NoError(t, nc.PublishMsg(m))
+		rmsg, err = sub.NextMsg(time.Second)
+		require_NoError(t, err)
+		pubAck = JSPubAckResponse{}
+		require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+		require_Error(t, pubAck.Error, NewJSBatchPublishUnknownBatchIDError())
+	}
+
+	start := step{1, FastBatchOpStart}
+	cases := []struct {
+		name  string
+		steps []step
+		abort step
+		count uint64
+	}{
+		{"DuplicateStart", []step{start}, start, 1},
+		{"DuplicateStartAfterAppend", []step{start, {2, FastBatchOpAppend}}, start, 2},
+		{"DuplicateAppend", []step{start, {2, FastBatchOpAppend}}, step{2, FastBatchOpAppend}, 2},
+		{"LowerAppend", []step{start, {2, FastBatchOpAppend}, {3, FastBatchOpAppend}}, step{2, FastBatchOpAppend}, 3},
+		{"DuplicateCommit", []step{start, {2, FastBatchOpAppend}}, step{2, FastBatchOpCommit}, 2},
+		{"LowerCommit", []step{start, {2, FastBatchOpAppend}, {3, FastBatchOpAppend}}, step{2, FastBatchOpCommit}, 3},
+		{"LowerCommitEob", []step{start, {2, FastBatchOpAppend}, {3, FastBatchOpAppend}}, step{2, FastBatchOpCommitEob}, 3},
+	}
+	for _, replicas := range []int{1, 3} {
+		for _, gapMode := range []string{FastBatchGapOk, FastBatchGapFail} {
+			for _, tc := range cases {
+				t.Run(fmt.Sprintf("R%d/%s/%s", replicas, gapMode, tc.name), func(t *testing.T) {
+					test(t, replicas, gapMode, tc.steps, tc.abort, tc.count)
+				})
+			}
+		}
+	}
 }
 
 func TestJetStreamFastBatchSequentialDuplicateAndErrorPubAck(t *testing.T) {
@@ -5269,4 +5895,474 @@ func TestJetStreamFastBatchPublishLimits(t *testing.T) {
 
 	t.Run("R1", func(t *testing.T) { test(t, 1) })
 	t.Run("R3", func(t *testing.T) { test(t, 3) })
+}
+
+func TestJetStreamFastBatchPublishAccountLimitsCounter(t *testing.T) {
+	test := func(t *testing.T, replicas int) {
+		c := createJetStreamClusterExplicit(t, "R3S", 3)
+		defer c.shutdown()
+
+		nc := clientConnectToServer(t, c.randomServer())
+		defer nc.Close()
+
+		_, err := jsStreamCreate(t, nc, &StreamConfig{
+			Name:              "TEST",
+			Subjects:          []string{"foo"},
+			Storage:           MemoryStorage,
+			Replicas:          replicas,
+			AllowMsgCounter:   true,
+			AllowBatchPublish: true,
+		})
+		require_NoError(t, err)
+
+		inbox := nats.NewInbox()
+		sub, err := nc.SubscribeSync(fmt.Sprintf("%s.>", inbox))
+		require_NoError(t, err)
+		defer sub.Drain()
+
+		increment := func(batchId string, seq uint64, op int) {
+			t.Helper()
+			m := nats.NewMsg("foo")
+			m.Header.Set(JSMessageIncr, "1")
+			m.Reply = generateFastBatchReply(inbox, batchId, seq, 0, FastBatchGapFail, op)
+			require_NoError(t, nc.PublishMsg(m))
+		}
+		// Waits for the batch's PubAck, and returns it with the errors received before it.
+		pubAck := func(batchId string) (*PubAck, []*ApiError) {
+			t.Helper()
+			var errs []*ApiError
+			for {
+				rmsg, err := sub.NextMsg(time.Second)
+				require_NoError(t, err)
+				var resp JSPubAckResponse
+				require_NoError(t, json.Unmarshal(rmsg.Data, &resp))
+				if resp.Error != nil {
+					errs = append(errs, resp.Error)
+				} else if resp.PubAck != nil && resp.BatchId == batchId {
+					return resp.PubAck, errs
+				}
+			}
+		}
+
+		// The leader checks the limits against the usage of all replicas, which they report periodically.
+		sl := c.streamLeader(globalAccountName, "TEST")
+		acc := sl.GlobalAccount()
+		waitForUsage := func(expected int64) {
+			t.Helper()
+			checkFor(t, 5*time.Second, 50*time.Millisecond, func() error {
+				if used := int64(acc.JetStreamUsage().Memory); used != expected {
+					return fmt.Errorf("expected usage %d, got %d", expected, used)
+				}
+				return nil
+			})
+		}
+
+		// Measure what one stored increment uses.
+		increment("c", 1, FastBatchOpCommit)
+		_, errs := pubAck("c")
+		require_Len(t, len(errs), 0)
+		mset, err := acc.lookupStream("TEST")
+		require_NoError(t, err)
+		stored, r := int64(mset.state().Bytes), int64(replicas)
+		waitForUsage(r * stored)
+
+		// Room for one more increment, not two. Both fit as received, without the counter value.
+		for _, s := range c.servers {
+			require_NoError(t, s.GlobalAccount().UpdateJetStreamLimits(map[string]JetStreamAccountLimits{
+				_EMPTY_: {MaxMemory: 3*r*stored - 1, MaxStore: -1, MaxStreams: -1, MaxConsumers: -1},
+			}))
+		}
+
+		// The second increment must be rejected, and the batch must still be acked up to the first.
+		increment("b", 1, FastBatchOpStart)
+		waitForUsage(2 * r * stored)
+		increment("b", 2, FastBatchOpAppend)
+		ack, errs := pubAck("b")
+		require_Len(t, len(errs), 1)
+		require_Error(t, errs[0], NewJSAccountResourcesExceededError())
+		require_Equal(t, ack.Sequence, 2)
+		require_Equal(t, ack.BatchSize, 1)
+		require_Equal(t, int64(acc.JetStreamUsage().Memory), 2*r*stored)
+	}
+
+	t.Run("R1", func(t *testing.T) { test(t, 1) })
+	t.Run("R3", func(t *testing.T) { test(t, 3) })
+}
+
+func TestJetStreamFastBatchPublishStoreError(t *testing.T) {
+	test := func(t *testing.T, gapMode string) {
+		s := RunBasicJetStreamServer(t)
+		defer s.Shutdown()
+
+		nc := clientConnectToServer(t, s)
+		defer nc.Close()
+
+		cfg := &StreamConfig{
+			Name:                   "TEST",
+			Subjects:               []string{"foo"},
+			Storage:                MemoryStorage,
+			Discard:                DiscardNew,
+			MaxBytes:               1024,
+			AllowMsgTTL:            true,
+			SubjectDeleteMarkerTTL: time.Hour,
+			AllowBatchPublish:      true,
+		}
+		_, err := jsStreamCreate(t, nc, cfg)
+		require_NoError(t, err)
+		mset, err := s.globalAccount().lookupStream("TEST")
+		require_NoError(t, err)
+
+		// A TTL below the subject delete marker TTL is raised to 3600 when stored, growing the message.
+		ttl := nats.NewMsg("foo")
+		ttl.Header.Set(JSMessageTTL, "1")
+		_, err = nc.RequestMsg(ttl, time.Second)
+		require_NoError(t, err)
+		grown := mset.state().Bytes
+		received := grown - uint64(len("3600")-len("1"))
+
+		// Room for the batch's first message and the TTL message as received, but not as stored.
+		cfg.MaxBytes = int64(grown + memStoreMsgSize("foo", nil, nil) + received)
+		_, err = jsStreamUpdate(t, nc, cfg)
+		require_NoError(t, err)
+
+		inbox := nats.NewInbox()
+		sub, err := nc.SubscribeSync(fmt.Sprintf("%s.>", inbox))
+		require_NoError(t, err)
+		defer sub.Drain()
+
+		// The first message is stored and triggers the initial flow control message.
+		m := nats.NewMsg("foo")
+		m.Reply = generateFastBatchReply(inbox, "uuid", 1, 0, gapMode, FastBatchOpStart)
+		require_NoError(t, nc.PublishMsg(m))
+		rmsg, err := sub.NextMsg(time.Second)
+		require_NoError(t, err)
+		var batchFlowAck BatchFlowAck
+		require_NoError(t, json.Unmarshal(rmsg.Data, &batchFlowAck))
+		require_Equal(t, batchFlowAck.Messages, 10)
+
+		// The second message passes all checks, but fails to be stored since it grew.
+		ttl.Reply = generateFastBatchReply(inbox, "uuid", 2, 0, gapMode, FastBatchOpAppend)
+		require_NoError(t, nc.PublishMsg(ttl))
+
+		// The error must be reported as part of the batch, on that sequence.
+		rmsg, err = sub.NextMsg(time.Second)
+		require_NoError(t, err)
+		require_True(t, strings.HasPrefix(string(rmsg.Data), "{\"type\":\"err\","))
+		var batchFlowErr BatchFlowErr
+		require_NoError(t, json.Unmarshal(rmsg.Data, &batchFlowErr))
+		require_Equal(t, batchFlowErr.Sequence, 2)
+		require_Error(t, batchFlowErr.Error, NewJSStreamStoreFailedError(ErrMaxBytes))
+
+		switch gapMode {
+		case FastBatchGapFail:
+			// The batch commits up to the failed message.
+		case FastBatchGapOk:
+			// The batch continues, so commit it.
+			m.Reply = generateFastBatchReply(inbox, "uuid", 3, 0, gapMode, FastBatchOpCommitEob)
+			require_NoError(t, nc.PublishMsg(m))
+		default:
+			t.Fatalf("Unexpected gap mode: %q", gapMode)
+		}
+
+		// We always expect a PubAck containing the last persisted message data.
+		rmsg, err = sub.NextMsg(time.Second)
+		require_NoError(t, err)
+		var pubAck JSPubAckResponse
+		require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+		require_True(t, pubAck.Error == nil)
+		require_Equal(t, pubAck.Sequence, 2)
+		require_Equal(t, pubAck.BatchId, "uuid")
+		if gapMode == FastBatchGapFail {
+			require_Equal(t, pubAck.BatchSize, 1)
+		} else {
+			require_Equal(t, pubAck.BatchSize, 2)
+		}
+
+		// The batch must be cleaned up.
+		mset.mu.RLock()
+		batches := mset.batches
+		mset.mu.RUnlock()
+		batches.mu.Lock()
+		inflight := len(batches.fast)
+		batches.mu.Unlock()
+		require_Equal(t, inflight, 0)
+	}
+
+	t.Run(FastBatchGapFail, func(t *testing.T) { test(t, FastBatchGapFail) })
+	t.Run(FastBatchGapOk, func(t *testing.T) { test(t, FastBatchGapOk) })
+}
+
+func TestJetStreamFastBatchPublishMsgTooLargeSingleReply(t *testing.T) {
+	test := func(t *testing.T, replicas int) {
+		tmpl := strings.Replace(jsClusterTempl, "server_name: %s", fmt.Sprintf("server_name: %%s\n\tmax_payload: %d", 40*1024*1024), 1)
+		c := createJetStreamClusterWithTemplate(t, tmpl, "R3S", 3)
+		defer c.shutdown()
+
+		nc := clientConnectToServer(t, c.randomServer())
+		defer nc.Close()
+
+		_, err := jsStreamCreate(t, nc, &StreamConfig{
+			Name:              "TEST",
+			Subjects:          []string{"foo.>"},
+			Storage:           FileStorage,
+			Replicas:          replicas,
+			AllowMsgSchedules: true,
+			AllowBatchPublish: true,
+		})
+		require_NoError(t, err)
+		c.waitOnStreamLeader(globalAccountName, "TEST")
+		sl := c.streamLeader(globalAccountName, "TEST")
+		mset, err := sl.globalAccount().lookupStream("TEST")
+		require_NoError(t, err)
+
+		// Subscribe on the stream leader, so the replies don't depend on interest propagation.
+		nc.Close()
+		nc = clientConnectToServer(t, sl)
+		inbox := nats.NewInbox()
+		sub, err := nc.SubscribeSync(fmt.Sprintf("%s.>", inbox))
+		require_NoError(t, err)
+		defer sub.Drain()
+		require_NoError(t, nc.Flush())
+
+		// The message fits the file store record limit as received, but not after the schedule's rollup header is added.
+		schedule := time.Now().Add(time.Hour).Format(time.RFC3339Nano)
+		hdr := genHeader(nil, JSSchedulePattern, fmt.Sprintf("@at %s", schedule))
+		hdr = genHeader(hdr, JSScheduleTarget, "foo.target")
+		msg := make([]byte, rlBadThresh-5-fileStoreMsgSize("foo.schedule", hdr, nil))
+		require_Equal(t, fileStoreMsgSize("foo.schedule", hdr, msg), rlBadThresh-5)
+		require_True(t, isFileStoreMsgTooLarge(fileStoreMsgSize("foo.schedule", genHeader(hdr, JSMsgRollup, JSMsgRollupSubject), msg)))
+
+		reply := generateFastBatchReply(inbox, "uuid", 1, 0, FastBatchGapFail, FastBatchOpStart)
+		batch, _ := getFastBatch(reply, hdr)
+		require_NotNil(t, batch)
+		defer batch.returnToPool()
+		err = mset.processJetStreamFastBatchMsg(batch, "foo.schedule", reply, hdr, msg, nil)
+
+		// The first message gets the initial flow control message.
+		rmsg, rerr := sub.NextMsg(time.Second)
+		require_NoError(t, rerr)
+		var batchFlowAck BatchFlowAck
+		require_NoError(t, json.Unmarshal(rmsg.Data, &batchFlowAck))
+		require_Equal(t, batchFlowAck.Type, "ack")
+
+		// The error must be replied to only once.
+		rmsg, rerr = sub.NextMsg(time.Second)
+		require_NoError(t, rerr)
+		var pubAck JSPubAckResponse
+		require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+		require_NotNil(t, pubAck.Error)
+		require_Error(t, pubAck.Error, NewJSStreamStoreFailedError(ErrMsgTooLarge))
+		rmsg, rerr = sub.NextMsg(250 * time.Millisecond)
+		if rerr == nil {
+			t.Fatalf("Unexpected second reply: %s", rmsg.Data)
+		}
+		require_Error(t, rerr, nats.ErrTimeout)
+
+		// The batch must be cleaned up immediately, not stall until it times out.
+		mset.mu.RLock()
+		batches := mset.batches
+		mset.mu.RUnlock()
+		batches.mu.Lock()
+		inflight := len(batches.fast)
+		batches.mu.Unlock()
+		require_Equal(t, inflight, 0)
+
+		// The message must be rejected before it's stored or proposed.
+		require_Error(t, err, ErrMsgTooLarge)
+	}
+
+	t.Run("R1", func(t *testing.T) { test(t, 1) })
+	t.Run("R3", func(t *testing.T) { test(t, 3) })
+}
+
+func TestJetStreamFastBatchPublishTraceOnly(t *testing.T) {
+	test := func(t *testing.T, replicas int, gapMode string) {
+		c := createJetStreamClusterExplicit(t, "R3S", 3)
+		defer c.shutdown()
+
+		nc := clientConnectToServer(t, c.randomServer())
+		defer nc.Close()
+
+		_, err := jsStreamCreate(t, nc, &StreamConfig{
+			Name:              "TEST",
+			Subjects:          []string{"foo"},
+			Storage:           FileStorage,
+			Replicas:          replicas,
+			AllowBatchPublish: true,
+		})
+		require_NoError(t, err)
+
+		inbox := nats.NewInbox()
+		sub, err := nc.SubscribeSync(fmt.Sprintf("%s.>", inbox))
+		require_NoError(t, err)
+		defer sub.Drain()
+		traceSub := natsSubSync(t, nc, "trace.dest")
+		for _, s := range c.servers {
+			checkSubInterest(t, s, globalAccountName, "trace.dest", time.Second)
+		}
+
+		m := nats.NewMsg("foo")
+		m.Reply = generateFastBatchReply(inbox, "uuid", 1, 0, gapMode, FastBatchOpStart)
+		require_NoError(t, nc.PublishMsg(m))
+		rmsg, err := sub.NextMsg(time.Second)
+		require_NoError(t, err)
+		var batchFlowAck BatchFlowAck
+		require_NoError(t, json.Unmarshal(rmsg.Data, &batchFlowAck))
+
+		// A trace-only message is dropped without a reply.
+		trace := nats.NewMsg("foo")
+		trace.Header.Set(MsgTraceDest, "trace.dest")
+		trace.Header.Set(MsgTraceOnly, "true")
+		trace.Reply = generateFastBatchReply(inbox, "uuid", 2, 0, gapMode, FastBatchOpAppend)
+		require_NoError(t, nc.PublishMsg(trace))
+
+		// Servers that only route the message send an event without a JetStream event.
+		var jsTrace *MsgTraceJetStream
+		for jsTrace == nil {
+			var traceEvent MsgTraceEvent
+			require_NoError(t, json.Unmarshal(natsNexMsg(t, traceSub, time.Second).Data, &traceEvent))
+			jsTrace = traceEvent.JetStream()
+		}
+		require_Equal(t, jsTrace.Stream, "TEST")
+		require_Equal(t, jsTrace.Error, errBatchTraceOnly.Error())
+
+		// The next message detects the dropped message as a gap.
+		m.Reply = generateFastBatchReply(inbox, "uuid", 3, 0, gapMode, FastBatchOpAppend)
+		require_NoError(t, nc.PublishMsg(m))
+		rmsg, err = sub.NextMsg(time.Second)
+		require_NoError(t, err)
+		require_True(t, strings.HasPrefix(string(rmsg.Data), "{\"type\":\"gap\","))
+		var batchFlowGap BatchFlowGap
+		require_NoError(t, json.Unmarshal(rmsg.Data, &batchFlowGap))
+		require_Equal(t, batchFlowGap.ExpectedLastSequence, 2)
+		require_Equal(t, batchFlowGap.CurrentSequence, 3)
+
+		var expectedMsgs uint64
+		switch gapMode {
+		case FastBatchGapFail:
+			// The batch commits up to the gap.
+			expectedMsgs = 1
+		case FastBatchGapOk:
+			// The batch continues, so commit it.
+			expectedMsgs = 2
+			m.Reply = generateFastBatchReply(inbox, "uuid", 4, 0, gapMode, FastBatchOpCommitEob)
+			require_NoError(t, nc.PublishMsg(m))
+		default:
+			t.Fatalf("Unexpected gap mode: %q", gapMode)
+		}
+
+		rmsg, err = sub.NextMsg(time.Second)
+		require_NoError(t, err)
+		var pubAck JSPubAckResponse
+		require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+		require_True(t, pubAck.Error == nil)
+		require_Equal(t, pubAck.Sequence, expectedMsgs)
+		require_Equal(t, pubAck.BatchId, "uuid")
+		if gapMode == FastBatchGapFail {
+			require_Equal(t, pubAck.BatchSize, 1)
+		} else {
+			require_Equal(t, pubAck.BatchSize, 3)
+		}
+
+		// All replicas must hold the same messages, without the trace-only message.
+		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+			for _, s := range c.servers {
+				mset, err := s.globalAccount().lookupStream("TEST")
+				if err != nil {
+					continue
+				}
+				if state := mset.state(); state.Msgs != expectedMsgs || state.LastSeq != expectedMsgs {
+					return fmt.Errorf("expected %d messages on %s, got %d (last seq %d)", expectedMsgs, s.Name(), state.Msgs, state.LastSeq)
+				}
+			}
+			return nil
+		})
+	}
+
+	for _, replicas := range []int{1, 3} {
+		t.Run(fmt.Sprintf("R%d", replicas), func(t *testing.T) {
+			t.Run(FastBatchGapFail, func(t *testing.T) { test(t, replicas, FastBatchGapFail) })
+			t.Run(FastBatchGapOk, func(t *testing.T) { test(t, replicas, FastBatchGapOk) })
+		})
+	}
+}
+
+func TestJetStreamAtomicBatchPublishTraceOnly(t *testing.T) {
+	test := func(t *testing.T, replicas int, traceSeq int) {
+		c := createJetStreamClusterExplicit(t, "R3S", 3)
+		defer c.shutdown()
+
+		nc := clientConnectToServer(t, c.randomServer())
+		defer nc.Close()
+
+		_, err := jsStreamCreate(t, nc, &StreamConfig{
+			Name:               "TEST",
+			Subjects:           []string{"foo"},
+			Storage:            FileStorage,
+			Replicas:           replicas,
+			AllowAtomicPublish: true,
+		})
+		require_NoError(t, err)
+		traceSub := natsSubSync(t, nc, "trace.dest")
+		for _, s := range c.servers {
+			checkSubInterest(t, s, globalAccountName, "trace.dest", time.Second)
+		}
+
+		// A trace-only message is dropped, so the batch fails on the missing sequence.
+		var rmsg *nats.Msg
+		for seq := 1; seq <= 3; seq++ {
+			m := nats.NewMsg("foo")
+			m.Header.Set(JSBatchId, "uuid")
+			m.Header.Set(JSBatchSeq, strconv.Itoa(seq))
+			if seq == traceSeq {
+				m.Header.Set(MsgTraceDest, "trace.dest")
+				m.Header.Set(MsgTraceOnly, "true")
+			}
+			if seq < 3 {
+				require_NoError(t, nc.PublishMsg(m))
+				continue
+			}
+			m.Header.Set(JSBatchCommit, "1")
+			if seq == traceSeq {
+				// The dropped commit doesn't reply, and the batch is abandoned later.
+				_, err = nc.RequestMsg(m, 500*time.Millisecond)
+				require_Error(t, err, nats.ErrTimeout)
+			} else {
+				rmsg, err = nc.RequestMsg(m, time.Second)
+				require_NoError(t, err)
+				var pubAck JSPubAckResponse
+				require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+				require_Error(t, pubAck.Error, NewJSAtomicPublishIncompleteBatchError())
+			}
+		}
+
+		// Servers that only route the message send an event without a JetStream event.
+		var jsTrace *MsgTraceJetStream
+		for jsTrace == nil {
+			var traceEvent MsgTraceEvent
+			require_NoError(t, json.Unmarshal(natsNexMsg(t, traceSub, time.Second).Data, &traceEvent))
+			jsTrace = traceEvent.JetStream()
+		}
+		require_Equal(t, jsTrace.Stream, "TEST")
+		require_Equal(t, jsTrace.Error, errBatchTraceOnly.Error())
+
+		// No replica may hold any of the batch's messages.
+		for _, s := range c.servers {
+			mset, err := s.globalAccount().lookupStream("TEST")
+			if err != nil {
+				continue
+			}
+			state := mset.state()
+			require_Equal(t, state.Msgs, 0)
+			require_Equal(t, state.LastSeq, 0)
+		}
+	}
+
+	for _, replicas := range []int{1, 3} {
+		t.Run(fmt.Sprintf("R%d", replicas), func(t *testing.T) {
+			t.Run("Start", func(t *testing.T) { test(t, replicas, 1) })
+			t.Run("Append", func(t *testing.T) { test(t, replicas, 2) })
+			t.Run("Commit", func(t *testing.T) { test(t, replicas, 3) })
+		})
+	}
 }

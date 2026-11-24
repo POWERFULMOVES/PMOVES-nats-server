@@ -1,4 +1,4 @@
-// Copyright 2018-2025 The NATS Authors
+// Copyright 2018-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,9 +14,12 @@
 package server
 
 import (
+	"bufio"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"slices"
 	"strconv"
@@ -982,6 +985,55 @@ func TestStreamImportLengthBug(t *testing.T) {
 	`))
 	if _, err := ProcessConfigFile(cf); err == nil {
 		t.Fatalf("Expected an error with import with wildcard prefix")
+	}
+}
+
+func TestStreamImportSubscribeDenyUsesMappedSubject(t *testing.T) {
+	cf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		accounts {
+			exporter {
+				users: [{user: publisher, password: pass}]
+				exports: [{stream: "foo.>"}]
+			}
+			importer {
+				users: [{
+					user: subscriber
+					password: pass
+					permissions: {
+						subscribe: {
+							allow: ["import.foo.>"]
+							deny: ["import.foo.secret"]
+						}
+					}
+				}]
+				imports: [{
+					stream: {account: exporter, subject: "foo.>"}
+					prefix: "import"
+				}]
+			}
+		}
+	`))
+	s, _ := RunServerWithConfig(cf)
+	defer s.Shutdown()
+
+	publisher := natsConnect(t, s.ClientURL(), nats.UserInfo("publisher", "pass"))
+	defer publisher.Close()
+	subscriber := natsConnect(t, s.ClientURL(), nats.UserInfo("subscriber", "pass"))
+	defer subscriber.Close()
+
+	plain := natsSubSync(t, subscriber, "import.foo.>")
+	queue := natsQueueSubSync(t, subscriber, "import.foo.>", "workers")
+	natsFlush(t, subscriber)
+
+	natsPub(t, publisher, "foo.secret", []byte("blocked"))
+	natsPub(t, publisher, "foo.public", []byte("allowed"))
+	natsFlush(t, publisher)
+
+	for _, sub := range []*nats.Subscription{plain, queue} {
+		msg := natsNexMsg(t, sub, time.Second)
+		require_Equal(t, msg.Subject, "import.foo.public")
+		require_Equal(t, string(msg.Data), "allowed")
 	}
 }
 
@@ -2002,6 +2054,43 @@ func TestAccountTrackLatencyRemoteLeaks(t *testing.T) {
 	})
 }
 
+func TestAccountServiceExportResponseThresholdTimerStoppedOnShutdown(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		accounts {
+			A { users = [{user: a, password: a}], exports = [{service: "svc"}] }
+			B { users = [{user: b, password: b}], imports = [{service: {account: A, subject: "svc"}}] }
+		}
+	`))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	ncA := natsConnect(t, s.ClientURL(), nats.UserInfo("a", "a"))
+	defer ncA.Close()
+	natsSub(t, ncA, "svc", func(m *nats.Msg) { m.Respond([]byte("ok")) })
+	natsFlush(t, ncA)
+
+	ncB := natsConnect(t, s.ClientURL(), nats.UserInfo("b", "b"))
+	defer ncB.Close()
+	_, err := ncB.Request("svc", nil, time.Second)
+	require_NoError(t, err)
+
+	acc, err := s.LookupAccount("A")
+	require_NoError(t, err)
+	rtmrSet := func() bool {
+		acc.mu.RLock()
+		defer acc.mu.RUnlock()
+		return acc.exports.services["svc"].rtmr != nil
+	}
+	// The request armed the timer, which runs for the response threshold.
+	require_True(t, rtmrSet())
+
+	// A timer left running holds the account, and through it the server,
+	// until it fires.
+	s.Shutdown()
+	require_False(t, rtmrSet())
+}
+
 func TestCrossAccountServiceResponseTypes(t *testing.T) {
 	s, fooAcc, barAcc := simpleAccountServer(t)
 	defer s.Shutdown()
@@ -2759,6 +2848,47 @@ func TestAccountBasicRouteMapping(t *testing.T) {
 
 	checkPending(fsub, 1)
 	checkPending(bsub, 1)
+}
+
+func TestAccountLeftRightMapping(t *testing.T) {
+	// left and right are supported by the subject transform since 2.10.16,
+	// so account mappings must accept them like the other functions.
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		accounts {
+			A {
+				users = [{user: a, password: p}]
+				mappings = {
+					"foo.*": "bar.{{right(1,2)}}"
+					"baz.*": "qux.{{left(1,3)}}"
+				}
+			}
+		}
+	`))
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	nc := natsConnect(t, s.ClientURL(), nats.UserInfo("a", "p"))
+	defer nc.Close()
+
+	sub, err := nc.SubscribeSync("bar.>")
+	require_NoError(t, err)
+	sub2, err := nc.SubscribeSync("qux.>")
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+
+	require_NoError(t, nc.Publish("foo.1234", nil))
+	require_NoError(t, nc.Publish("baz.1234", nil))
+	require_NoError(t, nc.Flush())
+
+	msg, err := sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_Equal(t, msg.Subject, "bar.34")
+
+	msg, err = sub2.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_Equal(t, msg.Subject, "qux.123")
 }
 
 func TestAccountWildcardRouteMapping(t *testing.T) {
@@ -3758,6 +3888,52 @@ func TestAccountMaxConnectionsDuringLameDuckMode(t *testing.T) {
 	}
 }
 
+func TestAccountMaxConnectionsRejectsPipelinedOps(t *testing.T) {
+	cf := createConfFile(t, []byte(`
+        port: -1
+        no_auth_user: user
+        accounts {
+                TEST {
+                        users = [ {user: user, password: pwd} ]
+                        limits {
+                                max_connections: 1
+                        }
+                }
+        }
+        `))
+	s, _ := RunServerWithConfig(cf)
+	defer s.Shutdown()
+
+	// Observer takes the only slot.
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+	sub := natsSubSync(t, nc, "foo")
+	natsFlush(t, nc)
+
+	// Raw client sends CONNECT with pipelined PUB in a single write.
+	c, err := net.Dial("tcp", s.Addr().String())
+	require_NoError(t, err)
+	defer c.Close()
+	require_NoError(t, c.SetDeadline(time.Now().Add(2*time.Second)))
+	r := bufio.NewReader(c)
+	info, err := r.ReadString('\n')
+	require_NoError(t, err)
+	require_True(t, strings.HasPrefix(info, "INFO"))
+	_, err = c.Write([]byte("CONNECT {}\r\nPUB foo 2\r\nhi\r\n"))
+	require_NoError(t, err)
+
+	// Only the rejection error should come back before the server closes the connection.
+	l, err := r.ReadString('\n')
+	require_NoError(t, err)
+	require_Contains(t, l, ErrTooManyAccountConnections.Error())
+	_, err = r.ReadString('\n')
+	require_Error(t, err, io.EOF)
+
+	if m, err := sub.NextMsg(250 * time.Millisecond); err == nil {
+		t.Fatalf("Pipelined PUB was delivered: %q", m.Data)
+	}
+}
+
 func TestAccountUserSubPermsWithQueueGroups(t *testing.T) {
 	cf := createConfFile(t, []byte(`
 	listen: 127.0.0.1:-1
@@ -4368,4 +4544,360 @@ func TestAccountSendTrackingLatencyRcRace(t *testing.T) {
 	}()
 
 	wg.Wait()
+}
+
+// sharedInboxRequests stands up a foo/bar service export/import pair and has
+// bar send numReqs requests that all share one reply subject. The responder
+// never answers, so every response is left outstanding under that single rrMap
+// key. Returns both accounts and the shared reply subject.
+func sharedInboxRequests(t *testing.T, numReqs int) (*Account, *Account, string) {
+	t.Helper()
+
+	s, fooAcc, barAcc := simpleAccountServer(t)
+	t.Cleanup(s.Shutdown)
+
+	if err := fooAcc.AddServiceExport("test", nil); err != nil {
+		t.Fatalf("Error adding service export: %v", err)
+	}
+	if err := barAcc.AddServiceImport(fooAcc, "test", _EMPTY_); err != nil {
+		t.Fatalf("Error adding service import: %v", err)
+	}
+
+	// Both connections are net.Pipe, so anything the server writes blocks until
+	// it is read. Drain them, otherwise the write loops sit on the flush
+	// deadline and shutdown takes ten seconds.
+	cfoo, rfoo, _ := newClientForServer(s)
+	t.Cleanup(cfoo.close)
+	go io.Copy(io.Discard, rfoo)
+	if err := cfoo.registerWithAccount(fooAcc); err != nil {
+		t.Fatalf("Error registering client with 'foo' account: %v", err)
+	}
+	// Responder never answers, so the entries stay outstanding.
+	cfoo.parse([]byte("SUB test 1\r\n"))
+
+	cbar, rbar, _ := newClientForServer(s)
+	t.Cleanup(cbar.close)
+	go io.Copy(io.Discard, rbar)
+	if err := cbar.registerWithAccount(barAcc); err != nil {
+		t.Fatalf("Error registering client with 'bar' account: %v", err)
+	}
+
+	const inbox = "my.inbox"
+	cbar.parse([]byte("SUB my.inbox 11\r\n"))
+	for i := 0; i < numReqs; i++ {
+		cbar.parse([]byte("PUB test my.inbox 4\r\nhelp\r\n"))
+	}
+
+	return fooAcc, barAcc, inbox
+}
+
+// A client is allowed to reuse a single reply subject across many concurrent
+// service import requests, which piles every outstanding response entry under
+// one rrMap key. Make sure those entries are tracked and removed correctly in
+// both the small (unindexed) and large (indexed) cases.
+func TestServiceImportReverseEntriesSharedReplySubject(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		numReqs int
+		indexed bool
+	}{
+		{"below index threshold", rrIndexThreshold - 1, false},
+		{"above index threshold", rrIndexThreshold * 100, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fooAcc, barAcc, inbox := sharedInboxRequests(t, test.numReqs)
+
+			barAcc.mu.RLock()
+			re, ok := barAcc.imports.rrMap[inbox]
+			numEntries, indexed := len(re.list), re.idx != nil
+			barAcc.mu.RUnlock()
+
+			if !ok {
+				t.Fatalf("Expected a reverse entry for %q", inbox)
+			}
+			if numEntries != test.numReqs {
+				t.Fatalf("Expected %d reverse entries, got %d", test.numReqs, numEntries)
+			}
+			if indexed != test.indexed {
+				t.Fatalf("Expected indexed to be %v, got %v", test.indexed, indexed)
+			}
+
+			// Now expire them the way the response threshold timer does, and make
+			// sure every entry is accounted for as we go.
+			fooAcc.mu.RLock()
+			var expired []*serviceImport
+			for _, si := range fooAcc.exports.responses {
+				expired = append(expired, si)
+			}
+			fooAcc.mu.RUnlock()
+
+			if len(expired) != test.numReqs {
+				t.Fatalf("Expected %d outstanding responses, got %d", test.numReqs, len(expired))
+			}
+
+			for i, si := range expired {
+				fooAcc.removeRespServiceImport(si, rsiTimeout)
+				barAcc.mu.RLock()
+				re, ok := barAcc.imports.rrMap[inbox]
+				remaining := len(re.list)
+				idxLen := len(re.idx)
+				barAcc.mu.RUnlock()
+
+				if expect := test.numReqs - i - 1; remaining != expect {
+					t.Fatalf("After %d removals expected %d entries, got %d", i+1, expect, remaining)
+				} else if expect == 0 {
+					if ok {
+						t.Fatalf("Expected the reverse entry for %q to be removed once empty", inbox)
+					}
+				} else if re.idx != nil && idxLen != remaining {
+					t.Fatalf("Index out of sync with list: %d vs %d", idxLen, remaining)
+				}
+			}
+
+			fooAcc.mu.RLock()
+			left := len(fooAcc.exports.responses)
+			fooAcc.mu.RUnlock()
+			if left != 0 {
+				t.Fatalf("Expected no outstanding responses left, got %d", left)
+			}
+		})
+	}
+}
+
+// The other removal path drops a whole reply subject at once instead of one
+// entry at a time. That is what runs when interest in the reply subject goes
+// away, so it is the path a disconnecting requestor takes.
+func TestServiceImportReverseEntriesBulkRemoval(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		numReqs int
+	}{
+		{"below index threshold", rrIndexThreshold - 1},
+		{"above index threshold", rrIndexThreshold * 100},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fooAcc, barAcc, inbox := sharedInboxRequests(t, test.numReqs)
+
+			fooAcc.mu.RLock()
+			outstanding := len(fooAcc.exports.responses)
+			fooAcc.mu.RUnlock()
+			if outstanding != test.numReqs {
+				t.Fatalf("Expected %d outstanding responses, got %d", test.numReqs, outstanding)
+			}
+
+			// A nil si means drop every entry under this reply subject and clean
+			// up the responses they point at on the exporting account.
+			barAcc.checkForReverseEntry(inbox, nil, false)
+
+			barAcc.mu.RLock()
+			_, ok := barAcc.imports.rrMap[inbox]
+			remaining := len(barAcc.imports.rrMap)
+			barAcc.mu.RUnlock()
+			if ok {
+				t.Fatalf("Expected the reverse entry for %q to be gone", inbox)
+			}
+			if remaining != 0 {
+				t.Fatalf("Expected no reverse entries left, got %d", remaining)
+			}
+
+			fooAcc.mu.RLock()
+			outstanding = len(fooAcc.exports.responses)
+			fooAcc.mu.RUnlock()
+			if outstanding != 0 {
+				t.Fatalf("Expected every outstanding response to be cleaned up, got %d", outstanding)
+			}
+		})
+	}
+}
+
+// Guards the cost of clearing outstanding responses. Each iteration clears the
+// whole set, so ns/op is the cost of draining n entries, not of one removal.
+// The shared case is the one that used to go quadratic; the unique case is the
+// common one and should stay where it is.
+func BenchmarkReverseRespMapRemoval(b *testing.B) {
+	for _, bench := range []struct {
+		name   string
+		shared bool
+	}{
+		{"SharedReplySubject", true},
+		{"UniqueReplySubjects", false},
+	} {
+		for _, n := range []int{1000, 10000, 40000} {
+			b.Run(fmt.Sprintf("%s/%d", bench.name, n), func(b *testing.B) {
+				replies, sis := make([]string, n), make([]*serviceImport, n)
+				for i := 0; i < n; i++ {
+					if bench.shared {
+						replies[i] = "my.inbox"
+					} else {
+						replies[i] = fmt.Sprintf("my.inbox.%d", i)
+					}
+					sis[i] = &serviceImport{from: fmt.Sprintf("_R_.%d", i), to: replies[i]}
+				}
+
+				b.ReportAllocs()
+				for i := 0; i < b.N; i++ {
+					b.StopTimer()
+					acc := NewAccount("bar")
+					for j := 0; j < n; j++ {
+						acc.addReverseRespMapEntry(acc, replies[j], sis[j].from)
+					}
+					b.StartTimer()
+
+					for j := 0; j < n; j++ {
+						acc.checkForReverseEntry(replies[j], sis[j], false)
+					}
+
+					if left := len(acc.imports.rrMap); left != 0 {
+						b.Fatalf("Expected no reverse entries left, got %d", left)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestAccountMappingsAccountFunctions(t *testing.T) {
+	s, fooAcc, _ := simpleAccountServer(t)
+	defer s.Shutdown()
+	hash := getHash(fooAcc.Name)
+
+	// In the destination.
+	require_NoError(t, fooAcc.AddMapping("orders.*", "{{account-hash()}}.orders.{{wildcard(1)}}"))
+	ndest, ok := fooAcc.selectMappedSubject("orders.new")
+	require_True(t, ok)
+	require_Equal(t, ndest, hash+".orders.new")
+
+	// In the source.
+	require_NoError(t, fooAcc.AddMapping("in.{{account-hash()}}.*", "out.{{wildcard(1)}}"))
+	ndest, ok = fooAcc.selectMappedSubject("in." + hash + ".x")
+	require_True(t, ok)
+	require_Equal(t, ndest, "out.x")
+	// Removing with the configured form works.
+	require_True(t, fooAcc.RemoveMapping("in.{{account-hash()}}.*"))
+	_, ok = fooAcc.selectMappedSubject("in." + hash + ".x")
+	require_False(t, ok)
+
+	// Functions that need an import or leafnode context are not available in mappings, and arguments are checked.
+	for _, dest := range []string{
+		"{{account-hash-import()}}", "{{account-hash-leaf-remote()}}",
+		"{{account-hash(x)}}", "{{account-hash-import(x)}}", "{{account-hash(a,b)}}",
+	} {
+		require_Error(t, fooAcc.AddMapping("b", dest), ErrInvalidMappingDestination)
+	}
+	require_Error(t, fooAcc.AddMapping("{{account-hash-import()}}", "b"), ErrMappingFunctionNotAvailable)
+}
+
+func TestAccountImportExportAccountFunctions(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		accounts: {
+			EXP: {
+				users: [ {user: exp, password: pwd} ]
+				exports [
+					{ stream: "events.{{account-hash()}}.>" }
+					{ service: "req.{{account-hash()}}.*" }
+				]
+			}
+			IMP: {
+				users: [ {user: imp, password: pwd} ]
+				imports [
+					{ stream: { subject: "events.{{account-hash-import()}}.>", account: EXP }, prefix: "from.{{account-hash()}}" }
+					{ service: { subject: "req.{{account-hash-import()}}.*", account: EXP }, to: "svc.{{account-hash()}}.*" }
+				]
+			}
+		}
+	`))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	expHash, impHash := getHash("EXP"), getHash("IMP")
+	exp, err := s.LookupAccount("EXP")
+	require_NoError(t, err)
+	exp.mu.RLock()
+	_, hasStream := exp.exports.streams["events."+expHash+".>"]
+	_, hasService := exp.exports.services["req."+expHash+".*"]
+	exp.mu.RUnlock()
+	require_True(t, hasStream)
+	require_True(t, hasService)
+
+	ncExp := natsConnect(t, s.ClientURL(), nats.UserInfo("exp", "pwd"))
+	defer ncExp.Close()
+	ncImp := natsConnect(t, s.ClientURL(), nats.UserInfo("imp", "pwd"))
+	defer ncImp.Close()
+
+	// Stream import with a prefix.
+	sub := natsSubSync(t, ncImp, "from."+impHash+".events."+expHash+".>")
+	natsFlush(t, ncImp)
+	natsPub(t, ncExp, "events."+expHash+".a.b", []byte("hello"))
+	m := natsNexMsg(t, sub, time.Second)
+	require_Equal(t, m.Subject, "from."+impHash+".events."+expHash+".a.b")
+
+	// Service import with a wildcard local subject.
+	_, err = ncExp.Subscribe("req."+expHash+".*", func(m *nats.Msg) { m.Respond([]byte("ok")) })
+	require_NoError(t, err)
+	natsFlush(t, ncExp)
+	resp, err := ncImp.Request("svc."+impHash+".hello", nil, time.Second)
+	require_NoError(t, err)
+	require_Equal(t, string(resp.Data), "ok")
+}
+
+func TestAccountImportExportAccountFunctionsConfigErrors(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		conf     string
+		expected string
+	}{
+		{"import function in export", `accounts: { A: { exports [ { stream: "x.{{account-hash-import()}}" } ] } }`, "not available"},
+		{"leafnode function in import", `accounts: { A: { exports [ { stream: "x.>" } ] }, B: { imports [ { stream: { subject: "x.{{account-hash-leaf-remote()}}", account: A } } ] } }`, "not available"},
+		{"bad arguments", `accounts: { A: { exports [ { service: "x.{{account-hash(a,b)}}" } ] } }`, "too many arguments"},
+		{"mapping", `accounts: { A: { mappings: { "foo": "{{account-hash-import()}}" } } }`, "not available"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			conf := createConfFile(t, []byte("listen: 127.0.0.1:-1\n"+test.conf))
+			_, err := ProcessConfigFile(conf)
+			require_Error(t, err)
+			require_Contains(t, err.Error(), test.expected)
+		})
+	}
+}
+
+func TestAccountUserPermissionsAccountFunctionsNotResolved(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		accounts: {
+			A: {
+				users: [ {user: a, password: pwd, permissions: {
+					publish: { allow: ["ok.>", "{{account-hash()}}.>"], deny: "deny.{{account-hash()}}" }
+					subscribe: { deny: ["deny.{{account-hash()}}.>", "deny.{{account-hash()}} q"] }
+				} } ]
+			}
+		}
+	`))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+	hash := getHash("A")
+
+	nc := natsConnect(t, s.ClientURL(), nats.UserInfo("a", "pwd"))
+	defer nc.Close()
+
+	var c *client
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		for _, cli := range s.clients {
+			c = cli
+			return nil
+		}
+		return fmt.Errorf("client not registered yet")
+	})
+	// Account scoped mapping functions are only resolved in leafnode remote deny lists,
+	// in user permissions they are plain literal tokens.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	require_False(t, c.perms.pub.allow.HasInterest(hash+".foo"))
+	require_True(t, c.perms.pub.allow.HasInterest("{{account-hash()}}.foo"))
+	require_False(t, c.perms.pub.deny.HasInterest("deny."+hash))
+	require_True(t, c.perms.pub.deny.HasInterest("deny.{{account-hash()}}"))
+	require_False(t, c.perms.sub.deny.HasInterest("deny."+hash+".x"))
+	require_True(t, c.perms.sub.deny.HasInterest("deny.{{account-hash()}}.x"))
 }
