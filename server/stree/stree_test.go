@@ -1,4 +1,4 @@
-// Copyright 2023-2025 The NATS Authors
+// Copyright 2023-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -18,7 +18,7 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"runtime"
 	"strconv"
 	"strings"
@@ -492,7 +492,7 @@ func TestSubjectTreeMatchSubjectParam(t *testing.T) {
 func TestSubjectTreeMatchRandomDoublePWC(t *testing.T) {
 	st := NewSubjectTree[int]()
 	for i := 1; i <= 10_000; i++ {
-		subj := fmt.Sprintf("foo.%d.%d", rand.Intn(20)+1, i)
+		subj := fmt.Sprintf("foo.%d.%d", rand.IntN(20)+1, i)
 		st.Insert(b(subj), 42)
 	}
 	match(t, st, "foo.*.*", 10_000)
@@ -682,6 +682,40 @@ func TestSubjectTreeMatchInvalidWildcard(t *testing.T) {
 	match(t, st, `'*.*'`, 0)
 }
 
+func TestSubjectTreeMatchPartialWildcardIsLiteral(t *testing.T) {
+	// Shared "a" prefix splits nodes right before the '*' or '>' in the filters.
+	st := NewSubjectTree[int]()
+	st.Insert(b("KV.a"), 1)
+	st.Insert(b("KV.apple"), 2)
+	st.Insert(b("KV.avocado"), 3)
+	st.Insert(b("KV.banana"), 4)
+	match(t, st, "KV.a*", 0)
+	match(t, st, "KV.a>", 0)
+	match(t, st, "KV.ap*", 0)
+	match(t, st, "KV.*", 4)
+	match(t, st, "KV.>", 4)
+
+	// Subjects with a wildcard char inside a token are valid literals, and match exactly.
+	st.Insert(b("KV.a*"), 5)
+	st.Insert(b("KV.a*x"), 6)
+	st.Insert(b("KV.a>"), 7)
+	st.Insert(b("KV.a>x"), 8)
+	match(t, st, "KV.a*", 1)
+	match(t, st, "KV.a>", 1)
+	match(t, st, "KV.a*x", 1)
+	match(t, st, "*.a*", 1)
+	match(t, st, "KV.*", 8)
+	match(t, st, "KV.>", 8)
+
+	// A trimmed '*' can also reach a leaf directly.
+	st = NewSubjectTree[int]()
+	st.Insert(b("KV.apple"), 1)
+	st.Insert(b("KV.avocado"), 2)
+	st.Insert(b("KV.a*x"), 3)
+	match(t, st, "KV.a*", 0)
+	match(t, st, "KV.a*x", 1)
+}
+
 func TestSubjectTreeRandomTrackEntries(t *testing.T) {
 	st := NewSubjectTree[int]()
 	smap := make(map[string]struct{}, 1000)
@@ -700,9 +734,9 @@ func TestSubjectTreeRandomTrackEntries(t *testing.T) {
 	for i := 0; i < 1000; i++ {
 		var sb strings.Builder
 		// 1-6 tokens.
-		numTokens := rand.Intn(6) + 1
+		numTokens := rand.IntN(6) + 1
 		for i := 0; i < numTokens; i++ {
-			tlen := rand.Intn(4) + 2
+			tlen := rand.IntN(4) + 2
 			tok := buf[:tlen]
 			crand.Read(tok)
 			sb.WriteString(hex.EncodeToString(tok))
@@ -755,7 +789,7 @@ func TestSubjectTreeMatchAllPerf(t *testing.T) {
 	st := NewSubjectTree[int]()
 
 	for i := 0; i < 1_000_000; i++ {
-		subj := fmt.Sprintf("subj.%d.%d", rand.Intn(100)+1, i)
+		subj := fmt.Sprintf("subj.%d.%d", rand.IntN(100)+1, i)
 		st.Insert(b(subj), 22)
 	}
 
@@ -785,7 +819,7 @@ func TestSubjectTreeIterPerf(t *testing.T) {
 	st := NewSubjectTree[int]()
 
 	for i := 0; i < 1_000_000; i++ {
-		subj := fmt.Sprintf("subj.%d.%d", rand.Intn(100)+1, i)
+		subj := fmt.Sprintf("subj.%d.%d", rand.IntN(100)+1, i)
 		st.Insert(b(subj), 22)
 	}
 

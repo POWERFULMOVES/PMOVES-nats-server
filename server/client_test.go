@@ -1198,6 +1198,48 @@ func TestClientSetPermissionsClearsStaleMsgDenyState(t *testing.T) {
 	require_True(t, c.mperms == nil)
 }
 
+func TestClientUpdateDefaultPermissionsRebuildsMsgDenyState(t *testing.T) {
+	permissions := &Permissions{
+		Subscribe: &SubjectPermission{
+			Allow: []string{"foo.>"},
+			Deny:  []string{"foo.secret"},
+		},
+	}
+	c := &client{
+		user: &NkeyUser{Permissions: permissions, defaultPerms: true},
+		subs: map[string]*subscription{
+			"1": {subject: []byte("foo.>")},
+		},
+	}
+	c.setPermissions(permissions)
+
+	updated := permissions.clone()
+	updated.Publish = &SubjectPermission{Allow: []string{"unused"}}
+	require_True(t, c.updateDefaultPermissions(updated))
+	require_NotNil(t, c.mperms)
+	require_True(t, c.checkDenySub("foo.secret", _EMPTY_))
+}
+
+func TestClientUpdateDefaultPermissionsPreservesReplyGrants(t *testing.T) {
+	response := &ResponsePermission{MaxMsgs: 1, Expires: time.Second}
+	permissions := &Permissions{
+		Subscribe: &SubjectPermission{Allow: []string{"service"}},
+		Response:  response,
+	}
+	c := &client{user: &NkeyUser{Permissions: permissions, defaultPerms: true}}
+	c.setPermissions(permissions)
+	c.replies["reply.pending"] = &resp{t: time.Now()}
+
+	updated := permissions.clone()
+	updated.Subscribe.Allow = append(updated.Subscribe.Allow, "extra")
+	require_True(t, c.updateDefaultPermissions(updated))
+	require_NotNil(t, c.replies["reply.pending"])
+
+	updated.Response = nil
+	require_True(t, c.updateDefaultPermissions(updated))
+	require_Len(t, len(c.replies), 0)
+}
+
 func TestClientSetPermissionsPublishDenyQueueQualifierFailsClosed(t *testing.T) {
 	c := &client{srv: New(&Options{})}
 	c.setPermissions(&Permissions{
@@ -2577,15 +2619,242 @@ func TestFlushOutboundNoSliceReuseIfPartial(t *testing.T) {
 	}
 }
 
+func TestFlushOutboundFreesExcessiveWorkingBuffer(t *testing.T) {
+	opts := DefaultOptions()
+	opts.MaxPending = MAX_PENDING_SIZE
+	s := &Server{opts: opts}
+
+	fakeConn := &testConnWritePartial{}
+	c := &client{srv: s, nc: fakeConn}
+	c.initClient()
+
+	// Helper that queues n separate chunks, each filling a small pool
+	// buffer exactly, so that "nb" ends up with n entries, and then
+	// flushes until everything has been written out.
+	queueAndFlush := func(n int) {
+		t.Helper()
+		payload := make([]byte, nbPoolSizeSmall)
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		for i := 0; i < n; i++ {
+			c.queueOutbound(payload)
+		}
+		if len(c.out.nb) != n {
+			t.Fatalf("Expected %d queued buffers, got %d", n, len(c.out.nb))
+		}
+		for c.out.pb > 0 {
+			c.flushOutbound()
+		}
+	}
+
+	// A modest flush should retain the working buffer for reuse.
+	queueAndFlush(10)
+	c.mu.Lock()
+	retained := c.out.wnb != nil
+	c.mu.Unlock()
+	if !retained {
+		t.Fatalf("Expected the working buffer to be retained for reuse")
+	}
+
+	// Growing the working buffer beyond a full writev batch of entries
+	// should cause it to be freed once everything has been written.
+	queueAndFlush(nbMaxVectorSize + 100)
+	c.mu.Lock()
+	freed := c.out.wnb == nil
+	c.mu.Unlock()
+	if !freed {
+		t.Fatalf("Expected the excessively grown working buffer to be freed")
+	}
+}
+
+type testTimeoutError struct{}
+
+func (testTimeoutError) Error() string   { return "i/o timeout" }
+func (testTimeoutError) Timeout() bool   { return true }
+func (testTimeoutError) Temporary() bool { return true }
+
+// Accepts up to maxWrite bytes per Write call, then reports a timeout,
+// leaving the rest of the buffer unwritten for the next flushOutbound.
+type testConnPartialWriteTimeout struct {
+	net.Conn
+	buf      bytes.Buffer
+	maxWrite int
+}
+
+func (c *testConnPartialWriteTimeout) Write(p []byte) (int, error) {
+	if c.maxWrite > 0 && len(p) > c.maxWrite {
+		n, _ := c.buf.Write(p[:c.maxWrite])
+		return n, testTimeoutError{}
+	}
+	return c.buf.Write(p)
+}
+
+func (c *testConnPartialWriteTimeout) RemoteAddr() net.Addr             { return nil }
+func (c *testConnPartialWriteTimeout) SetWriteDeadline(time.Time) error { return nil }
+
+func TestFlushOutboundPartialWriteKeepsPoolBufferCapacity(t *testing.T) {
+	opts := DefaultOptions()
+	s := &Server{opts: opts}
+
+	fakeConn := &testConnPartialWriteTimeout{maxWrite: 10}
+
+	// Use a ROUTER so that the write timeout policy is Retry, which keeps
+	// the connection open with the partially written buffer left in wnb.
+	c := &client{srv: s, kind: ROUTER, nc: fakeConn}
+	c.initClient()
+
+	payload := make([]byte, 100)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.queueOutbound(payload)
+	c.flushOutbound()
+
+	// The write timed out after maxWrite bytes, so the rest of the buffer
+	// stays behind in the working copy for the next flush.
+	if n := len(c.out.wnb); n != 1 {
+		t.Fatalf("Expected 1 buffer left in wnb, got %v", n)
+	}
+	if n, expected := len(c.out.wnb[0]), len(payload)-fakeConn.maxWrite; n != expected {
+		t.Fatalf("Expected %v pending bytes in wnb, got %v", expected, n)
+	}
+	// The leftover buffer must retain its original pooled capacity.
+	if cp := cap(c.out.wnb[0]); cp != nbPoolSizeSmall {
+		t.Fatalf("Expected wnb buffer to keep pooled capacity %v, got %v", nbPoolSizeSmall, cp)
+	}
+
+	// Let the next flush complete the write and check nothing was lost
+	// or duplicated by the buffer shuffling.
+	fakeConn.maxWrite = 0
+	c.flushOutbound()
+
+	if n := len(c.out.wnb); n != 0 {
+		t.Fatalf("Expected no buffers left in wnb, got %v", n)
+	}
+	if c.out.pb != 0 {
+		t.Fatalf("Expected no pending bytes, got %v", c.out.pb)
+	}
+	if !bytes.Equal(payload, fakeConn.buf.Bytes()) {
+		t.Fatalf("Expected\n%q\ngot\n%q", payload, fakeConn.buf.Bytes())
+	}
+}
+
 type captureNoticeLogger struct {
 	DummyLogger
 	notices []string
 }
 
+const (
+	remoteURLLogUser     = "log-test-user"
+	remoteURLLogPassword = "log-test-password"
+)
+
 func (l *captureNoticeLogger) Noticef(format string, v ...any) {
 	l.Lock()
 	l.notices = append(l.notices, fmt.Sprintf(format, v...))
 	l.Unlock()
+}
+
+// runServerWithNoticeLogger starts a server with a captureNoticeLogger installed
+// before Start, so that notices emitted during startup and solicitation are captured.
+func runServerWithNoticeLogger(t *testing.T, o *Options) (*Server, *captureNoticeLogger) {
+	t.Helper()
+	s, err := NewServer(o)
+	require_NoError(t, err)
+	l := &captureNoticeLogger{}
+	s.SetLogger(l, true, true)
+	s.Start()
+	if !s.ReadyForConnections(10 * time.Second) {
+		t.Fatal("Server not ready")
+	}
+	return s, l
+}
+
+// checkNoticeContains waits for a captured notice containing expected.
+func checkNoticeContains(t *testing.T, l *captureNoticeLogger, expected string) {
+	t.Helper()
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		l.Lock()
+		defer l.Unlock()
+		for _, n := range l.notices {
+			if strings.Contains(n, expected) {
+				return nil
+			}
+		}
+		return fmt.Errorf("notices do not contain %q: %v", expected, l.notices)
+	})
+}
+
+// checkNoticeNotContains checks captured notices after the server has shut down.
+func checkNoticeNotContains(t *testing.T, l *captureNoticeLogger, unexpected ...string) {
+	t.Helper()
+	l.Lock()
+	defer l.Unlock()
+	for _, n := range l.notices {
+		for _, value := range unexpected {
+			if strings.Contains(n, value) {
+				t.Fatalf("Notice contains unexpected %q: %s", value, n)
+			}
+		}
+	}
+}
+
+// TestCloseConnectionLogsRemoteURLBeforeInfo verifies that early close notices
+// retain the destination hostname without exposing credentials or a remote name.
+func TestCloseConnectionLogsRemoteURLBeforeInfo(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		kind    int
+		created string
+		closed  string
+	}{
+		{"route", ROUTER, "Route connection created (", "Router"},
+		{"gateway", GATEWAY, `Creating outbound gateway connection to "B" (`, "Gateway"},
+		{"leafnode", LEAF, "Leafnode connection created for account: $G (", "Leafnode"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
+			require_NoError(t, err)
+			defer listener.Close()
+
+			host := fmt.Sprintf("localhost:%d", listener.Addr().(*net.TCPAddr).Port)
+			u := &url.URL{Scheme: "nats", Host: host, User: url.UserPassword(remoteURLLogUser, remoteURLLogPassword)}
+			o := DefaultOptions()
+			switch test.kind {
+			case ROUTER:
+				o.Cluster.resolver = &localhostResolver{}
+				o.Routes = []*url.URL{u}
+			case GATEWAY:
+				o = testGatewayOptionsFromToWithURLs(t, "A", "B", []string{u.String()})
+				o.Gateway.resolver = &localhostResolver{}
+			case LEAF:
+				u.Scheme = "nats-leaf"
+				o.Cluster.Name = _EMPTY_
+				o.Cluster.Port = 0
+				o.LeafNode.resolver = &localhostResolver{}
+				o.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{u}}}
+			}
+			s, l := runServerWithNoticeLogger(t, o)
+			defer s.Shutdown()
+
+			require_NoError(t, listener.SetDeadline(time.Now().Add(2*time.Second)))
+			conn, err := listener.AcceptTCP()
+			require_NoError(t, err)
+			defer conn.Close()
+			checkNoticeContains(t, l, test.created+host+")")
+
+			// Send EOF without INFO. Keep the read side open so unread CONNECT
+			// data cannot turn the close into a TCP reset.
+			require_NoError(t, conn.CloseWrite())
+			checkNoticeContains(t, l, test.closed+" connection closed: "+ClientClosed.String()+" - Host: "+host)
+			s.Shutdown()
+			checkNoticeNotContains(t, l, remoteURLLogUser, remoteURLLogPassword, "Remote:")
+		})
+	}
 }
 
 func TestCloseConnectionLogsReason(t *testing.T) {
@@ -2761,10 +3030,6 @@ func TestClientConnectionName(t *testing.T) {
 }
 
 func TestClientLimits(t *testing.T) {
-	accKp, err := nkeys.CreateAccount()
-	if err != nil {
-		t.Fatalf("Error creating account key: %v", err)
-	}
 	uKp, err := nkeys.CreateUser()
 	if err != nil {
 		t.Fatalf("Error creating user key: %v", err)
@@ -2807,10 +3072,7 @@ func TestClientLimits(t *testing.T) {
 			uc := jwt.NewUserClaims(uPub)
 			uc.Limits.Subs = int64(test.client)
 			uc.Limits.Payload = int64(test.client)
-			c.opts.JWT, err = uc.Encode(accKp)
-			if err != nil {
-				t.Fatalf("Error encoding jwt: %v", err)
-			}
+			c.user = buildInternalNkeyUser(uc, nil, c.acc)
 			c.applyAccountLimits()
 			if c.mpay != test.expect {
 				t.Fatalf("payload %d not as expected %d", c.mpay, test.expect)
@@ -2836,7 +3098,8 @@ func TestClientApplyAccountLimitsSigningKeysRace(t *testing.T) {
 	nuc.IssuerAccount = apub // != Issuer (spub) so the signingKeys lookup runs
 	nuc.Limits.Payload = jwt.NoLimit
 	nuc.Limits.Subs = jwt.NoLimit
-	ujwt, err := nuc.Encode(skp)
+	// Encoding sets the issuer to the signing key.
+	_, err := nuc.Encode(skp)
 	require_NoError(t, err)
 
 	// The scope stored in the account's signing keys map.
@@ -2852,7 +3115,7 @@ func TestClientApplyAccountLimitsSigningKeysRace(t *testing.T) {
 
 	srv := &Server{opts: &Options{}}
 	c := &client{srv: srv, acc: acc, kind: CLIENT}
-	c.opts.JWT = ujwt
+	c.user = buildInternalNkeyUser(nuc, nil, acc)
 
 	const iters = 1000
 	var wg sync.WaitGroup
@@ -2895,7 +3158,8 @@ func TestClientApplyAccountLimitsMpayAtomicRace(t *testing.T) {
 	nuc.IssuerAccount = apub // != Issuer (spub) so the scoped signingKeys branch runs
 	nuc.Limits.Payload = 2048
 	nuc.Limits.Subs = 20
-	ujwt, err := nuc.Encode(skp)
+	// Encoding sets the issuer to the signing key.
+	_, err := nuc.Encode(skp)
 	require_NoError(t, err)
 
 	// The scope stored in the account's signing keys map, carrying a Payload
@@ -2912,7 +3176,7 @@ func TestClientApplyAccountLimitsMpayAtomicRace(t *testing.T) {
 
 	srv := &Server{opts: &Options{}}
 	c := &client{srv: srv, acc: acc, kind: CLIENT}
-	c.opts.JWT = ujwt
+	c.user = buildInternalNkeyUser(nuc, nil, acc)
 
 	// Sanity: ensure we actually hit the scoped-signing-key branch.
 	c.applyAccountLimits()
@@ -4509,6 +4773,60 @@ func TestClientFlushOutboundWriteTimeoutPolicy(t *testing.T) {
 	}
 }
 
+func TestFlushOutboundS2CompressionPartialWritePendingBytes(t *testing.T) {
+	for _, queueMore := range []bool{false, true} {
+		t.Run(fmt.Sprintf("queue_more=%v", queueMore), func(t *testing.T) {
+			s := &Server{opts: DefaultOptions()}
+			fakeConn := &testConnPartialWriteTimeout{maxWrite: 10}
+			c := &client{srv: s, nc: fakeConn, kind: LEAF}
+			c.initClient()
+			c.out.cw = s2.NewWriter(nil, s2.WriterConcurrency(1))
+
+			payload := bytes.Repeat([]byte("payload"), 1000)
+			expected := bytes.Clone(payload)
+
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.queueOutbound(payload)
+			c.flushOutbound()
+
+			// A partial timeout must keep the connection open and retain the
+			// unwritten compressed bytes in the pending-byte count.
+			require_False(t, c.isClosed())
+			require_True(t, c.flags.isSet(isSlowConsumer))
+			var remaining int64
+			for _, buf := range c.out.wnb {
+				remaining += int64(len(buf))
+			}
+			require_True(t, remaining > 0)
+			require_Equal(t, c.out.pb, remaining)
+
+			// Retry both with and without new data to compress. Previously,
+			// the leftover compressed bytes were subtracted a second time.
+			if queueMore {
+				more := []byte("PING\r\n")
+				c.queueOutbound(more)
+				expected = append(expected, more...)
+			}
+			fakeConn.maxWrite = 0
+			c.flushOutbound()
+
+			if c.out.pb < 0 {
+				t.Fatalf("Pending bytes went negative after compressed write recovery: %d", c.out.pb)
+			}
+			require_Equal(t, c.out.pb, int64(0))
+			require_Len(t, len(c.out.wnb), 0)
+			require_Len(t, len(c.out.nb), 0)
+			require_False(t, c.isClosed())
+			require_False(t, c.flags.isSet(isSlowConsumer))
+
+			got, err := io.ReadAll(s2.NewReader(bytes.NewReader(fakeConn.buf.Bytes())))
+			require_NoError(t, err)
+			require_True(t, bytes.Equal(got, expected))
+		})
+	}
+}
+
 func TestFlushOutboundS2CompressionPoolBufferRecycling(t *testing.T) {
 	opts := DefaultOptions()
 	s := &Server{opts: opts}
@@ -4778,6 +5096,79 @@ func TestClientRepeatConnectSwitchesAccountAndCleansOldSubs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestClientRepeatConnectClearsSublistResultCache(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		accounts: {
+			A: { users: [ { user: ua, password: pa } ] }
+			B: { users: [ { user: ub, password: pb } ] }
+		}
+	`))
+
+	s, opts := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	accA, err := s.LookupAccount("A")
+	require_NoError(t, err)
+	accB, err := s.LookupAccount("B")
+	require_NoError(t, err)
+
+	// Keep matching subscription state in both accounts. Equal generation IDs
+	// make this test exercise the stale-cache case directly.
+	ncA := natsConnect(t, s.ClientURL(), nats.UserInfo("ua", "pa"))
+	defer ncA.Close()
+	subA := natsSubSync(t, ncA, "target")
+	natsFlush(t, ncA)
+
+	ncB := natsConnect(t, s.ClientURL(), nats.UserInfo("ub", "pb"))
+	defer ncB.Close()
+	subB := natsSubSync(t, ncB, "target")
+	natsFlush(t, ncB)
+
+	checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		genA := atomic.LoadUint64(&accA.sl.genid)
+		genB := atomic.LoadUint64(&accB.sl.genid)
+		if genA != genB {
+			return fmt.Errorf("expected equal account sublist generation IDs, got A=%d B=%d", genA, genB)
+		}
+		return nil
+	})
+
+	conn, err := net.Dial("tcp", net.JoinHostPort(opts.Host, fmt.Sprintf("%d", opts.Port)))
+	require_NoError(t, err)
+	defer conn.Close()
+	cr := bufio.NewReader(conn)
+	line, _, err := cr.ReadLine()
+	require_NoError(t, err)
+	require_Contains(t, string(line), "INFO {")
+
+	_, err = conn.Write([]byte("CONNECT {\"verbose\":false,\"user\":\"ua\",\"pass\":\"pa\"}\r\nPING\r\n"))
+	require_NoError(t, err)
+	line, _, err = cr.ReadLine()
+	require_NoError(t, err)
+	require_Equal(t, string(line), "PONG")
+	_, err = conn.Write([]byte("PUB target 5\r\nprime\r\n"))
+	require_NoError(t, err)
+	msg := natsNexMsg(t, subA, time.Second)
+	require_Equal(t, string(msg.Data), "prime")
+
+	_, err = conn.Write([]byte("CONNECT {\"verbose\":false,\"user\":\"ub\",\"pass\":\"pb\"}\r\nPING\r\n"))
+	require_NoError(t, err)
+	line, _, err = cr.ReadLine()
+	require_NoError(t, err)
+	require_Equal(t, string(line), "PONG")
+	_, err = conn.Write([]byte("PUB target 6\r\nfrom-B\r\n"))
+	require_NoError(t, err)
+
+	if msg, err := subA.NextMsg(100 * time.Millisecond); err == nil {
+		t.Fatalf("message published in account B was delivered to account A: %q", msg.Data)
+	} else if err != nats.ErrTimeout {
+		t.Fatalf("unexpected error waiting for account A message: %v", err)
+	}
+	msg = natsNexMsg(t, subB, time.Second)
+	require_Equal(t, string(msg.Data), "from-B")
 }
 
 func TestClientMsgsMetric(t *testing.T) {

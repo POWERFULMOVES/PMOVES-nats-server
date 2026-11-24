@@ -1,4 +1,4 @@
-// Copyright 2018-2025 The NATS Authors
+// Copyright 2018-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -26,7 +26,7 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -255,7 +255,7 @@ func TestNoRaceClosedSlowConsumerWriteDeadline(t *testing.T) {
 
 	// At this point server should have closed connection c.
 	checkClosedConns(t, s, 1, 2*time.Second)
-	conns := s.closedClients()
+	conns := s.closed.closedClients()
 	if lc := len(conns); lc != 1 {
 		t.Fatalf("len(conns) expected to be %d, got %d\n", 1, lc)
 	}
@@ -303,7 +303,7 @@ func TestNoRaceClosedSlowConsumerPendingBytes(t *testing.T) {
 
 	// At this point server should have closed connection c.
 	checkClosedConns(t, s, 1, 2*time.Second)
-	conns := s.closedClients()
+	conns := s.closed.closedClients()
 	if lc := len(conns); lc != 1 {
 		t.Fatalf("len(conns) expected to be %d, got %d\n", 1, lc)
 	}
@@ -1102,13 +1102,14 @@ func TestNoRaceJetStreamDeleteStreamManyConsumers(t *testing.T) {
 	defer s.Shutdown()
 
 	mname := "MYS"
-	mset, err := s.GlobalAccount().addStream(&StreamConfig{Name: mname, Storage: FileStorage})
+	// Explicitly set MaxConsumers, otherwise the server default limit would kick in.
+	mset, err := s.globalAccount().addStream(&StreamConfig{Name: mname, Storage: FileStorage, MaxConsumers: 2000})
 	if err != nil {
 		t.Fatalf("Unexpected error adding stream: %v", err)
 	}
 
 	// This number needs to be higher than the internal sendq size to trigger what this test is testing.
-	for i := 0; i < 2000; i++ {
+	for i := range 2000 {
 		_, err := mset.addConsumer(&ConsumerConfig{
 			Durable:        fmt.Sprintf("D-%d", i),
 			DeliverSubject: fmt.Sprintf("deliver.%d", i),
@@ -1269,7 +1270,7 @@ func TestNoRaceJetStreamAPIConsumerListPaging(t *testing.T) {
 	defer s.Shutdown()
 
 	sname := "MYSTREAM"
-	mset, err := s.GlobalAccount().addStream(&StreamConfig{Name: sname})
+	mset, err := s.globalAccount().addStream(&StreamConfig{Name: sname, MaxConsumers: JSApiNamesLimit})
 	if err != nil {
 		t.Fatalf("Unexpected error adding stream: %v", err)
 	}
@@ -1725,7 +1726,7 @@ func TestNoRaceJetStreamSuperClusterMixedModeMirrors(t *testing.T) {
 		wg.Add(mirrorsCount)
 		errCh := make(chan error, 1)
 		for m := 0; m < mirrorsCount; m++ {
-			sname := fmt.Sprintf("S%d", rand.Intn(10)+1)
+			sname := fmt.Sprintf("S%d", rand.IntN(10)+1)
 			go func(sname string, mirrorIdx int) {
 				defer wg.Done()
 				if _, err := js.AddStream(&nats.StreamConfig{
@@ -2402,7 +2403,7 @@ func TestNoRaceJetStreamSuperClusterRIPStress(t *testing.T) {
 		for _, sns := range scm {
 			rand.Shuffle(len(sns), func(i, j int) { sns[i], sns[j] = sns[j], sns[i] })
 			for _, sn := range sns {
-				js := jsc[rand.Intn(len(jsc))]
+				js := jsc[rand.IntN(len(jsc))]
 				if _, err = js.PublishAsync(sn, msg); err != nil {
 					t.Fatalf("Unexpected publish error: %v", err)
 				}
@@ -2444,17 +2445,17 @@ func TestNoRaceJetStreamSlowFilteredInitialPendingAndFirstMsg(t *testing.T) {
 	// Then 'foo.bar.baz' all contigous for 100k.
 	// Then foo.N for 1-100000
 	for i := 0; i < toSend; i++ {
-		js.PublishAsync("foo", []byte("HELLO"))
-		js.PublishAsync("bar", []byte("WORLD"))
-		js.PublishAsync("baz", []byte("AGAIN"))
+		publishAsync(t, js, "foo", []byte("HELLO"))
+		publishAsync(t, js, "bar", []byte("WORLD"))
+		publishAsync(t, js, "baz", []byte("AGAIN"))
 	}
 	// Make contiguous block of same subject.
 	for i := 0; i < toSend; i++ {
-		js.PublishAsync("foo.bar.baz", []byte("ALL-TOGETHER"))
+		publishAsync(t, js, "foo.bar.baz", []byte("ALL-TOGETHER"))
 	}
 	// Now add some more at the end.
 	for i := 0; i < toSend; i++ {
-		js.PublishAsync(fmt.Sprintf("foo.%d", i+1), []byte("LATER"))
+		publishAsync(t, js, fmt.Sprintf("foo.%d", i+1), []byte("LATER"))
 	}
 
 	checkFor(t, 10*time.Second, 250*time.Millisecond, func() error {
@@ -2745,7 +2746,7 @@ func TestNoRaceJetStreamStalledMirrorsAfterExpire(t *testing.T) {
 	sendBatch := func(batch int) {
 		t.Helper()
 		for i := 0; i < batch; i++ {
-			js.PublishAsync("foo.bar", []byte("Hello"))
+			publishAsync(t, js, "foo.bar", []byte("Hello"))
 		}
 		select {
 		case <-js.PublishAsyncComplete():
@@ -3500,7 +3501,8 @@ func TestNoRaceJetStreamClusterMemoryStreamConsumerRaftGrowth(t *testing.T) {
 		t.Fatalf("Error looking up consumer %q", "q1")
 	}
 	node := o.raftNode().(*raft)
-	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+	// Higher than 10s for minSnapDelta.
+	checkFor(t, 30*time.Second, 100*time.Millisecond, func() error {
 		if ms := node.wal.(*memStore); ms.State().Msgs > 8192 {
 			return fmt.Errorf("Did not compact the raft memory WAL")
 		}
@@ -3837,7 +3839,7 @@ func TestNoRaceJetStreamClusterStreamReset(t *testing.T) {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 	// Do a hard reset here by hand.
-	mset.resetClusteredState(nil)
+	mset.resetClusteredState(mset.raftNode(), nil)
 
 	// Wait til we have the consumer leader re-elected.
 	c.waitOnConsumerLeader("$G", "TEST", "d1")
@@ -3905,7 +3907,7 @@ func TestNoRaceJetStreamKeyValueCompaction(t *testing.T) {
 
 	value := strings.Repeat("A", 128*1024)
 	for i := 0; i < 5_000; i++ {
-		key := fmt.Sprintf("K-%d", rand.Intn(256)+1)
+		key := fmt.Sprintf("K-%d", rand.IntN(256)+1)
 		if _, err := kv.PutString(key, value); err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -5052,7 +5054,9 @@ func TestNoRaceJetStreamAccountLimitsAndRestartForceSnapshot(t *testing.T) {
 	c.waitOnLeader()
 	c.waitOnStreamLeader("$JS", "TEST")
 
-	checkFor(t, 2*time.Second, 500*time.Millisecond, func() error {
+	// The first catchup request can race the leader's sync subscription.
+	// It's only retried after streamCatchupStartInterval.
+	checkFor(t, 2*streamCatchupStartInterval, 200*time.Millisecond, func() error {
 		return checkState(t, c, "$JS", "TEST")
 	})
 	for _, cs := range c.servers {
@@ -5220,7 +5224,7 @@ func TestNoRaceJetStreamClusterInterestPullConsumerStreamLimitBug(t *testing.T) 
 			require_NoError(t, err)
 
 			for {
-				pt := time.NewTimer(time.Duration(rand.Intn(300)) * time.Millisecond)
+				pt := time.NewTimer(time.Duration(rand.IntN(300)) * time.Millisecond)
 				select {
 				case <-pt.C:
 					msgs, err := sub.Fetch(1)
@@ -5230,7 +5234,7 @@ func TestNoRaceJetStreamClusterInterestPullConsumerStreamLimitBug(t *testing.T) 
 					}
 					if len(msgs) > 0 {
 						go func() {
-							ackDelay := time.Duration(rand.Intn(375)+15) * time.Millisecond
+							ackDelay := time.Duration(rand.IntN(375)+15) * time.Millisecond
 							m := msgs[0]
 							time.AfterFunc(ackDelay, func() { m.AckSync() })
 						}()
@@ -5334,7 +5338,7 @@ func TestNoRaceJetStreamClusterDirectAccessAllPeersSubs(t *testing.T) {
 					return
 				default:
 					// Send as fast as we can.
-					js.Publish(fmt.Sprintf("kv.%d", rand.Intn(1000)), msg)
+					js.Publish(fmt.Sprintf("kv.%d", rand.IntN(1000)), msg)
 				}
 			}
 		}()
@@ -5488,9 +5492,10 @@ func TestNoRaceJetStreamClusterConsumerListPaging(t *testing.T) {
 	defer nc.Close()
 
 	_, err := js.AddStream(&nats.StreamConfig{
-		Name:     "TEST",
-		Subjects: []string{"foo"},
-		Replicas: 3,
+		Name:         "TEST",
+		Subjects:     []string{"foo"},
+		Replicas:     3,
+		MaxConsumers: 5000,
 	})
 	require_NoError(t, err)
 	c.waitOnStreamLeader(globalAccountName, "TEST")
@@ -5609,38 +5614,56 @@ func TestNoRaceJetStreamFileStoreLargeKVAccessTiming(t *testing.T) {
 	first := fmt.Sprintf(tmpl, 1)
 	last := fmt.Sprintf(tmpl, nkeys)
 
-	start := time.Now()
-	sm, err := fs.LoadLastMsg(last, nil)
-	require_NoError(t, err)
-	base := time.Since(start)
-
-	if !bytes.Equal(sm.msg, val) {
-		t.Fatalf("Retrieved value did not match")
+	// Timings are sensitive to machine load and IO, so allow a few attempts.
+	attempt := func(measure func() error) {
+		t.Helper()
+		var err error
+		for range 5 {
+			if err = measure(); err == nil {
+				return
+			}
+		}
+		t.Fatal(err)
 	}
 
-	start = time.Now()
-	_, err = fs.LoadLastMsg(first, nil)
-	require_NoError(t, err)
-	slow := time.Since(start)
+	attempt(func() error {
+		start := time.Now()
+		sm, err := fs.LoadLastMsg(last, nil)
+		require_NoError(t, err)
+		base := time.Since(start)
 
-	if base > 100*time.Microsecond || slow > 200*time.Microsecond {
-		t.Fatalf("Took too long to look up first key vs last: %v vs %v", base, slow)
-	}
+		if !bytes.Equal(sm.msg, val) {
+			t.Fatalf("Retrieved value did not match")
+		}
+
+		start = time.Now()
+		_, err = fs.LoadLastMsg(first, nil)
+		require_NoError(t, err)
+		slow := time.Since(start)
+
+		if base > 100*time.Microsecond || slow > 200*time.Microsecond {
+			return fmt.Errorf("Took too long to look up first key vs last: %v vs %v", base, slow)
+		}
+		return nil
+	})
 
 	// time first seq lookup for both as well.
 	// Base will be first in this case.
-	fs.mu.Lock()
-	start = time.Now()
-	fs.firstSeqForSubj(first)
-	base = time.Since(start)
-	start = time.Now()
-	fs.firstSeqForSubj(last)
-	slow = time.Since(start)
-	fs.mu.Unlock()
+	attempt(func() error {
+		fs.mu.Lock()
+		start := time.Now()
+		fs.firstSeqForSubj(first)
+		base := time.Since(start)
+		start = time.Now()
+		fs.firstSeqForSubj(last)
+		slow := time.Since(start)
+		fs.mu.Unlock()
 
-	if base > 100*time.Microsecond || slow > 200*time.Microsecond {
-		t.Fatalf("Took too long to look up last key by subject vs first: %v vs %v", base, slow)
-	}
+		if base > 100*time.Microsecond || slow > 200*time.Microsecond {
+			return fmt.Errorf("Took too long to look up last key by subject vs first: %v vs %v", base, slow)
+		}
+		return nil
+	})
 }
 
 func TestNoRaceJetStreamKVLock(t *testing.T) {
@@ -5795,7 +5818,7 @@ func TestNoRaceJetStreamConcurrentPullConsumerBatch(t *testing.T) {
 
 	for i := 0; i < 100_000; i++ {
 		subj := fmt.Sprintf("ORDERS.%d", i+1)
-		js.PublishAsync(subj, []byte("BUY"))
+		publishAsync(t, js, subj, []byte("BUY"))
 	}
 	select {
 	case <-js.PublishAsyncComplete():
@@ -6237,6 +6260,8 @@ func TestNoRaceJetStreamClusterEnsureWALCompact(t *testing.T) {
 	node := mset.raftNode()
 	require_True(t, node != nil)
 
+	_, err = js.Publish("foo", []byte("bar"))
+	require_NoError(t, err)
 	err = node.InstallSnapshot(mset.stateSnapshot(), false)
 	require_NoError(t, err)
 
@@ -6432,13 +6457,18 @@ func TestNoRaceJetStreamClusterConsumerInfoSpeed(t *testing.T) {
 	toSend := 250_000
 	for i := 0; i < toSend; i++ {
 		subj := fmt.Sprintf("events.%d", i+1)
-		js.PublishAsync(subj, []byte("ok"))
+		publishAsync(t, js, subj, []byte("ok"))
 	}
 	select {
 	case <-js.PublishAsyncComplete():
 	case <-time.After(5 * time.Second):
 		t.Fatalf("Did not receive completion signal")
 	}
+
+	// Confirm all messages were stored.
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+	require_Equal(t, si.State.Msgs, uint64(toSend))
 
 	checkNumPending := func(expected int) {
 		t.Helper()
@@ -6511,7 +6541,7 @@ func TestNoRaceJetStreamKVAccountWithServerRestarts(t *testing.T) {
 			require_NoError(t, err)
 
 			for i := 0; i < npubs; i++ {
-				subj := fmt.Sprintf("KEY-%d", rand.Intn(nsubjs))
+				subj := fmt.Sprintf("KEY-%d", rand.IntN(nsubjs))
 				if _, err := kv.PutString(subj, "hello"); err != nil {
 					nc, js := jsClientConnect(t, c.randomServer())
 					defer nc.Close()
@@ -6579,7 +6609,7 @@ func TestNoRaceJetStreamConsumerCreateTimeNumPending(t *testing.T) {
 	msg := bytes.Repeat([]byte("X"), 8*1024)
 
 	for i := 0; i < n; i++ {
-		subj := fmt.Sprintf("events.%d", rand.Intn(100_000))
+		subj := fmt.Sprintf("events.%d", rand.IntN(100_000))
 		js.PublishAsync(subj, msg)
 	}
 	select {
@@ -6924,13 +6954,13 @@ func TestNoRaceJetStreamClusterF3Setup(t *testing.T) {
 					rand.Shuffle(len(msgs), func(i, j int) { msgs[i], msgs[j] = msgs[j], msgs[i] })
 
 					// Wait for a random interval up to 100ms.
-					time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
+					time.Sleep(time.Duration(rand.IntN(100)) * time.Millisecond)
 
 					for _, m := range msgs {
 						// If we want to simulate max redeliveries being hit, since not acking
 						// once will cause it due to subscriber setup.
 						// 100_000 == 0.01%
-						if simulateMaxRedeliveries && rand.Intn(100_000) == 0 {
+						if simulateMaxRedeliveries && rand.IntN(100_000) == 0 {
 							md, err := m.Metadata()
 							require_NoError(t, err)
 							t.Logf("** Skipping Ack: %d **", md.Sequence.Stream)
@@ -6987,9 +7017,9 @@ func TestNoRaceJetStreamClusterF3Setup(t *testing.T) {
 
 			for {
 				// Grab a random source stream
-				stream := sources[rand.Intn(len(sources))]
+				stream := sources[rand.IntN(len(sources))]
 				// Grab random event type.
-				evt := eventTypes[rand.Intn(len(eventTypes))]
+				evt := eventTypes[rand.IntN(len(eventTypes))]
 				subj := fmt.Sprintf("%s.%s", stream, evt)
 				start := time.Now()
 				_, err := js.Publish(subj, msg)
@@ -7570,10 +7600,10 @@ func TestNoRaceFileStoreNumPending(t *testing.T) {
 	tokens := []string{"foo", "bar", "baz"}
 	genSubj := func() string {
 		return fmt.Sprintf("%s.%s.%s.%s",
-			tokens[rand.Intn(len(tokens))],
-			tokens[rand.Intn(len(tokens))],
-			tokens[rand.Intn(len(tokens))],
-			tokens[rand.Intn(len(tokens))],
+			tokens[rand.IntN(len(tokens))],
+			tokens[rand.IntN(len(tokens))],
+			tokens[rand.IntN(len(tokens))],
+			tokens[rand.IntN(len(tokens))],
 		)
 	}
 
@@ -7747,7 +7777,7 @@ func TestNoRaceJetStreamClusterUnbalancedInterestMultipleConsumers(t *testing.T)
 	})
 
 	numToSend := 1000
-	for i := 0; i < numToSend; i++ {
+	for range numToSend {
 		_, err := js.PublishAsync("EV.NEW", nil)
 		require_NoError(t, err)
 	}
@@ -7757,6 +7787,18 @@ func TestNoRaceJetStreamClusterUnbalancedInterestMultipleConsumers(t *testing.T)
 		t.Fatalf("Did not receive completion signal")
 	}
 
+	// Wait for the consumer leader to have received all messages.
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		ci, err := js.ConsumerInfo("EVENTS", "D")
+		if err != nil {
+			return err
+		}
+		if ci.NumPending != uint64(numToSend) {
+			return fmt.Errorf("expected %d pending, got %d", numToSend, ci.NumPending)
+		}
+		return nil
+	})
+
 	// Now make sure we can pull messages since we have not acked.
 	// The bug is that the acks arrive on S1 faster then the messages but we want to
 	// make sure we do not remove prematurely.
@@ -7764,7 +7806,7 @@ func TestNoRaceJetStreamClusterUnbalancedInterestMultipleConsumers(t *testing.T)
 	require_NoError(t, err)
 	require_Len(t, len(msgs), 100)
 	for _, m := range msgs {
-		m.AckSync()
+		require_NoError(t, m.AckSync())
 	}
 
 	ci, err := js.ConsumerInfo("EVENTS", "D")
@@ -7804,7 +7846,7 @@ func TestNoRaceJetStreamClusterUnbalancedInterestMultipleConsumers(t *testing.T)
 	require_NoError(t, err)
 	require_Len(t, len(msgs), 900)
 	for _, m := range msgs {
-		m.AckSync()
+		require_NoError(t, m.AckSync())
 	}
 
 	// Let acks propagate.
@@ -8381,7 +8423,7 @@ func TestNoRaceRoutePoolAndPerAccountConfigReload(t *testing.T) {
 					default:
 					}
 					if i%300 == 0 {
-						time.Sleep(time.Duration(rand.Intn(5)) * time.Millisecond)
+						time.Sleep(time.Duration(rand.IntN(5)) * time.Millisecond)
 					}
 				}
 			}()
@@ -8409,7 +8451,7 @@ func TestNoRaceRoutePoolAndPerAccountConfigReload(t *testing.T) {
 						if strings.Contains(e, "No route for account") {
 							numErrs++
 						}
-					case <-time.After(DEFAULT_ROUTE_RECONNECT + 250*time.Millisecond):
+					case <-time.After(routeReconnectDelay + 500*time.Millisecond):
 						ok = true
 					}
 				}

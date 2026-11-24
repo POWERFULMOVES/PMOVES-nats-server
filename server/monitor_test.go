@@ -22,7 +22,7 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -411,7 +411,7 @@ func TestMonitorHandleVarz(t *testing.T) {
 			t.Fatalf("JS limits not set")
 		}
 		if v.JetStream.Limits.MaxHAAssets != 1000 {
-			t.Fatalf("Expected 1000 max_ha_assets got %q", v.JetStream.Limits.MaxHAAssets)
+			t.Fatalf("Expected 1000 max_ha_assets got %v", v.JetStream.Limits.MaxHAAssets)
 		}
 	}
 }
@@ -623,6 +623,86 @@ func TestMonitorConnzWithCID(t *testing.T) {
 			t.Fatalf("Expected NumConns of 0, got %d\n", c.NumConns)
 		}
 	}
+}
+
+func TestMonitorConnzWithCIDAndAccountFilter(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: "127.0.0.1:-1"
+		http: "127.0.0.1:-1"
+		system_account: SYS
+		accounts {
+			A { users = [{ user: a, password: a }] }
+			B { users = [{ user: b, password: b }] }
+			SYS { users = [{ user: sys, password: sys }] }
+		}
+	`))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	ncA, err := nats.Connect(s.ClientURL(), nats.UserInfo("a", "a"))
+	require_NoError(t, err)
+	defer ncA.Close()
+	ncB, err := nats.Connect(s.ClientURL(), nats.UserInfo("b", "b"))
+	require_NoError(t, err)
+	defer ncB.Close()
+
+	cidA, err := ncA.GetClientID()
+	require_NoError(t, err)
+	cidB, err := ncB.GetClientID()
+	require_NoError(t, err)
+
+	checkConns := func(t *testing.T, c *Connz, expected int, cid uint64) {
+		t.Helper()
+		require_Len(t, len(c.Conns), expected)
+		require_Equal(t, c.NumConns, expected)
+		if expected > 0 {
+			require_Equal(t, c.Conns[0].Cid, cid)
+		}
+	}
+
+	for _, state := range []ConnState{ConnOpen, ConnAll} {
+		// Selecting a CID that belongs to the filtered account must work.
+		c, err := s.Connz(&ConnzOptions{Account: "A", CID: cidA, State: state})
+		require_NoError(t, err)
+		checkConns(t, c, 1, cidA)
+
+		// Selecting a CID from another account must not leak that connection.
+		c, err = s.Connz(&ConnzOptions{Account: "A", CID: cidB, State: state})
+		require_NoError(t, err)
+		checkConns(t, c, 0, 0)
+
+		// The user filter must also apply when selecting by CID.
+		c, err = s.Connz(&ConnzOptions{User: "b", CID: cidA, State: state})
+		require_NoError(t, err)
+		checkConns(t, c, 0, 0)
+		c, err = s.Connz(&ConnzOptions{User: "a", CID: cidA, State: state})
+		require_NoError(t, err)
+		checkConns(t, c, 1, cidA)
+
+		// Same for the MQTT client ID filter.
+		c, err = s.Connz(&ConnzOptions{MQTTClient: "nope", CID: cidA, State: state})
+		require_NoError(t, err)
+		checkConns(t, c, 0, 0)
+	}
+
+	// An account user can request its own account's CONNZ through the system
+	// import. It must not be able to see other accounts' connections by CID.
+	sysReq := func(t *testing.T, nc *nats.Conn, cid uint64) *Connz {
+		t.Helper()
+		req, err := json.Marshal(&ConnzOptions{CID: cid})
+		require_NoError(t, err)
+		resp, err := nc.Request("$SYS.REQ.ACCOUNT.PING.CONNZ", req, time.Second)
+		require_NoError(t, err)
+		var r ServerAPIConnzResponse
+		require_NoError(t, json.Unmarshal(resp.Data, &r))
+		require_True(t, r.Error == nil)
+		require_True(t, r.Data != nil)
+		return r.Data
+	}
+	checkConns(t, sysReq(t, ncA, cidA), 1, cidA)
+	checkConns(t, sysReq(t, ncA, cidB), 0, 0)
+	checkConns(t, sysReq(t, ncB, cidB), 1, cidB)
+	checkConns(t, sysReq(t, ncB, cidA), 0, 0)
 }
 
 // Helper to map to connection name
@@ -895,6 +975,36 @@ func TestMonitorConnzOffsetOverflow(t *testing.T) {
 	// Both Offset and Limit at the max also overflows the sum.
 	_, err := s.Connz(&ConnzOptions{Offset: math.MaxInt64, Limit: math.MaxInt64})
 	require_NoError(t, err)
+}
+
+func TestMonitorConnzSortedPaging(t *testing.T) {
+	s := runMonitorServer()
+	defer s.Shutdown()
+
+	// All clients tie on these sort options.
+	clients := make([]*nats.Conn, 50)
+	for i := range clients {
+		clients[i] = createClientConnSubscribeAndPublish(t, s)
+		defer clients[i].Close()
+	}
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
+	for _, sortOpt := range []SortOpt{BySubs, ByPending, ByOutMsgs, ByInMsgs, ByOutBytes, ByInBytes} {
+		for mode := range 2 {
+			// Paging must return every connection exactly once.
+			seen := make(map[uint64]struct{})
+			for offset := 0; offset < 50; offset += 10 {
+				c := pollConnz(t, s, mode, fmt.Sprintf("%sconnz?sort=%s&offset=%d&limit=10", url, sortOpt, offset),
+					&ConnzOptions{Sort: sortOpt, Offset: offset, Limit: 10})
+				require_Equal(t, c.Total, 50)
+				require_Len(t, len(c.Conns), 10)
+				for _, ci := range c.Conns {
+					seen[ci.Cid] = struct{}{}
+				}
+			}
+			require_Len(t, len(seen), 50)
+		}
+	}
 }
 
 func TestMonitorConnzDefaultSorted(t *testing.T) {
@@ -1205,14 +1315,12 @@ func TestMonitorConnzSortedByStopTimeClosedConn(t *testing.T) {
 	checkClosedConns(t, s, 4, time.Second)
 
 	// Now adjust the Stop times for these with some random values.
-	s.mu.Lock()
 	now := time.Now().UTC()
 	ccs := s.closed.closedClients()
 	for _, cc := range ccs {
 		newStop := now.Add(time.Duration(rand.Int()%120) * -time.Minute)
 		cc.Stop = &newStop
 	}
-	s.mu.Unlock()
 
 	url = fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
 	for mode := 0; mode < 2; mode++ {
@@ -1250,13 +1358,11 @@ func TestMonitorConnzSortedByReason(t *testing.T) {
 	checkClosedConns(t, s, 20, time.Second)
 
 	// Now adjust the Reasons for these with some random values.
-	s.mu.Lock()
 	ccs := s.closed.closedClients()
 	max := int(ServerShutdown)
 	for _, cc := range ccs {
 		cc.Reason = ClosedState(rand.Int() % max).String()
 	}
-	s.mu.Unlock()
 
 	url = fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
 	for mode := 0; mode < 2; mode++ {
@@ -1890,6 +1996,40 @@ func TestMonitorSubszMultiAccount(t *testing.T) {
 				t.Fatalf("Expected account information to be present and be 'A', got %q", sd.Account)
 			}
 		}
+	}
+}
+
+func TestMonitorSubszMultiAccountPaging(t *testing.T) {
+	s := runMonitorServer()
+	defer s.Shutdown()
+
+	ncA := createClientConnWithUserSubscribeAndPublish(t, s, "a", "a")
+	defer ncA.Close()
+	ncB := createClientConnWithUserSubscribeAndPublish(t, s, "b", "b")
+	defer ncB.Close()
+
+	for _, nc := range []*nats.Conn{ncA, ncB} {
+		for i := range 200 {
+			_, err := nc.Subscribe(fmt.Sprintf("foo.%d", i), func(m *nats.Msg) {})
+			require_NoError(t, err)
+		}
+		require_NoError(t, nc.Flush())
+	}
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
+	for mode := range 2 {
+		// Paging must return every subscription exactly once.
+		seen := make(map[SubDetail]struct{})
+		for offset := 0; offset < 400; offset += 100 {
+			sl := pollSubsz(t, s, mode, fmt.Sprintf("%ssubsz?subs=1&offset=%d&limit=100", url, offset),
+				&SubszOptions{Subscriptions: true, Offset: offset, Limit: 100})
+			require_Equal(t, sl.Total, 400)
+			require_Len(t, len(sl.Subs), 100)
+			for _, sd := range sl.Subs {
+				seen[sd] = struct{}{}
+			}
+		}
+		require_Len(t, len(seen), 400)
 	}
 }
 
@@ -5620,29 +5760,20 @@ func TestMonitorJsz(t *testing.T) {
 		}
 	})
 	t.Run("cluster-info", func(t *testing.T) {
-		found := 0
-		for i, url := range []string{monUrl1, monUrl2} {
+		for _, url := range []string{monUrl1, monUrl2} {
 			info := readJsInfo(url + "")
 			if info.Meta.Peer != getHash(info.Meta.Leader) {
 				t.Fatalf("Invalid Peer: %+v", info.Meta)
 			}
-			if info.Meta.Replicas != nil {
-				found++
-				for _, r := range info.Meta.Replicas {
-					if r.Peer == _EMPTY_ {
-						t.Fatalf("Replicas' Peer is empty: %+v", r)
-					}
-				}
-				if info.Meta.Leader != srvs[i].Name() {
-					t.Fatalf("received cluster info from non leader: leader %s, server: %s", info.Meta.Leader, srvs[i].Name())
+			// Replicas are populated on every server, not just the meta leader.
+			if len(info.Meta.Replicas) == 0 {
+				t.Fatalf("Expected replicas to be populated: %+v", info.Meta)
+			}
+			for _, r := range info.Meta.Replicas {
+				if r.Peer == _EMPTY_ {
+					t.Fatalf("Replicas' Peer is empty: %+v", r)
 				}
 			}
-		}
-		if found == 0 {
-			t.Fatalf("did not receive cluster info from any node")
-		}
-		if found > 1 {
-			t.Fatalf("received cluster info from multiple nodes")
 		}
 	})
 	t.Run("meta-snapshot-stats", func(t *testing.T) {
@@ -6289,6 +6420,49 @@ func TestMonitorConnzOperatorModeFilterByUser(t *testing.T) {
 	require_True(t, connz.NumConns == 2)
 	for _, ci := range connz.Conns {
 		require_True(t, ci.AuthorizedUser == aUser)
+	}
+}
+
+func TestMonitorConnzTotalReflectsFilters(t *testing.T) {
+	s := runMonitorServerWithAccounts()
+	defer s.Shutdown()
+
+	ncA := createClientConnWithUserSubscribeAndPublish(t, s, "a", "a")
+	defer ncA.Close()
+	for i := 0; i < 3; i++ {
+		nc := createClientConnWithUserSubscribeAndPublish(t, s, "b", "b")
+		defer nc.Close()
+	}
+	ncSub := createClientConnWithUserSubscribeAndPublish(t, s, "b", "b")
+	defer ncSub.Close()
+	sub, err := ncSub.SubscribeSync("only.here")
+	require_NoError(t, err)
+	defer sub.Unsubscribe()
+	require_NoError(t, ncSub.Flush())
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
+	for _, tc := range []struct {
+		name     string
+		url      string
+		opts     *ConnzOptions
+		expected int
+	}{
+		{"user", "connz?user=a", &ConnzOptions{User: "a"}, 1},
+		{"user no match", "connz?user=nobody", &ConnzOptions{User: "nobody"}, 0},
+		{"user paged", "connz?user=b&limit=1", &ConnzOptions{User: "b", Limit: 1}, 4},
+		// filter_subject is not an HTTP query parameter, only via Connz()/system request.
+		{"filter subject", _EMPTY_, &ConnzOptions{Account: "B", FilterSubject: "only.here"}, 1},
+		{"account", "connz?acc=B", &ConnzOptions{Account: "B"}, 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for mode := 0; mode < 2; mode++ {
+				if mode == 0 && tc.url == _EMPTY_ {
+					continue
+				}
+				c := pollConnz(t, s, mode, url+tc.url, tc.opts)
+				require_Equal(t, c.Total, tc.expected)
+			}
+		})
 	}
 }
 
@@ -7017,9 +7191,7 @@ func TestConnzClosedSubsDetailNoSharedMutation(t *testing.T) {
 	cc.Cid = 1
 	cc.subs = []SubDetail{{Subject: "foo.bar"}}
 	cc.NumSubs = 1
-	s.mu.Lock()
 	s.closed.append(cc)
-	s.mu.Unlock()
 
 	// Concurrently request closed connections with subscription detail.
 	var wg sync.WaitGroup
@@ -7048,4 +7220,188 @@ func TestConnzClosedSubsDetailNoSharedMutation(t *testing.T) {
 	if c.Conns[0].SubsDetail != nil {
 		t.Fatalf("Plain closed-conn query unexpectedly carried SubsDetail: %+v", c.Conns[0].SubsDetail)
 	}
+}
+
+// Returns a listener that is never accepted from, so that a leafnode remote
+// pointed at it can dial but never completes the connect process, and no other
+// process can take its port while the test runs.
+func monitorHealthzStalledRemoteURL(t *testing.T) *url.URL {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require_NoError(t, err)
+	t.Cleanup(func() { ln.Close() })
+	u, err := url.Parse(fmt.Sprintf("nats://%s", ln.Addr()))
+	require_NoError(t, err)
+	return u
+}
+
+func TestMonitorHealthzLeafRemotes(t *testing.T) {
+	ho := DefaultOptions()
+	ho.Port = -1
+	ho.Cluster.Name = "hub"
+	ho.LeafNode.Host = "127.0.0.1"
+	ho.LeafNode.Port = -1
+	hub := RunServer(ho)
+	defer hub.Shutdown()
+
+	u, err := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", ho.LeafNode.Port))
+	require_NoError(t, err)
+
+	lo := DefaultOptions()
+	lo.Port = -1
+	lo.Cluster.Name = "leaf"
+	lo.HTTPHost = "127.0.0.1"
+	lo.HTTPPort = -1
+	lo.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{u}}}
+	leaf := RunServer(lo)
+	defer leaf.Shutdown()
+
+	addr := leaf.MonitorAddr().String()
+	get := func(query string) (int, HealthStatus) {
+		t.Helper()
+		resp, err := http.Get(fmt.Sprintf("http://%s/healthz%s", addr, query))
+		require_NoError(t, err)
+		defer resp.Body.Close()
+		var hs HealthStatus
+		require_NoError(t, json.NewDecoder(resp.Body).Decode(&hs))
+		return resp.StatusCode, hs
+	}
+	checkStatus := func(query string, expected int) {
+		t.Helper()
+		checkFor(t, 10*time.Second, 50*time.Millisecond, func() error {
+			if code, hs := get(query); code != expected {
+				return fmt.Errorf("status %d, expected %d: %s", code, expected, hs.Error)
+			}
+			return nil
+		})
+	}
+
+	// Remote connects.
+	checkStatus("?leaf-remotes-connected=true", http.StatusOK)
+	code, hs := get("?leaf-remotes-connected=true&details=true")
+	require_Equal(t, code, http.StatusOK)
+	require_Equal(t, len(hs.Errors), 0)
+
+	// Drop the link and prevent it from coming back.
+	leaf.closeAndDisableLeafnodes()
+	checkStatus("?leaf-remotes-connected=true", http.StatusServiceUnavailable)
+	// Plain healthz is unaffected by the remote being down.
+	code, _ = get("")
+	require_Equal(t, code, http.StatusOK)
+	code, hs = get("?leaf-remotes-connected=true")
+	require_Equal(t, code, http.StatusServiceUnavailable)
+	require_True(t, strings.Contains(hs.Error, "is not connected"))
+	code, hs = get("?leaf-remotes-connected=true&details=true")
+	require_Equal(t, code, http.StatusServiceUnavailable)
+	require_Equal(t, len(hs.Errors), 1)
+	require_Equal(t, hs.Errors[0].Type, HealthzErrorConn)
+
+	// Allow it to reconnect.
+	leaf.reEnableLeafnodes()
+	checkStatus("?leaf-remotes-connected=true", http.StatusOK)
+}
+
+func TestMonitorHealthzLeafRemotesMultipleAndDisabled(t *testing.T) {
+	// None of these remotes can complete a connection.
+	a, b, c := monitorHealthzStalledRemoteURL(t), monitorHealthzStalledRemoteURL(t), monitorHealthzStalledRemoteURL(t)
+	conf := createConfFile(t, fmt.Appendf(nil, `
+		listen: 127.0.0.1:-1
+		http: 127.0.0.1:-1
+		accounts {
+			A { users = [ { user: "a", pass: "p" } ] }
+			B { users = [ { user: "b", pass: "p" } ] }
+			C { users = [ { user: "c", pass: "p" } ] }
+		}
+		leafnodes {
+			remotes = [
+				{ url: "%s", account: "A" }
+				{ url: "%s", account: "B" }
+				{ url: "%s", account: "C", disabled: true }
+			]
+		}
+	`, a, b, c))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	hs := s.Healthz(&HealthzOptions{LeafRemotesConnected: true, Details: true})
+	require_Equal(t, hs.StatusCode, http.StatusServiceUnavailable)
+	require_Equal(t, hs.Status, "error")
+	// Both enabled remotes are reported, in a stable order, and the disabled one is not.
+	require_Equal(t, len(hs.Errors), 2)
+	require_True(t, strings.Contains(hs.Errors[0].Error, `account "A"`))
+	require_True(t, strings.Contains(hs.Errors[1].Error, `account "B"`))
+	for _, he := range hs.Errors {
+		require_Equal(t, he.Type, HealthzErrorConn)
+		require_False(t, strings.Contains(he.Error, `account "C"`))
+	}
+
+	// Without details, only the first error is returned.
+	hs = s.Healthz(&HealthzOptions{LeafRemotesConnected: true})
+	require_Equal(t, hs.StatusCode, http.StatusServiceUnavailable)
+	require_True(t, strings.Contains(hs.Error, `account "A"`))
+	require_False(t, strings.Contains(hs.Error, `account "B"`))
+	require_False(t, strings.Contains(hs.Error, `account "C"`))
+
+	// Same server without the option is healthy.
+	hs = s.Healthz(nil)
+	require_Equal(t, hs.StatusCode, http.StatusOK)
+}
+
+func TestMonitorHealthzLeafRemotesErrorDoesNotLeakSecrets(t *testing.T) {
+	u := monitorHealthzStalledRemoteURL(t)
+	creds := filepath.Join(t.TempDir(), "secret-creds-file.creds")
+	conf := createConfFile(t, fmt.Appendf(nil, `
+		listen: 127.0.0.1:-1
+		leafnodes {
+			remotes = [ { url: "nats://user:s3cr3tpass@%s", credentials: %q } ]
+		}
+	`, u.Host, creds))
+	// The credentials file does not need to be valid for the remote to be configured.
+	require_NoError(t, os.WriteFile(creds, []byte("x"), 0600))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	hs := s.Healthz(&HealthzOptions{LeafRemotesConnected: true})
+	require_Equal(t, hs.StatusCode, http.StatusServiceUnavailable)
+	for _, secret := range []string{"s3cr3tpass", "secret-creds-file", "credentials"} {
+		require_False(t, strings.Contains(hs.Error, secret))
+	}
+}
+
+func TestMonitorHealthzLeafRemotesSystemAccountRequest(t *testing.T) {
+	u := monitorHealthzStalledRemoteURL(t)
+	conf := createConfFile(t, fmt.Appendf(nil, `
+		listen: 127.0.0.1:-1
+		accounts {
+			A { users = [ { user: "a", pass: "p" } ] }
+			$SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }
+		}
+		leafnodes {
+			remotes = [ { url: "%s", account: "A" } ]
+		}
+	`, u))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	nc, err := nats.Connect(s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+
+	request := func(payload string) HealthStatus {
+		t.Helper()
+		msg, err := nc.Request(fmt.Sprintf("$SYS.REQ.SERVER.%s.HEALTHZ", s.ID()), []byte(payload), 2*time.Second)
+		require_NoError(t, err)
+		var resp struct {
+			Data HealthStatus `json:"data"`
+		}
+		require_NoError(t, json.Unmarshal(msg.Data, &resp))
+		return resp.Data
+	}
+
+	hs := request(`{"leaf-remotes-connected":true}`)
+	require_Equal(t, hs.StatusCode, http.StatusServiceUnavailable)
+	require_True(t, strings.Contains(hs.Error, "is not connected"))
+
+	hs = request(`{}`)
+	require_Equal(t, hs.StatusCode, http.StatusOK)
 }

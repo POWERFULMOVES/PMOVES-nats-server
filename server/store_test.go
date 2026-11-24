@@ -1,4 +1,4 @@
-// Copyright 2012-2025 The NATS Authors
+// Copyright 2012-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,6 +17,7 @@ package server
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -926,6 +927,63 @@ func TestStoreStreamInteriorDeleteAccounting(t *testing.T) {
 	}
 }
 
+func TestStoreStateNoDeletedWithoutMsgs(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		compact  uint64
+		truncate uint64
+		first    uint64
+	}{
+		{"New", 0, 0, 0},
+		{"Truncated", 0, 6, 7},
+		{"CompactedAndTruncated", 24, 24, 25},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := StreamConfig{Name: "zzz", Subjects: []string{"foo"}}
+			testAllStoreAllPermutations(t, true, cfg, func(t *testing.T, s StreamStore) {
+				// Both move the sequences up, but nothing was ever stored.
+				if test.compact > 0 {
+					_, err := s.Compact(test.compact)
+					require_NoError(t, err)
+				}
+				if test.truncate > 0 {
+					require_NoError(t, s.Truncate(test.truncate))
+				}
+
+				// Without messages the first sequence comes after the last, so nothing is deleted.
+				before := s.State()
+				require_Equal(t, before.Msgs, 0)
+				require_Equal(t, before.FirstSeq, test.first)
+				require_Equal(t, before.LastSeq, test.truncate)
+				require_Equal(t, before.NumDeleted, 0)
+				require_Len(t, len(before.Deleted), 0)
+
+				var fstate StreamState
+				s.FastState(&fstate)
+				require_Equal(t, fstate.NumDeleted, 0)
+
+				// Only a file store recovers, and only if it was written to.
+				fs, ok := s.(*fileStore)
+				if !ok || test.truncate == 0 {
+					return
+				}
+				// Otherwise it must be the same after a restart.
+				cfg.Storage = FileStorage
+				fcfg := fs.fcfg
+				require_NoError(t, fs.Stop())
+				fs, err := newFileStore(fcfg, cfg)
+				require_NoError(t, err)
+				defer fs.Stop()
+
+				state := fs.State()
+				require_Equal(t, state.FirstSeq, before.FirstSeq)
+				require_Equal(t, state.LastSeq, before.LastSeq)
+				require_Equal(t, state.NumDeleted, 0)
+			})
+		})
+	}
+}
+
 func TestStoreMsgLoadPrevMsgMulti(t *testing.T) {
 	testAllStoreAllPermutations(
 		t, false,
@@ -1171,6 +1229,41 @@ func TestStoreGetSeqFromTimeWithTrailingDeletes(t *testing.T) {
 	)
 }
 
+func TestStoreSkipMsgsSequenceLimits(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		seq     uint64
+		num     uint64
+		wantErr bool
+	}{
+		{"zero count", 2, 0, true},
+		{"zero count zero sequence", 0, 0, true},
+		{"overflow", 2, math.MaxUint64, true},
+		{"overflow zero sequence", 0, math.MaxUint64, true},
+		{"last sequence exhausted", 2, math.MaxUint64 - 1, true},
+		{"normal skip", 2, 100, false},
+		{"zero sequence", 0, 100, false},
+		{"largest valid skip", 2, math.MaxUint64 - 2, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			testAllStoreAllPermutations(t, false, StreamConfig{Name: "T"}, func(t *testing.T, store StreamStore) {
+				require_NoError(t, store.SkipMsgs(1, 1))
+				before := store.State()
+				err := store.SkipMsgs(test.seq, test.num)
+				if test.wantErr {
+					require_Error(t, err, ErrSequenceMismatch)
+					require_True(t, reflect.DeepEqual(store.State(), before))
+				} else {
+					require_NoError(t, err)
+					state := store.State()
+					require_Equal(t, state.LastSeq, before.LastSeq+test.num)
+					require_Equal(t, state.FirstSeq, state.LastSeq+1)
+				}
+			})
+		})
+	}
+}
+
 func TestStoreSkipMsgsCarryForwardLastTime(t *testing.T) {
 	testAllStoreAllPermutations(
 		t, false,
@@ -1359,6 +1452,169 @@ func TestFileStoreMultiLastSeqsAndLoadLastMsgWithLazySubjectState(t *testing.T) 
 	)
 }
 
+func TestStoreMultiLastMsgs(t *testing.T) {
+	testAllStoreAllPermutations(
+		t, false,
+		StreamConfig{Name: "zzz", Subjects: []string{"foo.*"}},
+		func(t *testing.T, fs StreamStore) {
+			// Three rounds over ten subjects, so every subject has multiple
+			// revisions and the last per subject sits in the final round.
+			// Seqs 1-30, last for foo.<i> is 21+i.
+			for range 3 {
+				for i := range 10 {
+					_, _, err := fs.StoreMsg(fmt.Sprintf("foo.%d", i), nil, nil, 0)
+					require_NoError(t, err)
+				}
+			}
+
+			type delivery struct {
+				seq uint64
+				np  uint64
+			}
+			load := func(filters []string, minSeq, maxSeq uint64, maxAllowed, stopAfter int) ([]delivery, uint64, uint64, error) {
+				var msgs []delivery
+				total, np, err := fs.MultiLastMsgs(filters, minSeq, maxSeq, maxAllowed, func(sm *StoreMsg, np uint64) bool {
+					msgs = append(msgs, delivery{sm.seq, np})
+					return stopAfter == 0 || len(msgs) < stopAfter
+				})
+				return msgs, total, np, err
+			}
+
+			// Whole stream delivers the last message per subject in ascending
+			// sequence order, with np counting down the remaining messages.
+			msgs, total, np, err := load([]string{"foo.*"}, 0, 0, -1, 0)
+			require_NoError(t, err)
+			require_Equal(t, total, 10)
+			require_Equal(t, np, 0)
+			require_Len(t, len(msgs), 10)
+			for i, d := range msgs {
+				require_Equal(t, d.seq, uint64(21+i))
+				require_Equal(t, d.np, uint64(9-i))
+			}
+
+			// minSeq skips lower sequences but still accounts for them in np.
+			msgs, total, np, err = load([]string{"foo.*"}, 26, 0, -1, 0)
+			require_NoError(t, err)
+			require_Equal(t, total, 10)
+			require_Equal(t, np, 0)
+			require_Len(t, len(msgs), 5)
+			for i, d := range msgs {
+				require_Equal(t, d.seq, uint64(26+i))
+				require_Equal(t, d.np, uint64(4-i))
+			}
+
+			// maxSeq resolves the last message per subject at or below it,
+			// stepping back to an earlier round where needed.
+			msgs, total, np, err = load([]string{"foo.*"}, 0, 25, -1, 0)
+			require_NoError(t, err)
+			require_Equal(t, total, 10)
+			require_Equal(t, np, 0)
+			require_Len(t, len(msgs), 10)
+			for i, d := range msgs {
+				require_Equal(t, d.seq, uint64(16+i))
+			}
+
+			// Stopping the callback early keeps np at the remaining count.
+			msgs, total, np, err = load([]string{"foo.*"}, 0, 0, -1, 3)
+			require_NoError(t, err)
+			require_Equal(t, total, 10)
+			require_Equal(t, np, 7)
+			require_Len(t, len(msgs), 3)
+
+			// Exceeding maxAllowed errors without delivering anything.
+			msgs, _, _, err = load([]string{"foo.*"}, 0, 0, 5, 0)
+			require_Error(t, err, ErrTooManyResults)
+			require_Len(t, len(msgs), 0)
+
+			// No matches.
+			msgs, total, _, err = load([]string{"bar.>"}, 0, 0, -1, 0)
+			require_NoError(t, err)
+			require_Equal(t, total, 0)
+			require_Len(t, len(msgs), 0)
+		},
+	)
+}
+
+func TestStoreLoadLastSeq(t *testing.T) {
+	test := func(t *testing.T, fs StreamStore) {
+		for _, subj := range []string{"foo.a", "foo.b", "foo.c", "foo.a", "foo.b", "bar", "foo.c", "foo.a", "foo.b"} {
+			_, _, err := fs.StoreMsg(subj, nil, []byte("x"), 0)
+			require_NoError(t, err)
+		}
+		if fs, ok := fs.(*fileStore); ok {
+			require_True(t, fs.numMsgBlocks() > 1)
+		}
+		// LoadLastSeq must agree with LoadLastMsg.
+		check := func(subj string, expected uint64) {
+			t.Helper()
+			var smv StoreMsg
+			sm, merr := fs.LoadLastMsg(subj, &smv)
+			seq, err := fs.LoadLastSeq(subj)
+			if sm == nil {
+				require_Error(t, merr, ErrStoreMsgNotFound)
+				require_Error(t, err, ErrStoreMsgNotFound)
+			} else {
+				require_NoError(t, err)
+				require_Equal(t, seq, sm.seq)
+			}
+			require_Equal(t, seq, expected)
+		}
+		check("foo.a", 8)
+		check("foo.b", 9)
+		check("foo.c", 7)
+		check("bar", 6)
+		check("foo.*", 9)
+		check(_EMPTY_, 9)
+		check(fwcs, 9)
+		check("baz", 0)
+
+		// Removing a subject's last message out of order moves it back to the previous one.
+		_, err := fs.RemoveMsg(8)
+		require_NoError(t, err)
+		check("foo.a", 4)
+
+		// The stream's last sequence stays after its message is removed, but has no message.
+		_, err = fs.RemoveMsg(9)
+		require_NoError(t, err)
+		check("foo.b", 5)
+		check("foo.*", 7)
+		check(_EMPTY_, 0)
+		check(fwcs, 0)
+
+		_, err = fs.RemoveMsg(4)
+		require_NoError(t, err)
+		check("foo.a", 1)
+		_, err = fs.RemoveMsg(1)
+		require_NoError(t, err)
+		check("foo.a", 0)
+
+		_, err = fs.Purge()
+		require_NoError(t, err)
+		check("foo.b", 0)
+		check(fwcs, 0)
+	}
+
+	cfg := StreamConfig{Name: "zzz", Subjects: []string{"foo.*", "bar"}}
+	t.Run("Memory", func(t *testing.T) {
+		cfg.Storage = MemoryStorage
+		ms, err := newMemStore(&cfg)
+		require_NoError(t, err)
+		defer ms.Stop()
+		test(t, ms)
+	})
+	t.Run("File", func(t *testing.T) {
+		cfg.Storage = FileStorage
+		testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
+			// Small blocks, so stale last block indexes make the lookup walk back across blocks.
+			fcfg.BlockSize = 128
+			fs, err := newFileStore(fcfg, cfg)
+			require_NoError(t, err)
+			defer fs.Stop()
+			test(t, fs)
+		})
+	})
+}
+
 func TestStoreNumPendingLastPerSubjectExcludeOvercount(t *testing.T) {
 	testAllStoreAllPermutations(
 		t, false,
@@ -1390,6 +1646,295 @@ func TestStoreNumPendingLastPerSubjectExcludeOvercount(t *testing.T) {
 			total, _, err = fs.NumPendingMulti(13, filters, true)
 			require_NoError(t, err)
 			require_Equal(t, total, 2)
+		},
+	)
+}
+
+func TestStoreFilteredStateFirstAndLast(t *testing.T) {
+	put := func(t *testing.T, fs StreamStore, subjs ...string) {
+		for _, subj := range subjs {
+			_, _, err := fs.StoreMsg(subj, nil, nil, 0)
+			require_NoError(t, err)
+		}
+	}
+	// Only the file store has blocks.
+	newBlock := func(t *testing.T, fs StreamStore) {
+		if fs, ok := fs.(*fileStore); ok {
+			fs.mu.Lock()
+			defer fs.mu.Unlock()
+			_, err := fs.newMsgBlockForWrite()
+			require_NoError(t, err)
+		}
+	}
+	for _, test := range []struct {
+		title             string
+		setup             func(t *testing.T, fs StreamStore)
+		sseq              uint64
+		filter            string
+		msgs, first, last uint64
+	}{
+		{
+			// Starting at "bar", the only "foo" left is the last message.
+			title: "FirstIsLastMatch",
+			setup: func(t *testing.T, fs StreamStore) {
+				put(t, fs, "foo", "bar", "foo")
+			},
+			sseq: 2, filter: "foo", msgs: 1, first: 3, last: 3,
+		},
+		{
+			// With many skipped sequences the memory store goes over its messages instead of the sequence range.
+			title: "FirstIsLastMatchSparse",
+			setup: func(t *testing.T, fs StreamStore) {
+				put(t, fs, "foo", "bar")
+				require_NoError(t, fs.SkipMsgs(3, 1000))
+				put(t, fs, "foo")
+			},
+			sseq: 2, filter: "foo", msgs: 1, first: 1003, last: 1003,
+		},
+		{
+			title: "FirstIsLowestMatch",
+			setup: func(t *testing.T, fs StreamStore) {
+				put(t, fs, "foo")
+				require_NoError(t, fs.SkipMsgs(2, 1000))
+				put(t, fs, "foo")
+				require_NoError(t, fs.SkipMsgs(1003, 10))
+				put(t, fs, "foo", "foo")
+			},
+			sseq: 1002, filter: "foo", msgs: 3, first: 1002, last: 1014,
+		},
+		{
+			// When matching all messages the last is the stream's, even if that message is removed.
+			title: "FullWildcardLast",
+			setup: func(t *testing.T, fs StreamStore) {
+				put(t, fs, "foo", "foo", "foo", "foo", "foo")
+				for seq := uint64(4); seq <= 5; seq++ {
+					_, err := fs.RemoveMsg(seq)
+					require_NoError(t, err)
+				}
+			},
+			sseq: 2, filter: ">", msgs: 2, first: 2, last: 5,
+		},
+		{
+			// The file store keeps the emptied second block for its tombstone, the first isn't taken from it.
+			title: "FullWildcardFirstAfterEmptyBlock",
+			setup: func(t *testing.T, fs StreamStore) {
+				remove := func(seq uint64) {
+					_, err := fs.RemoveMsg(seq)
+					require_NoError(t, err)
+				}
+				put(t, fs, "foo", "foo")
+				newBlock(t, fs)
+				put(t, fs, "foo")
+				remove(1)
+				newBlock(t, fs)
+				put(t, fs, "foo", "foo")
+				remove(3)
+				remove(4)
+			},
+			sseq: 3, filter: ">", msgs: 1, first: 5, last: 5,
+		},
+		{
+			// Without messages at or after the start, the sequences are the stream's.
+			title: "StartPastLast",
+			setup: func(t *testing.T, fs StreamStore) {
+				put(t, fs, "foo", "foo", "foo")
+			},
+			sseq: 10, filter: "foo", msgs: 0, first: 1, last: 3,
+		},
+		{
+			title: "StartPastLastAfterPurge",
+			setup: func(t *testing.T, fs StreamStore) {
+				put(t, fs, "foo", "foo", "foo")
+				_, err := fs.Purge()
+				require_NoError(t, err)
+			},
+			sseq: 1, filter: "foo", msgs: 0, first: 4, last: 3,
+		},
+	} {
+		t.Run(test.title, func(t *testing.T) {
+			testAllStoreAllPermutations(
+				t, false,
+				StreamConfig{Name: "zzz", Subjects: []string{"*"}},
+				func(t *testing.T, fs StreamStore) {
+					test.setup(t, fs)
+					// Repeated, since the memory store's map of messages has no fixed iteration order.
+					for range 30 {
+						ss, err := fs.FilteredState(test.sseq, test.filter)
+						require_NoError(t, err)
+						require_Equal(t, ss.Msgs, test.msgs)
+						require_Equal(t, ss.First, test.first)
+						require_Equal(t, ss.Last, test.last)
+					}
+				},
+			)
+		})
+	}
+}
+
+// Resolving last sequences for many subjects whose last messages are spread
+// over the whole stream. For the filestore a small block size spreads them
+// across many blocks: WholeStream can resolve via each subject's last block,
+// Bounded must walk the blocks backwards from maxSeq.
+func Benchmark_StoreMultiLastSeqsManyBlocks(b *testing.B) {
+	const (
+		numSubjects = 1_000
+		msgsPerSubj = 100
+	)
+
+	run := func(b *testing.B, fs StreamStore) {
+		// Store each subject's messages contiguously so the per-subject last
+		// messages land spread out over the whole stream.
+		msg := []byte("ok")
+		for i := range numSubjects {
+			subj := fmt.Sprintf("foo.%d", i)
+			for range msgsPerSubj {
+				_, _, err := fs.StoreMsg(subj, nil, msg, 0)
+				require_NoError(b, err)
+			}
+		}
+
+		// A sparse subset of subjects spread over the whole stream. Resolving
+		// via each subject's last block only visits these few blocks, while
+		// the backwards walk must scan nearly every block to find them all.
+		var sparse []string
+		for i := 0; i < numSubjects; i += numSubjects / 10 {
+			sparse = append(sparse, fmt.Sprintf("foo.%d", i))
+		}
+
+		for _, bc := range []struct {
+			name    string
+			filters []string
+			matches int
+			maxSeq  uint64
+		}{
+			{"AllSubjects/WholeStream", []string{">"}, numSubjects, 0},
+			{"AllSubjects/Bounded", []string{">"}, numSubjects, numSubjects*msgsPerSubj - 1},
+			{"SparseSubjects/WholeStream", sparse, len(sparse), 0},
+			{"SparseSubjects/Bounded", sparse, len(sparse), numSubjects*msgsPerSubj - 1},
+		} {
+			b.Run(bc.name, func(b *testing.B) {
+				for range b.N {
+					seqs, err := fs.MultiLastSeqs(bc.filters, bc.maxSeq, -1)
+					require_NoError(b, err)
+					require_Len(b, len(seqs), bc.matches)
+				}
+			})
+		}
+	}
+
+	cfg := StreamConfig{Name: "zzz", Subjects: []string{"foo.*", "bar.*"}}
+
+	b.Run("Memory", func(b *testing.B) {
+		cfg := cfg
+		cfg.Storage = MemoryStorage
+		ms, err := newMemStore(&cfg)
+		require_NoError(b, err)
+		defer ms.Stop()
+		run(b, ms)
+	})
+	b.Run("File", func(b *testing.B) {
+		cfg := cfg
+		cfg.Storage = FileStorage
+		fs, err := newFileStore(
+			FileStoreConfig{StoreDir: b.TempDir(), BlockSize: 8192}, cfg)
+		require_NoError(b, err)
+		defer fs.Stop()
+		run(b, fs)
+	})
+}
+
+func TestStoreSourcesOnlyTracksConfiguredSources(t *testing.T) {
+	testAllStoreAllPermutations(
+		t, false,
+		StreamConfig{
+			Name:     "SOURCE",
+			Subjects: []string{">"},
+			Sources:  []*StreamSource{{Name: "ORIGIN1"}},
+		},
+		func(t *testing.T, fs StreamStore) {
+			h1 := genHeader(nil, JSStreamSource, "ORIGIN1 5 > > foo.a IDENT1")
+			_, _, err := fs.StoreMsg("foo.a", h1, nil, 0)
+			require_NoError(t, err)
+
+			// Only configured sources are seeded into the map, so a header naming one that
+			// isn't configured is not tracked. It is recovered by a scan if it is added.
+			h2 := genHeader(nil, JSStreamSource, "ORIGIN2 7 > > foo.b IDENT2")
+			_, _, err = fs.StoreMsg("foo.b", h2, nil, 0)
+			require_NoError(t, err)
+
+			// Nor is a pre-2.10 header, which carries no index name at all.
+			h3 := genHeader(nil, JSStreamSource, "ORIGIN3 9")
+			_, _, err = fs.StoreMsg("foo.c", h3, nil, 0)
+			require_NoError(t, err)
+
+			state := fs.SourcesState()
+			require_Len(t, len(state), 1)
+			require_Equal(t, state["ORIGIN1 > >"].Seq, 5)
+			require_Equal(t, state["ORIGIN1 > >"].Ident, "IDENT1")
+
+			var tracked int
+			if fss, ok := fs.(*fileStore); ok {
+				fss.mu.RLock()
+				tracked = len(fss.sources)
+				fss.mu.RUnlock()
+			} else if mss, ok := fs.(*memStore); ok {
+				mss.mu.RLock()
+				tracked = len(mss.sources)
+				mss.mu.RUnlock()
+			} else {
+				t.Fatal("unknown store")
+			}
+			require_Equal(t, tracked, 1)
+
+			// A new message should update both the sequence and identity.
+			h4 := genHeader(nil, JSStreamSource, "ORIGIN1 2 > > foo.a IDENT3")
+			_, _, err = fs.StoreMsg("foo.a", h4, nil, 0)
+			require_NoError(t, err)
+			state = fs.SourcesState()
+			require_Len(t, len(state), 1)
+			require_Equal(t, state["ORIGIN1 > >"].Seq, 2)
+			require_Equal(t, state["ORIGIN1 > >"].Ident, "IDENT3")
+		},
+	)
+}
+
+func TestStoreConsumerAckAllWithRedeliveredDeliverySequence(t *testing.T) {
+	testAllStoreAllPermutations(
+		t, false,
+		StreamConfig{Name: "zzz", Subjects: []string{"foo"}},
+		func(t *testing.T, fs StreamStore) {
+			o, err := fs.ConsumerStore("o", time.Time{}, &ConsumerConfig{AckPolicy: AckAll})
+			require_NoError(t, err)
+			defer o.Stop()
+
+			// Deliver 1-3, then redeliver 1 at delivery sequence 4.
+			ts := time.Now().UnixNano()
+			for seq := uint64(1); seq <= 3; seq++ {
+				require_NoError(t, o.UpdateDelivered(seq, seq, 1, ts))
+			}
+			require_NoError(t, o.UpdateDelivered(4, 1, 2, ts))
+
+			// An older leader acks with the redelivered delivery sequence.
+			// The floor must use the original, staying below the other pending messages.
+			require_NoError(t, o.UpdateAcks(4, 1, false))
+			state, err := o.State()
+			require_NoError(t, err)
+			require_Equal(t, state.AckFloor, SequencePair{Consumer: 1, Stream: 1})
+			require_Len(t, len(state.Pending), 2)
+
+			// An older server could have stored a delivery floor above pending messages.
+			require_NoError(t, o.Update(&ConsumerState{
+				Delivered: SequencePair{Consumer: 4, Stream: 3},
+				AckFloor:  SequencePair{Consumer: 4, Stream: 1},
+				Pending:   map[uint64]*Pending{2: {2, ts}, 3: {3, ts}},
+			}))
+
+			// Acking the last one must still ack all, and move the floor up to the last delivered.
+			require_NoError(t, o.UpdateAcks(3, 3, false))
+			state, err = o.State()
+			require_NoError(t, err)
+			require_Equal(t, state.AckFloor, SequencePair{Consumer: 4, Stream: 3})
+			require_Len(t, len(state.Pending), 0)
 		},
 	)
 }

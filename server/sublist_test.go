@@ -1,4 +1,4 @@
-// Copyright 2016-2025 The NATS Authors
+// Copyright 2016-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,7 +17,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"runtime"
 	"strconv"
@@ -723,6 +723,15 @@ func TestValidateDestinationSubject(t *testing.T) {
 	checkError(ValidateMapping("*", "foo.{{partition(2,1)}}"), nil, t)
 	checkError(ValidateMapping("*.*", "foo.{{SplitFromLeft(2,1)}}"), nil, t)
 	checkError(ValidateMapping("*.*", "foo.{{SplitFromRight(2,1)}}"), nil, t)
+	checkError(ValidateMapping("*.*", "foo.{{SliceFromLeft(2,1)}}"), nil, t)
+	checkError(ValidateMapping("*.*", "foo.{{SliceFromRight(2,1)}}"), nil, t)
+	checkError(ValidateMapping("*.*", "foo.{{split(1,-)}}"), nil, t)
+	checkError(ValidateMapping("*", "foo.{{random(1)}}"), nil, t)
+	checkError(ValidateMapping("*", "foo.{{left(1,2)}}"), nil, t)
+	checkError(ValidateMapping("*", "foo.{{Left(1,2)}}"), nil, t)
+	checkError(ValidateMapping("*", "foo.{{right(1,2)}}"), nil, t)
+	checkError(ValidateMapping("*", "foo.{{Right(1,2)}}"), nil, t)
+	checkError(ValidateMapping("*", "foo.{{ left( 1 , 2 ) }}"), nil, t)
 	checkError(ValidateMapping("*", "foo.{{unknown(1)}}"), ErrInvalidMappingDestination, t)
 	checkError(ValidateMapping("foo", "foo..}"), ErrInvalidMappingDestination, t)
 	checkError(ValidateMapping("foo", "foo. bar}"), ErrInvalidMappingDestinationSubject, t)
@@ -1040,34 +1049,79 @@ func testSublistRemoteQueueSubscriptions(t *testing.T, s *Sublist) {
 	rs2 := newRemoteQSub("foo", "bar", 10)
 	s.Insert(rs2)
 
-	// These are just shadowed in results, so should appear as 4 subs.
+	// Weights are not expanded in results, so should appear as 4 subs.
 	verifyCount(s, 4, t)
 
 	r := s.Match("foo")
 	verifyLen(r.psubs, 0, t)
 	verifyQLen(r.qsubs, 1, t)
-	verifyLen(r.qsubs[0], 22, t)
+	verifyLen(r.qsubs[0], 4, t)
 
 	s.Remove(s1)
 	s.Remove(rs1)
 
 	verifyCount(s, 2, t)
 
-	// Now make sure our shadowed results are correct after a removal.
 	r = s.Match("foo")
 	verifyLen(r.psubs, 0, t)
 	verifyQLen(r.qsubs, 1, t)
-	verifyLen(r.qsubs[0], 11, t)
+	verifyLen(r.qsubs[0], 2, t)
 
 	// Now do an update to an existing remote sub to update its weight.
 	rs2.qw = 1
 	s.UpdateRemoteQSub(rs2)
 
-	// Results should reflect new weight.
 	r = s.Match("foo")
 	verifyLen(r.psubs, 0, t)
 	verifyQLen(r.qsubs, 1, t)
 	verifyLen(r.qsubs[0], 2, t)
+
+	// A huge weight must not grow the results.
+	rs2.qw = 999_999_999
+	s.UpdateRemoteQSub(rs2)
+	r = s.Match("foo")
+	verifyQLen(r.qsubs, 1, t)
+	verifyLen(r.qsubs[0], 2, t)
+}
+
+func TestSublistWeightedQSubIndex(t *testing.T) {
+	s := NewSublistWithCache()
+	for range 3 {
+		require_NoError(t, s.Insert(newQSub("foo", "bar")))
+	}
+	remote := newRemoteQSub("foo", "bar", 7)
+	require_NoError(t, s.Insert(remote))
+
+	// The weighted remote sub is moved to the front.
+	r := s.Match("foo")
+	require_Len(t, len(r.qsubs[0]), 4)
+	require_Equal(t, r.qwn[0], 1)
+	require_True(t, r.qsubs[0][0] == remote)
+
+	// The remote sub has weight 7 out of 10, so should be picked ~70% of the time.
+	const n = 100_000
+	var picked int
+	for range n {
+		if weightedQSubIndex(r.qsubs[0], r.qwn[0]) == 0 {
+			picked++
+		}
+	}
+	if pct := float64(picked) / n; pct < 0.68 || pct > 0.72 {
+		t.Fatalf("Expected remote picked ~70%%, got %.2f%%", pct*100)
+	}
+
+	// A weighted remote sub inserted into a cached result is also moved to the front.
+	remote2 := newRemoteQSub("foo", "bar", 5)
+	require_NoError(t, s.Insert(remote2))
+	r = s.Match("foo")
+	require_Len(t, len(r.qsubs[0]), 5)
+	require_Equal(t, r.qwn[0], 2)
+	require_True(t, r.qsubs[0][1] == remote2)
+
+	// A local sub keeps weight 1 regardless of qw.
+	local := newQSub("foo", "bar")
+	local.qw = 9
+	require_Equal(t, qsubWeight(local), 1)
 }
 
 func TestSublistSharedEmptyResult(t *testing.T) {
@@ -1120,6 +1174,43 @@ func TestSublistAll(t *testing.T) {
 	}
 }
 
+func TestSublistFilter(t *testing.T) {
+	s := NewSublistNoCache()
+	subs := []*subscription{
+		newSub("foo.bar.baz"),
+		newSub("foo.bar"),
+		newQSub("baz", "q1"),
+		newQSub("foo.bar", "q2"),
+	}
+	for _, sub := range subs {
+		s.Insert(sub)
+	}
+
+	check := func(expected int) {
+		t.Helper()
+		var buf [32]*subscription
+		output := buf[:0]
+		s.Filter(&output, func(sub *subscription) bool {
+			return string(sub.subject) != "foo.bar"
+		})
+		if len(output) != expected {
+			t.Fatalf("Expected %d for Filter, got %d", expected, len(output))
+		}
+		for _, sub := range output {
+			if string(sub.subject) == "foo.bar" {
+				t.Fatalf("The sub with subject `foo.bar` should not have been returned")
+			}
+		}
+	}
+	check(2)
+
+	// Add more subscriptions to get n.plist populated.
+	for range plistMin + 10 {
+		s.Insert(newSub("foo.baz"))
+	}
+	check(plistMin + 10 + 2)
+}
+
 func TestIsSubsetMatch(t *testing.T) {
 	for _, test := range []struct {
 		subject string
@@ -1137,6 +1228,14 @@ func TestIsSubsetMatch(t *testing.T) {
 		{"foo.>", "foo.bar", false},
 		{"foo..bar", "foo.*", false}, // Bad subject, we return false
 		{"foo.*", "foo..bar", false}, // Bad subject, we return false
+		// A wildcard char inside a token is a literal.
+		{"foo.bar", "foo.*bar", false},
+		{"foo.bar", "foo.**", false},
+		{"foo.*bar", "foo.*bar", true},
+		{"foo.*bar", "foo.*", true},
+		{"foo.*", "foo.*bar", false},
+		{"foo.bar", "foo.bar*", false},
+		{"foo.bar", "foo.>bar", false},
 	} {
 		t.Run("", func(t *testing.T) {
 			if res := subjectIsSubsetMatch(test.subject, test.test); res != test.result {
@@ -1575,6 +1674,13 @@ func TestSublistSubjectCollide(t *testing.T) {
 	require_True(t, SubjectsCollide("foo.*", "foo.foo"))
 	require_True(t, SubjectsCollide("foo.*", "*.foo"))
 	require_True(t, SubjectsCollide("foo.bar.>", "*.bar.foo"))
+
+	// A wildcard char inside a token is a literal.
+	require_False(t, SubjectsCollide("foo.*bar.*", "foo.baz.*"))
+	require_False(t, SubjectsCollide("foo.>bar.*", "foo.baz.*"))
+	require_False(t, SubjectsCollide("foo.**.*", "foo.baz.*"))
+	require_True(t, SubjectsCollide("foo.*bar.*", "foo.*bar.*"))
+	require_True(t, SubjectsCollide("foo.*bar.*", "foo.*.baz"))
 }
 
 func TestSublistAddCacheHitRate(t *testing.T) {
@@ -1805,6 +1911,33 @@ func TestSublistHasInterestOverlapping(t *testing.T) {
 	require_NoError(t, sl.Insert(newSub("stream.*")))
 	require_True(t, sl.HasInterest("stream.A.child"))
 	require_True(t, sl.HasInterest("stream.A"))
+}
+
+func TestSublistNumInterestOverlappingSubs(t *testing.T) {
+	ref, nc, wc := NewSublistNoCache(), NewSublistNoCache(), NewSublistWithCache()
+	for _, subj := range []string{">", "foo.>", "*.>", "foo.*", "*.bar", "foo.bar", "foo.bar.baz", "*.*.baz"} {
+		for _, sub := range []*subscription{newSub(subj), newQSub(subj, "q1"), newQSub(subj, "q2")} {
+			for _, sl := range []*Sublist{ref, nc, wc} {
+				sl.Insert(sub)
+			}
+		}
+	}
+	for _, subj := range []string{"foo", "bar", "foo.bar", "foo.baz", "bar.bar", "foo.bar.baz", "foo.bar.baz.qux"} {
+		r := ref.Match(subj)
+		wnq := 0
+		for _, qsub := range r.qsubs {
+			wnq += len(qsub)
+		}
+		// Check both before and after Match caches the result.
+		for _, sl := range []*Sublist{nc, wc} {
+			for range 2 {
+				np, nq := sl.NumInterest(subj)
+				require_Equal(t, np, len(r.psubs))
+				require_Equal(t, nq, wnq)
+				sl.Match(subj)
+			}
+		}
+	}
 }
 
 func TestSublistNumInterest(t *testing.T) {
@@ -2346,7 +2479,7 @@ func cacheContentionTest(b *testing.B, numMatchers, numAdders, numRemovers int) 
 	// Removers
 	for i := 0; i < numRemovers; i++ {
 		go func() {
-			prand := rand.New(rand.NewSource(time.Now().UnixNano()))
+			prand := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 0))
 			swg.Done()
 			swg.Wait()
 			for {
@@ -2357,7 +2490,7 @@ func cacheContentionTest(b *testing.B, numMatchers, numAdders, numRemovers int) 
 				default:
 					mu.RLock()
 					lh := len(subs) - 1
-					index := prand.Intn(lh)
+					index := prand.IntN(lh)
 					sub := subs[index]
 					mu.RUnlock()
 					s.Remove(sub)

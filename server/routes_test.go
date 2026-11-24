@@ -1,4 +1,4 @@
-// Copyright 2013-2025 The NATS Authors
+// Copyright 2013-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,7 +20,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -43,6 +43,7 @@ import (
 func init() {
 	routeConnectDelay = 15 * time.Millisecond
 	routeConnectMaxDelay = 15 * time.Millisecond
+	routeReconnectDelay = 15 * time.Millisecond
 }
 
 func checkNumRoutes(t *testing.T, s *Server, expected int) {
@@ -339,7 +340,7 @@ func checkClusterFormed(t testing.TB, servers ...*Server) {
 			enr = append(enr, total)
 		}
 	}
-	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+	checkFor(t, 10*time.Second, 15*time.Millisecond, func() error {
 		for i, s := range servers {
 			if numRoutes := s.NumRoutes(); numRoutes != enr[i] {
 				return fmt.Errorf("Expected %d routes for server %q, got %d", enr[i], s, numRoutes)
@@ -1371,6 +1372,52 @@ func TestRouteCloseTLSConnection(t *testing.T) {
 	ch <- true
 }
 
+func TestRouteNoPoolRejectsRoutePoolIdx(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		poolSize int
+		info     string
+	}{
+		{"remote out of range", 0, `"route_pool_size":0,"route_pool_idx":3`},
+		{"remote in range", 0, `"route_pool_size":0,"route_pool_idx":2`},
+		{"remote negative", 0, `"route_pool_size":0,"route_pool_idx":-1`},
+		{"local out of range", -1, `"route_pool_size":3,"route_pool_idx":3`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			o := DefaultOptions()
+			o.Cluster.Name = "A"
+			o.Cluster.Host = "127.0.0.1"
+			o.Cluster.Port = -1
+			o.Cluster.PoolSize = test.poolSize
+			s := RunServer(o)
+			defer s.Shutdown()
+
+			conn, err := net.DialTimeout("tcp", net.JoinHostPort(o.Cluster.Host, fmt.Sprintf("%d", o.Cluster.Port)), 2*time.Second)
+			require_NoError(t, err)
+			defer conn.Close()
+
+			_, err = conn.Write([]byte("CONNECT {\"name\":\"route\",\"verbose\":false,\"pedantic\":false,\"cluster\":\"A\"}\r\n"))
+			require_NoError(t, err)
+			_, err = conn.Write(fmt.Appendf(nil, "INFO {\"server_id\":\"route\",\"name\":\"route\",\"cluster\":\"A\",%s}\r\n", test.info))
+			require_NoError(t, err)
+
+			// The route must be rejected as a protocol violation.
+			require_NoError(t, conn.SetReadDeadline(time.Now().Add(2*time.Second)))
+			br := bufio.NewReader(conn)
+			for {
+				line, err := br.ReadString('\n')
+				require_NoError(t, err)
+				if strings.HasPrefix(line, "-ERR") {
+					require_Contains(t, line, "Route pool index should not be set")
+					break
+				}
+			}
+			require_True(t, s.Running())
+			require_Equal(t, s.NumRoutes(), 0)
+		})
+	}
+}
+
 func TestRouteClusterNameConflictBetweenStaticAndDynamic(t *testing.T) {
 	o1 := DefaultOptions()
 	o1.Cluster.Name = "AAAAAAAAAAAAAAAAAAAA" // make it alphabetically the "smallest"
@@ -1785,7 +1832,7 @@ func TestRouteReconnectExponentialBackoff(t *testing.T) {
 	s2.SetLogger(l, true, false)
 
 	// Remove initial delay before reconnect, and allow for some skew.
-	now := time.Now().Add(DEFAULT_ROUTE_RECONNECT).Add(-100 * time.Millisecond)
+	now := time.Now().Add(routeReconnectDelay).Add(-100 * time.Millisecond)
 	var delay time.Duration
 
 	// S2 should retry ConnectRetries+1 times and then stop
@@ -1903,6 +1950,103 @@ func TestRouteSaveTLSName(t *testing.T) {
 	checkClusterFormed(t, s1, s2, s3)
 }
 
+func TestRouteImplicitUsesAdvertisedURLForTLSName(t *testing.T) {
+	c1Conf := createConfFile(t, []byte(`
+		port: -1
+		cluster {
+			name: "abc"
+			port: -1
+			pool_size: -1
+			advertise: "localhost"
+			tls {
+				cert_file: '../test/configs/certs/server-noip.pem'
+				key_file: '../test/configs/certs/server-key-noip.pem'
+				ca_file: '../test/configs/certs/ca.pem'
+			}
+		}
+	`))
+	s1, o1 := RunServerWithConfig(c1Conf)
+	defer s1.Shutdown()
+
+	tmpl := `
+	port: -1
+	cluster {
+		name: "abc"
+		port: -1
+		pool_size: -1
+		routes: ["nats://localhost:%d"]
+		%s
+		tls {
+			cert_file: '../test/configs/certs/server-noip.pem'
+			key_file: '../test/configs/certs/server-key-noip.pem'
+			ca_file: '../test/configs/certs/ca.pem'
+		}
+	}
+	`
+	c2And3Conf := createConfFile(t, fmt.Appendf(nil, tmpl, o1.Cluster.Port, _EMPTY_))
+	s2, _ := RunServerWithConfig(c2And3Conf)
+	defer s2.Shutdown()
+
+	checkClusterFormed(t, s1, s2)
+
+	// For this test, we need to clear the saved TLS name to make sure
+	// that the implicit route fails since the connection will be made with
+	// an IP instead of a hostname.
+	s2.mu.Lock()
+	s2.routeTLSName = _EMPTY_
+	s2.mu.Unlock()
+
+	// Set a logger to capture error indicating that s2 can't connect to the
+	// discovered server s3 because it connects using an IP and the certs
+	// don't allow for that.
+	l := &captureErrorLogger{errCh: make(chan string, 1)}
+	s2.SetLogger(l, false, false)
+
+	s3, _ := RunServerWithConfig(c2And3Conf)
+	defer s3.Shutdown()
+
+	var gotIt bool
+	for i := 0; !gotIt && i < 5; i++ {
+		select {
+		case err := <-l.errCh:
+			if strings.Contains(err, "handshake") {
+				gotIt = true
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Timed-out waiting for handshake error")
+		}
+	}
+	if !gotIt {
+		t.Fatal("Did not get the handshake error")
+	}
+
+	// Stop the servers and update the configuration to have the advertise
+	// address set to "localhost".
+	s2.Shutdown()
+	s3.Shutdown()
+	checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		if n := s1.NumRoutes(); n != 0 {
+			return fmt.Errorf("Server s1 has still %v routes", n)
+		}
+		return nil
+	})
+
+	c2And3Conf = createConfFile(t, fmt.Appendf(nil, tmpl, o1.Cluster.Port, "advertise: localhost"))
+	s2, _ = RunServerWithConfig(c2And3Conf)
+	defer s2.Shutdown()
+
+	checkClusterFormed(t, s1, s2)
+
+	s2.mu.Lock()
+	s2.routeTLSName = _EMPTY_
+	s2.mu.Unlock()
+
+	s3, _ = RunServerWithConfig(c2And3Conf)
+	defer s3.Shutdown()
+
+	checkClusterFormed(t, s1, s2, s3)
+}
+
 func TestRoutePoolAndPerAccountErrors(t *testing.T) {
 	conf := createConfFile(t, []byte(`
 		port: -1
@@ -1959,7 +2103,7 @@ func TestRoutePoolAndPerAccountErrors(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatalf("Did not get expected error regarding no route for account")
 		}
-		time.Sleep(DEFAULT_ROUTE_RECONNECT + 100*time.Millisecond)
+		time.Sleep(routeReconnectDelay + 100*time.Millisecond)
 	}
 }
 
@@ -2149,7 +2293,7 @@ func TestRoutePoolConnectRace(t *testing.T) {
 							t.Fatalf("Routes are constantly reconnecting: %v", e)
 						}
 					}
-				case <-time.After(DEFAULT_ROUTE_RECONNECT + 250*time.Millisecond):
+				case <-time.After(routeReconnectDelay + 500*time.Millisecond):
 					// More than reconnect and some, and no reconnect, so we are good.
 					done = true
 				}
@@ -2702,6 +2846,78 @@ func TestRoutePerAccountImplicit(t *testing.T) {
 	checkClusterFormed(t, s1, s2, s3)
 }
 
+func TestRoutePerAccountInboundStatsCountedOnce(t *testing.T) {
+	tmpl := `
+		port: -1
+		accounts {
+			A { users: [{user: "a", password: "a"}] }
+			B { users: [{user: "b", password: "b"}] }
+		}
+		cluster {
+			port: -1
+			name: "local"
+			accounts: ["A"]
+			%s
+		}
+	`
+	conf1 := createConfFile(t, []byte(fmt.Sprintf(tmpl, _EMPTY_)))
+	s1, o1 := RunServerWithConfig(conf1)
+	defer s1.Shutdown()
+
+	conf2 := createConfFile(t, []byte(fmt.Sprintf(tmpl,
+		fmt.Sprintf("routes: [\"nats://127.0.0.1:%d\"]", o1.Cluster.Port))))
+	s2, _ := RunServerWithConfig(conf2)
+	defer s2.Shutdown()
+
+	checkClusterFormed(t, s1, s2)
+
+	const n = 10
+	payload := []byte("hello")
+
+	// Account A has a dedicated route, account B uses the pool. Messages that
+	// reach s2 only over a route must count once in the account's received
+	// totals either way, matching the route breakdown and the sender's count.
+	for _, acc := range []string{"A", "B"} {
+		t.Run(acc, func(t *testing.T) {
+			user := strings.ToLower(acc)
+			s2nc := natsConnect(t, s2.ClientURL(), nats.UserInfo(user, user))
+			defer s2nc.Close()
+			sub := natsSubSync(t, s2nc, "foo")
+			natsFlush(t, s2nc)
+
+			s1nc := natsConnect(t, s1.ClientURL(), nats.UserInfo(user, user))
+			defer s1nc.Close()
+			checkSubInterest(t, s1, acc, "foo", time.Second)
+
+			for i := 0; i < n; i++ {
+				natsPub(t, s1nc, "foo", payload)
+			}
+			for i := 0; i < n; i++ {
+				natsNexMsg(t, sub, time.Second)
+			}
+
+			checkFor(t, time.Second, 15*time.Millisecond, func() error {
+				stz, err := s2.AccountStatz(&AccountStatzOptions{Accounts: []string{acc}})
+				if err != nil {
+					return err
+				}
+				if len(stz.Accounts) != 1 {
+					return fmt.Errorf("expected 1 account, got %d", len(stz.Accounts))
+				}
+				recv := stz.Accounts[0].Received
+				if recv.Routes == nil || recv.Routes.Msgs != n {
+					return fmt.Errorf("expected %d route msgs received, got %+v", n, recv.Routes)
+				}
+				if recv.Msgs != n || recv.Bytes != int64(n*len(payload)) {
+					return fmt.Errorf("expected %d msgs and %d bytes received, got %d and %d",
+						n, n*len(payload), recv.Msgs, recv.Bytes)
+				}
+				return nil
+			})
+		})
+	}
+}
+
 func TestRoutePerAccountDefaultForSysAccount(t *testing.T) {
 	tmpl := `
 		port: -1
@@ -2838,7 +3054,7 @@ func TestRoutePerAccountConnectRace(t *testing.T) {
 					t.Fatalf("Routes are constantly reconnecting: %v", e)
 				}
 			}
-		case <-time.After(DEFAULT_ROUTE_RECONNECT + 250*time.Millisecond):
+		case <-time.After(routeReconnectDelay + 500*time.Millisecond):
 			// More than reconnect and some, and no reconnect, so we are good.
 			done = true
 		}
@@ -3743,6 +3959,11 @@ func TestRoutePoolWithOlderServerConnectAndReconnect(t *testing.T) {
 }
 
 func TestRoutePoolBadAuthNoRunawayCreateRoute(t *testing.T) {
+	// This test checks the reconnect rate, so use the default reconnect delay.
+	oRouteReconnectDelay := routeReconnectDelay
+	routeReconnectDelay = DEFAULT_ROUTE_RECONNECT
+	defer func() { routeReconnectDelay = oRouteReconnectDelay }()
+
 	conf1 := createConfFile(t, []byte(`
 		server_name: "S1"
 		listen: "127.0.0.1:-1"
@@ -4021,7 +4242,7 @@ func TestRouteCompression(t *testing.T) {
 			var payloads [][]byte
 			count := 26
 			for i := 0; i < count; i++ {
-				n := rand.Intn(2048) + 1
+				n := rand.IntN(2048) + 1
 				p := make([]byte, n)
 				for j := 0; j < n; j++ {
 					p[j] = byte(i) + 'A'
@@ -5096,7 +5317,7 @@ func TestRouteMsgWithManyHeadersDoesNotCorruptJSON(t *testing.T) {
 	total := 3000
 	bodies := make([][]byte, total)
 	for i := 0; i < total; i++ {
-		filler := strings.Repeat("x", 32+rand.Intn(12*1024))
+		filler := strings.Repeat("x", 32+rand.IntN(12*1024))
 		body := fmt.Sprintf(
 			`{"branch":"main","idx":%d,`+
 				`"some_tag":"tag-aaaaaaaaaaaaaaaaaaaaaaaa",`+
@@ -5661,5 +5882,204 @@ func BenchmarkProcessLeafMsgArgs_Queues(b *testing.B) {
 		if err := c.processLeafMsgArgs(arg); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func TestRouteReconnectAfterSolicitedUpgradeAdoptsConfiguredURL(t *testing.T) {
+	// Default pool size + pinned $SYS route, like a production setup, with a
+	// hostname-based route URL like production configs use.
+	ob := DefaultOptions()
+	sb := RunServer(ob)
+	defer sb.Shutdown()
+
+	oa := DefaultOptions()
+	oa.Routes = RoutesFromStr(fmt.Sprintf("nats://localhost:%d", sb.ClusterAddr().Port))
+	sa := RunServer(oa)
+	defer sa.Shutdown()
+	checkClusterFormed(t, sa, sb)
+
+	// Find A's pooled route connection for the slot that carries the global
+	// account's interest.
+	gSlot := computeRoutePoolIdx(sa.getOpts().Cluster.PoolSize, globalAccountName)
+	var route *client
+	sa.mu.RLock()
+	sa.forEachRouteIdx(gSlot, func(r *client) bool {
+		route = r
+		return false
+	})
+	sa.mu.RUnlock()
+	require_NotNil(t, route)
+
+	// Put the connection in the pre-upgrade gossip-dial state, then run the
+	// actual upgrade with the configured URL, as duplicate-route resolution
+	// does. The upgrade must adopt the configured URL so the later reconnect
+	// passes routeStillValid.
+	gossipURL, err := url.Parse(fmt.Sprintf("nats-route://127.0.0.1:%d/", sb.ClusterAddr().Port))
+	require_NoError(t, err)
+	route.mu.Lock()
+	route.route.didSolicit = true
+	route.route.routeType = Implicit
+	route.route.url = gossipURL
+	route.mu.Unlock()
+
+	configured := oa.Routes[0]
+	upgradeRouteToSolicited(route, configured, Explicit)
+
+	route.mu.Lock()
+	upURL := route.route.url
+	route.mu.Unlock()
+	require_Equal(t, upURL, configured)
+
+	// Drop the connection the way a fault would (slow consumer). The sibling
+	// pool slots and the pinned $SYS route stay up, so the remote is never
+	// treated as new and only this reconnect can re-establish the slot.
+	route.closeConnection(SlowConsumerWriteDeadline)
+	checkClusterFormed(t, sa, sb)
+
+	// Interest must flow across the re-established slot again.
+	nca := natsConnect(t, sa.ClientURL())
+	defer nca.Close()
+	ncb := natsConnect(t, sb.ClientURL())
+	defer ncb.Close()
+	natsSub(t, ncb, "reconnect.echo", func(m *nats.Msg) { m.Respond(m.Data) })
+	natsFlush(t, ncb)
+	checkSubInterest(t, sa, globalAccountName, "reconnect.echo", 2*time.Second)
+	_, err = nca.Request("reconnect.echo", []byte("ping"), time.Second)
+	require_NoError(t, err)
+}
+
+func TestRouteReconnectAfterDuplicateRouteAdoptsConfiguredURL(t *testing.T) {
+	// handleDuplicateRoute is the other path that promotes a route to Explicit,
+	// used for duplicate per-account (pinned) routes and for any duplicate
+	// route in non-pool mode. It must adopt the configured URL too, otherwise
+	// routeStillValid rejects the gossiped one and the reconnect is abandoned.
+	// The global account is pinned here so interest can use ordinary pub/sub.
+	ob := DefaultOptions()
+	ob.Cluster.PinnedAccounts = []string{globalAccountName}
+	sb := RunServer(ob)
+	defer sb.Shutdown()
+
+	oa := DefaultOptions()
+	oa.Cluster.PinnedAccounts = []string{globalAccountName}
+	oa.Routes = RoutesFromStr(fmt.Sprintf("nats://localhost:%d", sb.ClusterAddr().Port))
+	sa := RunServer(oa)
+	defer sa.Shutdown()
+	checkClusterFormed(t, sa, sb)
+
+	// Grab A's pinned route for the global account.
+	var pinned *client
+	sa.mu.RLock()
+	for _, r := range sa.accRoutes[globalAccountName] {
+		pinned = r
+	}
+	sa.mu.RUnlock()
+	require_NotNil(t, pinned)
+
+	// Put the connection in the pre-upgrade gossip-dial state, then resolve it
+	// as a duplicate against the configured explicit route, as addRoute does
+	// for a pinned account. The upgrade must adopt the configured URL so the
+	// later reconnect passes routeStillValid.
+	gossipURL, err := url.Parse(fmt.Sprintf("nats-route://127.0.0.1:%d/", sb.ClusterAddr().Port))
+	require_NoError(t, err)
+	pinned.mu.Lock()
+	pinned.route.didSolicit = true
+	pinned.route.routeType = Implicit
+	pinned.route.url = gossipURL
+	pinned.mu.Unlock()
+
+	configured := oa.Routes[0]
+	dup := &client{}
+	dup.route = &route{
+		url:        configured,
+		didSolicit: true,
+		routeType:  Explicit,
+		accName:    []byte(globalAccountName),
+	}
+	handleDuplicateRoute(pinned, dup, true)
+
+	pinned.mu.Lock()
+	upURL := pinned.route.url
+	pinned.mu.Unlock()
+	require_Equal(t, upURL, configured)
+
+	// Drop the connection the way a fault would (slow consumer). The pinned
+	// route must come back, otherwise this account's mesh stays severed while
+	// every pooled route looks healthy.
+	pinned.closeConnection(SlowConsumerWriteDeadline)
+	checkClusterFormed(t, sa, sb)
+
+	checkFor(t, 5*time.Second, 50*time.Millisecond, func() error {
+		sa.mu.RLock()
+		defer sa.mu.RUnlock()
+		for _, r := range sa.accRoutes[globalAccountName] {
+			if r != nil && r != pinned {
+				return nil
+			}
+		}
+		return fmt.Errorf("pinned route for %q did not reconnect", globalAccountName)
+	})
+
+	// Interest must flow across the re-established pinned route again.
+	nca := natsConnect(t, sa.ClientURL())
+	defer nca.Close()
+	ncb := natsConnect(t, sb.ClientURL())
+	defer ncb.Close()
+	natsSub(t, ncb, "pinned.echo", func(m *nats.Msg) { m.Respond(m.Data) })
+	natsFlush(t, ncb)
+	checkSubInterest(t, sa, globalAccountName, "pinned.echo", 2*time.Second)
+	_, err = nca.Request("pinned.echo", []byte("ping"), time.Second)
+	require_NoError(t, err)
+}
+
+func TestRouteLogsRemoteURL(t *testing.T) {
+	o1 := DefaultOptions()
+	o1.Cluster.Username = remoteURLLogUser
+	o1.Cluster.Password = remoteURLLogPassword
+	s1 := RunServer(o1)
+	defer s1.Shutdown()
+
+	routeHost := fmt.Sprintf("localhost:%d", o1.Cluster.Port)
+	o2 := DefaultOptions()
+	o2.Cluster.resolver = &localhostResolver{}
+	o2.Routes = []*url.URL{{Scheme: "nats", Host: routeHost, User: url.UserPassword(remoteURLLogUser, remoteURLLogPassword)}}
+	s2, l := runServerWithNoticeLogger(t, o2)
+	defer s2.Shutdown()
+
+	checkClusterFormed(t, s1, s2)
+	checkNoticeContains(t, l, "Route connection created ("+routeHost+")")
+
+	s1.Shutdown()
+	checkNoticeContains(t, l, "Router connection closed: "+ClientClosed.String()+" - Remote: "+s1.Name()+", Host: "+routeHost)
+	s2.Shutdown()
+	checkNoticeNotContains(t, l, remoteURLLogUser, remoteURLLogPassword)
+}
+
+func TestRouteCompressionReconnectAfterWriteError(t *testing.T) {
+	for _, mode := range []string{
+		// Fails in the readLoop's compression INFO flush.
+		CompressionS2Fast,
+		// Fails in the writeLoop, as a baseline.
+		CompressionOff,
+	} {
+		t.Run(mode, func(t *testing.T) {
+			o1 := DefaultOptions()
+			o1.Cluster.PoolSize = -1
+			o1.Cluster.Compression.Mode = mode
+			s1 := RunServer(o1)
+			defer s1.Shutdown()
+
+			o2 := DefaultOptions()
+			o2.Cluster.PoolSize = -1
+			o2.Cluster.Compression.Mode = mode
+			// Start the writeLoop late so the readLoop flushes first.
+			o2.Cluster.writeLoopDelay = 250 * time.Millisecond
+			o2.Cluster.dialer = failFirstWriteDialer()
+			o2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", o1.Cluster.Port))
+			s2 := RunServer(o2)
+			defer s2.Shutdown()
+
+			// The first connection failed, so this requires a reconnect.
+			checkClusterFormed(t, s1, s2)
+		})
 	}
 }

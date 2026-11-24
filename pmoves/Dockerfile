@@ -4,7 +4,9 @@
 #
 # Build context = this directory (pmoves/). Pin the base by digest in the
 # consuming compose for reproducibility (fleet convention).
-FROM nats:2.11-alpine
+# 2.15.3 = newest maintained line (2026-11-11); multi-arch index digest, so the
+# same pin serves amd64 hubs and arm64 Jetson leaves.
+FROM nats:2.15.3-alpine@sha256:558394a23dd3c36f2d3a64b51865fd09908010e80a542cea5e75c2af543ed62a
 
 # Baked hub config. resolver_preload.conf (public account JWTs) and the
 # per-account .creds are MOUNTED at runtime (funnel-rendered / Docker secrets),

@@ -1,4 +1,4 @@
-// Copyright 2012-2025 The NATS Authors
+// Copyright 2012-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,6 +16,7 @@ package main
 //go:generate go run server/errors_gen.go
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -36,6 +37,8 @@ Server Options:
     -ms,--https_port <port>          Use port for https monitoring
     -c, --config <file>              Configuration file
     -t                               Test configuration and exit
+        --test_reload <file>         With -t, test whether this configuration file can be reloaded
+                                     (exit code 3 if a restart is required)
     -sl,--signal <signal>[=<pid>]    Send signal to nats-server process (ldm, stop, quit, term, reopen, reload)
                                      <pid> can be either a PID (e.g. 1) or the path to a PID file (e.g. /var/run/nats-server.pid)
         --client_advertise <string>  Client URL to advertise to other servers
@@ -44,6 +47,7 @@ Server Options:
 Logging Options:
     -l, --log <file>                 File to redirect log output
     -T, --logtime                    Timestamp log entries (default: true)
+        --logtime_utc                Timestamps in UTC instead of local timezone (default: false)
     -s, --syslog                     Log to syslog or windows event log
     -r, --remote_syslog <addr>       Syslog server addr (udp://localhost:514)
     -D, --debug                      Enable debugging output
@@ -107,9 +111,17 @@ func main() {
 		fs.Usage,
 		server.PrintTLSHelpAndDie)
 	if err != nil {
+		// The configuration is valid, but changing to it requires a restart.
+		if errors.Is(err, server.ErrConfigReloadNotSupported) {
+			fmt.Fprintf(os.Stderr, "%s: %s\n", exe, err)
+			os.Exit(3)
+		}
 		server.PrintAndDie(fmt.Sprintf("%s: %s", exe, err))
 	} else if opts.CheckConfig {
 		fmt.Fprintf(os.Stderr, "%s: configuration file %s is valid (%s)\n", exe, opts.ConfigFile, opts.ConfigDigest())
+		if opts.CheckReloadTo != "" {
+			fmt.Fprintf(os.Stderr, "%s: configuration file %s can be reloaded\n", exe, opts.CheckReloadTo)
+		}
 		os.Exit(0)
 	}
 

@@ -1,4 +1,4 @@
-// Copyright 2018-2025 The NATS Authors
+// Copyright 2018-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,11 +17,12 @@ package server
 
 import (
 	"bytes"
+	"compress/flate"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"os"
 	"path/filepath"
@@ -439,7 +440,7 @@ func TestNoRaceBinaryStreamSnapshotEncodingBasic(t *testing.T) {
 	mset, err := s.GlobalAccount().lookupStream("TEST")
 	require_NoError(t, err)
 
-	snap, err := mset.store.EncodedStreamState(0)
+	snap, err := mset.store.EncodedStreamState(0, false)
 	require_NoError(t, err)
 
 	// Now decode the snapshot.
@@ -476,7 +477,7 @@ func TestNoRaceFilestoreBinaryStreamSnapshotEncodingLargeGaps(t *testing.T) {
 	// The tombstones from above will only be cleaned up when syncing blocks.
 	fs.syncBlocks()
 
-	snap, err := fs.EncodedStreamState(0)
+	snap, err := fs.EncodedStreamState(0, false)
 	require_NoError(t, err)
 	require_LessThan(t, len(snap), 512)
 
@@ -547,16 +548,23 @@ func TestNoRaceJetStreamClusterStreamSnapshotCatchup(t *testing.T) {
 	c.waitOnServerCurrent(sr)
 	c.waitOnStreamCurrent(sr, globalAccountName, "TEST")
 
-	mset, err := sr.GlobalAccount().lookupStream("TEST")
-	require_NoError(t, err)
+	// Current can be reported before the leader's snapshot catchup has started, so wait for the state.
+	checkCaughtUp := func(msgs, lseq uint64) {
+		t.Helper()
+		mset, err := sr.GlobalAccount().lookupStream("TEST")
+		require_NoError(t, err)
+		checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+			var state StreamState
+			mset.store.FastState(&state)
+			if state.Msgs != msgs || state.FirstSeq != 1 || state.LastSeq != lseq || state.NumDeleted != int(lseq-msgs) {
+				return fmt.Errorf("not caught up: %+v", state)
+			}
+			return nil
+		})
+	}
 
 	// Make sure it's caught up
-	var state StreamState
-	mset.store.FastState(&state)
-	require_Equal(t, state.Msgs, 2)
-	require_Equal(t, state.FirstSeq, 1)
-	require_Equal(t, state.LastSeq, 51_000)
-	require_Equal(t, state.NumDeleted, 51_000-2)
+	checkCaughtUp(2, 51_000)
 
 	sr.Shutdown()
 
@@ -569,15 +577,7 @@ func TestNoRaceJetStreamClusterStreamSnapshotCatchup(t *testing.T) {
 	c.checkClusterFormed()
 	c.waitOnServerCurrent(sr)
 	c.waitOnStreamCurrent(sr, globalAccountName, "TEST")
-
-	mset, err = sr.GlobalAccount().lookupStream("TEST")
-	require_NoError(t, err)
-	mset.store.FastState(&state)
-
-	require_Equal(t, state.Msgs, 3)
-	require_Equal(t, state.FirstSeq, 1)
-	require_Equal(t, state.LastSeq, 51_001)
-	require_Equal(t, state.NumDeleted, 51_001-3)
+	checkCaughtUp(3, 51_001)
 }
 
 func TestNoRaceStoreStreamEncoderDecoder(t *testing.T) {
@@ -606,7 +606,7 @@ func TestNoRaceStoreStreamEncoderDecoder(t *testing.T) {
 
 	test := func(t *testing.T, gs StreamStore) {
 		t.Parallel()
-		prand := rand.New(rand.NewSource(seed))
+		prand := rand.New(rand.NewPCG(uint64(seed), 0))
 		tick := time.NewTicker(time.Second)
 		defer tick.Stop()
 		done := time.NewTimer(10 * time.Second)
@@ -620,7 +620,7 @@ func TestNoRaceStoreStreamEncoderDecoder(t *testing.T) {
 					continue
 				}
 				start := time.Now()
-				snap, err := gs.EncodedStreamState(0)
+				snap, err := gs.EncodedStreamState(0, false)
 				require_NoError(t, err)
 				elapsed := time.Since(start)
 				// Should take <1ms without race but if CI/CD is slow we will give it a bit of room.
@@ -636,7 +636,7 @@ func TestNoRaceStoreStreamEncoderDecoder(t *testing.T) {
 			case <-done.C:
 				running = false
 			default:
-				key := strconv.Itoa(prand.Intn(256_000))
+				key := strconv.Itoa(prand.IntN(256_000))
 				gs.StoreMsg(key, nil, msg, 0)
 			}
 		}
@@ -694,12 +694,12 @@ func TestNoRaceJetStreamClusterKVWithServerKill(t *testing.T) {
 
 			case <-tk.C:
 				// Pick a random key within the range.
-				k := fmt.Sprintf("key.%d", rand.Intn(numKeys))
+				k := fmt.Sprintf("key.%d", rand.IntN(numKeys))
 				// Attempt to get a key.
 				e, err := kv.Get(k)
 				// If found, attempt to update or delete.
 				if err == nil {
-					if rand.Intn(10) < 3 {
+					if rand.IntN(10) < 3 {
 						kv.Delete(k, nats.LastRevision(e.Revision()))
 					} else {
 						kv.Update(k, nil, e.Revision())
@@ -731,7 +731,7 @@ func TestNoRaceJetStreamClusterKVWithServerKill(t *testing.T) {
 		c.waitOnStreamLeader(globalAccountName, "KV_TEST")
 
 		// Wait for a bit and then start the server again.
-		time.Sleep(time.Duration(rand.Intn(1250)) * time.Millisecond)
+		time.Sleep(time.Duration(rand.IntN(1250)) * time.Millisecond)
 		s = c.restartServer(s)
 		c.waitOnServerCurrent(s)
 		c.waitOnLeader()
@@ -839,6 +839,63 @@ func TestNoRaceWSNoCorruptionWithFrameSizeLimit(t *testing.T) {
 	testWSNoCorruptionWithFrameSizeLimit(t, 50000)
 }
 
+func TestNoRaceWSCompressionGrownBufferRecycling(t *testing.T) {
+	opts := testWSOptions()
+	opts.MaxPending = MAX_PENDING_SIZE
+	s := &Server{opts: opts}
+	c := &client{srv: s, ws: &websocket{compress: true}}
+	c.initClient()
+
+	// Incompressible payload filling the medium pool bucket exactly, so
+	// that the flate output (payload + block overhead) is guaranteed to
+	// outgrow the pooled buffer seeding the compression bytes.Buffer.
+	payload := make([]byte, nbPoolSizeMedium)
+	rnd := uint32(1)
+	for i := range payload {
+		rnd = rnd*1664525 + 1013904223
+		payload[i] = byte(rnd >> 24)
+	}
+
+	// Confirm the payload no longer fits the bucket once compressed.
+	var cb bytes.Buffer
+	cw, _ := flate.NewWriter(&cb, flate.BestSpeed)
+	cw.Write(payload)
+	cw.Flush()
+	if cb.Len() <= nbPoolSizeMedium {
+		t.Fatalf("Expected compressed payload to exceed %v bytes, got %v", nbPoolSizeMedium, cb.Len())
+	}
+
+	nbSlice := make(net.Buffers, 1)
+	collapse := func() {
+		c.mu.Lock()
+		data := nbPoolGet(len(payload))
+		data = append(data, payload...)
+		nbSlice[0] = data
+		c.out.nb = nbSlice
+		c.out.pb = int64(len(payload))
+		c.ws.fs = 0
+
+		// calls c.wsCollapsePtoNB internally.
+		bufs, _ := c.collapsePtoNB()
+		for _, buf := range bufs {
+			nbPoolPut(buf)
+		}
+		c.out.nb = nil
+		c.mu.Unlock()
+	}
+	// Populate the pool and initialize the compressor.
+	for i := 0; i < 10; i++ {
+		collapse()
+	}
+
+	// Growing the bytes.Buffer beyond the seeded pool buffer costs a few
+	// allocations per iteration but the seed itself must be returned to the pool.
+	allocs := testing.AllocsPerRun(500, collapse)
+	if allocs > 3 {
+		t.Fatalf("Too many allocs per iteration (%.1f); the compression seed buffer is likely not recycled", allocs)
+	}
+}
+
 func TestNoRaceJetStreamAPIDispatchQueuePending(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
@@ -858,7 +915,7 @@ func TestNoRaceJetStreamAPIDispatchQueuePending(t *testing.T) {
 	// space and wildcards for now does the trick.
 	toks := []string{"foo", "bar", "baz"} // for second token.
 	for i := 1; i <= 500_000; i++ {
-		subj := fmt.Sprintf("foo.%s.%d", toks[rand.Intn(len(toks))], i)
+		subj := fmt.Sprintf("foo.%s.%d", toks[rand.IntN(len(toks))], i)
 		_, err := js.PublishAsync(subj, nil, nats.StallWait(time.Second))
 		require_NoError(t, err)
 	}
@@ -1043,8 +1100,8 @@ func TestNoRaceJetStreamClusterStreamCatchupLargeInteriorDeletes(t *testing.T) {
 
 	// Create 50k messages randomly from 1-100
 	for i := 0; i < 50_000; i++ {
-		subj := fmt.Sprintf("foo.%d", rand.Intn(100)+1)
-		js.PublishAsync(subj, msg)
+		subj := fmt.Sprintf("foo.%d", rand.IntN(100)+1)
+		publishAsync(t, js, subj, msg)
 	}
 	select {
 	case <-js.PublishAsyncComplete():
@@ -1053,7 +1110,7 @@ func TestNoRaceJetStreamClusterStreamCatchupLargeInteriorDeletes(t *testing.T) {
 	}
 	// Now create a large gap.
 	for i := 0; i < 100_000; i++ {
-		js.PublishAsync("foo.2", msg)
+		publishAsync(t, js, "foo.2", msg)
 	}
 	select {
 	case <-js.PublishAsyncComplete():
@@ -1062,8 +1119,8 @@ func TestNoRaceJetStreamClusterStreamCatchupLargeInteriorDeletes(t *testing.T) {
 	}
 	// Do 50k random again at end.
 	for i := 0; i < 50_000; i++ {
-		subj := fmt.Sprintf("foo.%d", rand.Intn(100)+1)
-		js.PublishAsync(subj, msg)
+		subj := fmt.Sprintf("foo.%d", rand.IntN(100)+1)
+		publishAsync(t, js, subj, msg)
 	}
 	select {
 	case <-js.PublishAsyncComplete():
@@ -1133,12 +1190,17 @@ func TestNoRaceJetStreamClusterBadRestartsWithHealthzPolling(t *testing.T) {
 
 	var wg sync.WaitGroup
 
+	// Cap inflight consumer create requests to prevent timeout on slower CI machines.
+	inflight := make(chan struct{}, 50)
+
 	for i := 0; i < numConsumers; i++ {
 		cname := fmt.Sprintf("CONS-%d", i+1)
 		consumers = append(consumers, cname)
 		wg.Add(1)
+		inflight <- struct{}{}
 		go func() {
 			defer wg.Done()
+			defer func() { <-inflight }()
 			_, err := js.PullSubscribe("foo.>", cname, nats.BindStream("TEST"))
 			require_NoError(t, err)
 		}()
@@ -1161,12 +1223,17 @@ func TestNoRaceJetStreamClusterBadRestartsWithHealthzPolling(t *testing.T) {
 	numStreams := 200
 	streams := make([]string, 0, numStreams)
 
+	// Cap number of inflight stream request creates.
+	sinflight := make(chan struct{}, 25)
+
 	for i := 0; i < numStreams; i++ {
 		sname := fmt.Sprintf("TEST-%d", i+1)
 		streams = append(streams, sname)
 		wg.Add(1)
+		sinflight <- struct{}{}
 		go func() {
 			defer wg.Done()
+			defer func() { <-sinflight }()
 			_, err := js.AddStream(&nats.StreamConfig{Name: sname, Replicas: 3})
 			require_NoError(t, err)
 		}()
@@ -1252,7 +1319,7 @@ func TestNoRaceJetStreamKVReplaceWithServerRestart(t *testing.T) {
 		const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 		b := make([]byte, n)
 		for i := range b {
-			b[i] = letterBytes[rand.Intn(len(letterBytes))]
+			b[i] = letterBytes[rand.IntN(len(letterBytes))]
 		}
 		return b
 	}
@@ -1515,7 +1582,7 @@ func TestNoRaceJetStreamWQSkippedMsgsOnScaleUp(t *testing.T) {
 		for {
 			select {
 			case <-st.C:
-				subj := publishSubjects[rand.Intn(len(publishSubjects))]
+				subj := publishSubjects[rand.IntN(len(publishSubjects))]
 				_, err = js.Publish(subj, msg)
 				require_NoError(t, err)
 			case <-pdone:
@@ -1550,11 +1617,11 @@ func TestNoRaceJetStreamWQSkippedMsgsOnScaleUp(t *testing.T) {
 				}
 				require_Equal(t, len(msgs), 1)
 				m := msgs[0]
-				if rand.Intn(10) == 1 {
+				if rand.IntN(10) == 1 {
 					m.Nak()
 				} else {
 					// Wait up to 20ms to ack.
-					time.Sleep(time.Duration(rand.Intn(20)) * time.Millisecond)
+					time.Sleep(time.Duration(rand.IntN(20)) * time.Millisecond)
 					// This could fail and that is ok, system should recover due to low ack wait.
 					m.Ack()
 				}
@@ -2092,7 +2159,7 @@ func TestNoRaceFileStoreWriteFullStateUniqueSubjects(t *testing.T) {
 			partB := nuid.Next()
 			for k := 0; k < 500; k++ {
 				partC := nuid.Next()
-				partD := labels[rand.Intn(len(labels)-1)]
+				partD := labels[rand.IntN(len(labels)-1)]
 				subject := fmt.Sprintf("records.%s.%s.%s.%s.%s", partA, partB, partC, partD, nuid.Next())
 				start := time.Now()
 				fs.StoreMsg(subject, nil, msg, 0)
@@ -2453,10 +2520,10 @@ func TestNoRaceJetStreamClusterMirrorSkipSequencingBug(t *testing.T) {
 	// via the max msgs per limit.
 	for i := 0; i < 500_000; i++ {
 		subj := fmt.Sprintf("foo.%d", i)
-		js.PublishAsync(subj, nil)
+		publishAsync(t, js, subj, nil)
 		// Create sequence holes every 100k.
 		if i%100_000 == 0 {
-			js.PublishAsync(subj, nil)
+			publishAsync(t, js, subj, nil)
 		}
 	}
 	select {
@@ -2678,11 +2745,11 @@ func TestNoRaceJetStreamClusterCheckInterestStatePerformanceWQ(t *testing.T) {
 	// Load up a bunch of messages for three different subjects.
 	msg := bytes.Repeat([]byte("Z"), 4096)
 	for i := 0; i < 100_000; i++ {
-		js.PublishAsync("foo.foo", msg)
+		publishAsync(t, js, "foo.foo", msg)
 	}
 	for i := 0; i < 5_000; i++ {
-		js.PublishAsync("foo.bar", msg)
-		js.PublishAsync("foo.baz", msg)
+		publishAsync(t, js, "foo.bar", msg)
+		publishAsync(t, js, "foo.baz", msg)
 	}
 	select {
 	case <-js.PublishAsyncComplete():
@@ -2800,11 +2867,11 @@ func TestNoRaceJetStreamClusterCheckInterestStatePerformanceInterest(t *testing.
 	// Load up a bunch of messages for three different subjects.
 	msg := bytes.Repeat([]byte("Z"), 4096)
 	for i := 0; i < 90_000; i++ {
-		js.PublishAsync("foo.foo", msg)
+		publishAsync(t, js, "foo.foo", msg)
 	}
 	for i := 0; i < 5_000; i++ {
-		js.PublishAsync("foo.bar", msg)
-		js.PublishAsync("foo.baz", msg)
+		publishAsync(t, js, "foo.bar", msg)
+		publishAsync(t, js, "foo.baz", msg)
 	}
 	select {
 	case <-js.PublishAsyncComplete():
@@ -3856,4 +3923,146 @@ func TestNoRaceFileStoreWeakCacheGCRecyclesBuf(t *testing.T) {
 		// ...and GC of the disused cache must not recycle it a second time.
 		expectNotRecycled(t, arr)
 	})
+}
+
+func TestNoRaceNoDroppedMsgOnSubCloseForRouteOrLeafDelivery(t *testing.T) {
+	// The bug really impacted only delivery to leafnodes because sub.close()
+	// was invoked only when processing LEAF unsub protocols, however, setting
+	// up the test with route delivery too since the code to delivery to routes
+	// and leafnodes is common, so this will make sure that the bug does not
+	// appear for routes in the future.
+	tmpl := `
+		listen: "127.0.0.1:-1"
+		server_name: "%s"
+		cluster {
+			name: "local"
+			listen: "127.0.0.1:-1"
+			%s
+		}
+		leafnodes {
+			listen: "127.0.0.1:-1"
+		}
+	`
+	conf1 := createConfFile(t, fmt.Appendf(nil, tmpl, "A", _EMPTY_))
+	s1, o1 := RunServerWithConfig(conf1)
+	defer s1.Shutdown()
+
+	conf2 := createConfFile(t, fmt.Appendf(nil, tmpl, "B",
+		fmt.Sprintf("routes: [\"nats://127.0.0.1:%d\"]", o1.Cluster.Port)))
+	s2, _ := RunServerWithConfig(conf2)
+	defer s2.Shutdown()
+
+	checkClusterFormed(t, s1, s2)
+
+	tmpl = `
+		listen: "127.0.0.1:-1"
+		server_name: "LEAF"
+		leafnodes {
+			listen: "127.0.0.1:-1"
+			remotes: [{url: "nats://127.0.0.1:%d"}]
+		}
+	`
+	conf3 := createConfFile(t, fmt.Appendf(nil, tmpl, o1.LeafNode.Port))
+	s3, _ := RunServerWithConfig(conf3)
+	defer s3.Shutdown()
+
+	checkLeafNodeConnected(t, s1)
+	checkLeafNodeConnected(t, s3)
+
+	var (
+		qs2Count atomic.Int32
+		qs3Count atomic.Int32
+		last     atomic.Int32
+	)
+
+	keepTab := func(m *nats.Msg, count *atomic.Int32) {
+		if len(m.Data) == 0 {
+			last.Add(1)
+		} else {
+			(*count).Add(1)
+		}
+	}
+
+	nc2 := natsConnect(t, s2.ClientURL())
+	defer nc2.Close()
+	qsub := natsQueueSub(t, nc2, "foo", "q2", func(m *nats.Msg) {
+		keepTab(m, &qs2Count)
+	})
+	qsub.SetPendingLimits(-1, -1)
+	natsSubSync(t, nc2, "s2.interest")
+	natsFlush(t, nc2)
+
+	nc3 := natsConnect(t, s3.ClientURL())
+	defer nc3.Close()
+	qsub = natsQueueSub(t, nc3, "foo", "q3", func(m *nats.Msg) {
+		keepTab(m, &qs3Count)
+	})
+	qsub.SetPendingLimits(-1, -1)
+	natsSubSync(t, nc3, "s3.interest")
+	natsFlush(t, nc3)
+
+	checkSubInterest(t, s1, globalAccountName, "s2.interest", time.Second)
+	checkSubInterest(t, s1, globalAccountName, "s3.interest", time.Second)
+
+	nc1 := natsConnect(t, s1.ClientURL())
+	defer nc1.Close()
+
+	wg := sync.WaitGroup{}
+	wg.Add(2)
+	closeCh := make(chan struct{})
+	createCloseQSub := func(nc *nats.Conn, qn string) {
+		defer wg.Done()
+		for {
+			select {
+			case <-closeCh:
+				nc.Flush()
+				return
+			default:
+				qsub := natsQueueSub(t, nc, "foo", qn, func(_ *nats.Msg) {})
+				qsub.Drain()
+			}
+		}
+	}
+	go createCloseQSub(nc2, "q2_2")
+	go createCloseQSub(nc3, "q3_2")
+
+	time.Sleep(50 * time.Millisecond)
+
+	const total = 10000
+	for range total {
+		nc1.Publish("foo", []byte("hello"))
+		natsFlush(t, nc1)
+	}
+
+	close(closeCh)
+	wg.Wait()
+
+	acc := s1.globalAccount()
+	checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		r := acc.sl.Match("foo")
+		if len(r.qsubs) > 2 {
+			return errors.New("remote queues still registered")
+		}
+		return nil
+	})
+
+	natsPub(t, nc1, "foo", nil)
+	checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		if n := int(last.Load()); n != 2 {
+			return fmt.Errorf("Only %v out of 2 subscriptions have received the last message", n)
+		}
+		return nil
+	})
+
+	check := func(count *atomic.Int32) {
+		t.Helper()
+		checkFor(t, time.Second, 15*time.Millisecond, func() error {
+			if n := int((*count).Load()); n != total {
+				return fmt.Errorf("Expecting %v messages, got %v", total, n)
+			}
+			return nil
+		})
+	}
+	check(&qs2Count)
+	check(&qs3Count)
 }

@@ -1,4 +1,4 @@
-// Copyright 2020-2025 The NATS Authors
+// Copyright 2020-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -761,17 +761,28 @@ func TestJetStreamJWTClusteredDeleteTierWithStreamAndMove(t *testing.T) {
 		return err
 	})
 
-	var respAfter JSApiAccountInfoResponse
-	m, err = nc.Request("$JS.API.INFO", nil, time.Second)
-	require_NoError(t, err)
-	err = json.Unmarshal(m.Data, &respAfter)
-	require_NoError(t, err)
-
-	require_True(t, respAfter.JetStreamAccountStats.Tiers["R3"].Streams == 1)
-	require_True(t, respAfter.JetStreamAccountStats.Tiers["R3"].Store > 0)
-
-	_, ok := respAfter.JetStreamAccountStats.Tiers["R1"]
-	require_True(t, !ok)
+	// Account usage is propagated to the meta leader asynchronously.
+	checkFor(t, 5*time.Second, 250*time.Millisecond, func() error {
+		var respAfter JSApiAccountInfoResponse
+		m, err := nc.Request("$JS.API.INFO", nil, time.Second)
+		if err != nil {
+			return err
+		}
+		if err = json.Unmarshal(m.Data, &respAfter); err != nil {
+			return err
+		}
+		if respAfter.Error != nil {
+			return respAfter.Error
+		}
+		tiers := respAfter.JetStreamAccountStats.Tiers
+		if r3 := tiers["R3"]; r3.Streams != 1 || r3.Store == 0 {
+			return fmt.Errorf("expected R3 tier with 1 stream and stored data, got %+v", r3)
+		}
+		if r1, ok := tiers["R1"]; ok {
+			return fmt.Errorf("expected no R1 tier, got %+v", r1)
+		}
+		return nil
+	})
 }
 
 func TestJetStreamJWTSysAccUpdateMixedMode(t *testing.T) {
@@ -1716,6 +1727,10 @@ func TestJetStreamJWTHAStorageLimitsOnScaleAndUpdate(t *testing.T) {
 	require_Equal(t, r1.ReservedStore, 2*1024*1024) // TEST7
 	require_Equal(t, r3.ReservedMemory, 22*1024)    // TEST9
 	require_Equal(t, r3.ReservedStore, 5*1024*1024) // TEST1-TEST6
+
+	// Tiered reservations don't scale by replicas, so the top-level sums the tiers.
+	require_Equal(t, stats.ReservedMemory, r1.ReservedMemory+r3.ReservedMemory)
+	require_Equal(t, stats.ReservedStore, r1.ReservedStore+r3.ReservedStore)
 }
 
 func TestJetStreamJWTClusteredTiersR3StreamWithR1ConsumersAndAccounting(t *testing.T) {
@@ -1793,6 +1808,122 @@ func TestJetStreamJWTClusteredTiersR3StreamWithR1ConsumersAndAccounting(t *testi
 	require_Equal(t, r3.Consumers, 0)
 }
 
+func TestJetStreamJWTClusteredTieredR3StreamWithMixedReplicaConsumers(t *testing.T) {
+	sysKp, syspub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
+	newUser(t, sysKp)
+
+	accKp, aExpPub := createKey(t)
+	accClaim := jwt.NewAccountClaims(aExpPub)
+	accClaim.Name = "acc"
+	// The R1 tier allows no stream and 2 consumers.
+	accClaim.Limits.JetStreamTieredLimits["R1"] = jwt.JetStreamLimits{DiskStorage: 1100, Consumer: 2, Streams: 0}
+	// The R3 tier allows 1 stream and 3 consumers.
+	accClaim.Limits.JetStreamTieredLimits["R3"] = jwt.JetStreamLimits{DiskStorage: 1100, Consumer: 3, Streams: 1}
+	accJwt := encodeClaim(t, accClaim, aExpPub)
+	accCreds := newUser(t, accKp)
+
+	tmlp := `
+		listen: 127.0.0.1:-1
+		server_name: %s
+		jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+		leaf {
+			listen: 127.0.0.1:-1
+		}
+		cluster {
+			name: %s
+			listen: 127.0.0.1:%d
+			routes = [%s]
+		}
+	` + fmt.Sprintf(`
+		operator: %s
+		system_account: %s
+		resolver = MEMORY
+		resolver_preload = {
+			%s : %s
+			%s : %s
+		}
+	`, ojwt, syspub, syspub, sysJwt, aExpPub, accJwt)
+
+	c := createJetStreamClusterWithTemplate(t, tmlp, "cluster", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer(), nats.UserCredentials(accCreds))
+	defer nc.Close()
+
+	// Prevent 'nats: JetStream not enabled for account' when creating the first stream.
+	c.waitOnAccount(aExpPub)
+
+	// Add the one R3 stream the tier allows.
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo.*"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	// Add 2 R3 consumers
+	for i := range 2 {
+		_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+			Name:      fmt.Sprintf("R3-%d", i+1),
+			AckPolicy: nats.AckExplicitPolicy,
+			Replicas:  3,
+		})
+		require_NoError(t, err)
+	}
+
+	// Add 1 R1 consumer
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Name:      "R1-1",
+		AckPolicy: nats.AckExplicitPolicy,
+		Replicas:  1,
+	})
+	require_NoError(t, err)
+
+	// Add the 3rd R3 consumer (allowed by limits)
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Name:      "R3-3",
+		AckPolicy: nats.AckExplicitPolicy,
+		Replicas:  3,
+	})
+	require_NoError(t, err)
+
+	// Add the 2nd R1 consumer (allowed by limits)
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Name:      "R1-2",
+		AckPolicy: nats.AckExplicitPolicy,
+		Replicas:  1,
+	})
+	require_NoError(t, err)
+
+	// Both tiers are full now, so one more consumer of each tier must fail.
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Name:      "R3-4",
+		AckPolicy: nats.AckExplicitPolicy,
+		Replicas:  3,
+	})
+	require_Error(t, err, NewJSMaximumConsumersLimitError())
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Name:      "R1-3",
+		AckPolicy: nats.AckExplicitPolicy,
+		Replicas:  1,
+	})
+	require_Error(t, err, NewJSMaximumConsumersLimitError())
+
+	// Make sure each tier accounts for its own assets.
+	info, err := js.AccountInfo()
+	require_NoError(t, err)
+
+	r1 := info.Tiers["R1"]
+	r3 := info.Tiers["R3"]
+
+	require_Equal(t, r1.Streams, 0)
+	require_Equal(t, r1.Consumers, 2)
+	require_Equal(t, r3.Streams, 1)
+	require_Equal(t, r3.Consumers, 3)
+}
+
 func TestJetStreamJWTClusterAccountNRG(t *testing.T) {
 	_, syspub := createKey(t)
 	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
@@ -1836,12 +1967,16 @@ func TestJetStreamJWTClusterAccountNRG(t *testing.T) {
 	c := createJetStreamClusterWithTemplate(t, tmlp, "cluster", 3)
 	defer c.shutdown()
 
+	// Prevent 'nats: JetStream not enabled for account' when creating the first stream.
+	c.waitOnAccount(aExpPub)
+
 	nc, _ := jsClientConnect(t, c.randomServer(), nats.UserCredentials(accCreds))
-	jsStreamCreate(t, nc, &StreamConfig{
+	_, err := jsStreamCreate(t, nc, &StreamConfig{
 		Name:     "TEST",
 		Replicas: 3,
 		Storage:  FileStorage,
 	})
+	require_NoError(t, err)
 
 	// We'll try flipping the state a few times and then do some sanity
 	// checks to check that it took effect.
@@ -2204,8 +2339,16 @@ func TestJetStreamAccountResolverNoFetchIfNotMember(t *testing.T) {
 	s := c.leader()
 	js := s.getJetStream()
 	ci := &ClientInfo{Cluster: "R3S", Account: aPub}
-	cfg := &StreamConfig{Name: "TEST", Subjects: []string{"foo"}}
-	sa := &streamAssignment{Client: ci, Config: cfg}
+	cfg := &StreamConfig{Name: "TEST", Subjects: []string{"foo"}, Replicas: 2}
+	// Place the stream on the other servers, so this server is not a member.
+	var peers []string
+	for _, srv := range c.servers {
+		if srv != s {
+			peers = append(peers, srv.NodeName())
+		}
+	}
+	rg := &raftGroup{Name: "TEST", Storage: cfg.Storage, Peers: peers}
+	sa := &streamAssignment{Client: ci, Config: cfg, Group: rg}
 	start := time.Now()
 	// Simulate some meta operations where this server is not a member.
 	// The server should not fetch the account from the resolver.

@@ -1,4 +1,4 @@
-// Copyright 2022-2025 The NATS Authors
+// Copyright 2022-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,6 +19,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -30,6 +31,9 @@ const (
 	AuthCalloutSubject    = "$SYS.REQ.USER.AUTH"
 	AuthRequestSubject    = "nats-authorization-request"
 	AuthRequestXKeyHeader = "Nats-Server-Xkey"
+
+	// Auth callout replies are sent to the server's response inboxes.
+	authCalloutReplySubjects = "$SYS._INBOX.>"
 )
 
 func titleCase(m string) string {
@@ -42,7 +46,7 @@ func titleCase(m string) string {
 
 // Process a callout on this client's behalf.
 func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequired, trustedProxy bool, ujwt string) (authorized bool, errStr string) {
-	isOperatorMode := len(opts.TrustedKeys) > 0
+	isOperatorMode := s.trustedKeys != nil
 
 	// this is the account the user connected in, or the one running the callout
 	var acc *Account
@@ -78,7 +82,11 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 	// If set grab server's xkey keypair and public key.
 	if pubAccXKey != _EMPTY_ {
 		// These are only set on creation, so lock not needed.
-		xkp, xkey = s.xkp, s.info.XKey
+		if xkp, xkey = s.xkp, s.info.XKey; xkp == nil {
+			errStr = fmt.Sprintf("auth callout not available for account %q", acc.Name)
+			s.Warnf(errStr)
+			return false, errStr
+		}
 	}
 
 	// Create a keypair for the user. We will expect this public user to be in the signed response.
@@ -86,8 +94,19 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 	ukp, _ := nkeys.CreateUser()
 	pub, _ := ukp.PublicKey()
 
+	// Shutdown() stops eventing before it closes the listeners, so a client can
+	// get here after the system account is gone.
+	s.mu.RLock()
+	if s.sys == nil {
+		s.mu.RUnlock()
+		errStr = "Authorization callout not available, eventing shut down"
+		s.Debugf(errStr)
+		return false, errStr
+	}
 	reply := s.newRespInbox()
+	s.mu.RUnlock()
 	respCh := make(chan string, 1)
+	var replied atomic.Bool
 
 	decodeResponse := func(rc *client, rmsg []byte, acc *Account) (*jwt.UserClaims, error) {
 		account := acc.Name
@@ -132,22 +151,28 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 			return nil, errors.New("auth callout violation: auth callout response is not for server")
 		}
 
+		// if response is encrypted none of this is needed
+		if !encrypted {
+			if isOperatorMode {
+				// The asserted issuer account, if any, must be the callout account.
+				if cr.IssuerAccount != _EMPTY_ && cr.IssuerAccount != account {
+					return nil, fmt.Errorf("auth callout response issuer account %q is not the callout account", cr.IssuerAccount)
+				}
+				// The actual signer must be the callout account or one of its signing keys.
+				if cr.Issuer != account {
+					if _, ok := acc.hasIssuer(cr.Issuer); !ok {
+						return nil, errors.New("auth callout signing key is unknown")
+					}
+				}
+			} else if opts.AuthCallout == nil || cr.Issuer != opts.AuthCallout.Issuer {
+				// The signer must be the configured issuer.
+				return nil, errors.New("auth callout signing key is unknown")
+			}
+		}
+
 		// check if had an error message from the auth account
 		if cr.Error != _EMPTY_ {
 			return nil, fmt.Errorf("auth callout service returned an error: %v", cr.Error)
-		}
-
-		// if response is encrypted none of this is needed
-		if isOperatorMode && !encrypted {
-			pkStr := cr.Issuer
-			if cr.IssuerAccount != _EMPTY_ {
-				pkStr = cr.IssuerAccount
-			}
-			if pkStr != account {
-				if _, ok := acc.hasIssuer(pkStr); !ok {
-					return nil, errors.New("auth callout signing key is unknown")
-				}
-			}
 		}
 
 		return jwt.DecodeUserClaims(cr.Jwt)
@@ -189,6 +214,10 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 	}
 
 	getExpirationAndAllowedConnections := func(arc *jwt.UserClaims, account string) (time.Duration, map[string]struct{}, error) {
+		if !validateSrc(arc, c.host) {
+			c.Errorf("Bad src Ip %s", c.host)
+			return 0, nil, fmt.Errorf("authorized user on account %q not allowed from source %q", account, c.host)
+		}
 		allowNow, expiration := validateTimes(arc)
 		if !allowNow {
 			c.Errorf("Outside connect times")
@@ -201,6 +230,9 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 			if len(allowedConnTypes) == 0 {
 				return 0, nil, fmt.Errorf("authorized user on account %q using invalid connection type", account)
 			}
+		}
+		if !c.connectionTypeAllowed(allowedConnTypes) {
+			return 0, nil, fmt.Errorf("authorized user on account %q not allowed to use connection type", account)
 		}
 		return expiration, allowedConnTypes, nil
 	}
@@ -246,6 +278,10 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 	}
 
 	processReply := func(_ *subscription, rc *client, racc *Account, subject, reply string, rmsg []byte) {
+		// Only handle the first reply, later ones would block on respCh or override the result.
+		if !replied.CompareAndSwap(false, true) {
+			return
+		}
 		arc, err := decodeResponse(rc, rmsg, racc)
 		if err != nil {
 			c.authViolation()
@@ -277,6 +313,14 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 			return
 		}
 
+		targetAcc, err := assignAccountAndPermissions(arc, racc.Name)
+		if err != nil {
+			c.authViolation()
+			respCh <- titleCase(err.Error())
+			return
+		}
+
+		// Checked after the scoped template, which may restrict connection types.
 		expiration, allowedConnTypes, err := getExpirationAndAllowedConnections(arc, racc.Name)
 		if err != nil {
 			c.authViolation()
@@ -284,8 +328,10 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 			return
 		}
 
-		targetAcc, err := assignAccountAndPermissions(arc, racc.Name)
-		if err != nil {
+		// The scoped template may have introduced a proxy requirement.
+		if arc.ProxyRequired && !trustedProxy {
+			err = ErrAuthProxyRequired
+			c.setAuthError(err)
 			c.authViolation()
 			respCh <- titleCase(err.Error())
 			return
@@ -307,16 +353,20 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 			return
 		}
 
+		c.mu.Lock()
+		c.flags.set(authCallout)
 		// See if the response wants to override the username.
 		if arc.Name != _EMPTY_ {
-			c.mu.Lock()
 			c.opts.Username = arc.Name
 			// Clear any others.
 			c.opts.Nkey = _EMPTY_
 			c.pubKey = _EMPTY_
 			c.opts.Token = _EMPTY_
-			c.mu.Unlock()
 		}
+		// Carry the user's tags and name onto the client, as with regular JWT auth.
+		c.tags = arc.Tags
+		c.nameTag = arc.Name
+		c.mu.Unlock()
 
 		// Check if we need to set an auth timer if the user jwt expires.
 		c.setExpiration(arc.Claims(), expiration)
@@ -449,6 +499,18 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 	}
 
 	return authorized, errStr
+}
+
+// Deny the auth callout subjects for a client in an auth callout account.
+// Lock should be held.
+func (c *client) denyAuthCalloutSubjects(authUser bool) {
+	// Auth users receive the requests and reply to them, but must not send requests.
+	if authUser {
+		c.mergeDenyPermissions(pub, []string{AuthCalloutSubject})
+		return
+	}
+	// Callout users must not see or answer other users' requests and replies.
+	c.mergeDenyPermissions(both, []string{AuthCalloutSubject, authCalloutReplySubjects})
 }
 
 // Fill in client information for the request.

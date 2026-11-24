@@ -1,4 +1,4 @@
-// Copyright 2018-2025 The NATS Authors
+// Copyright 2018-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,7 +15,6 @@ package server
 
 import (
 	"bufio"
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -26,6 +25,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2067,8 +2067,8 @@ func TestJWTAccountURLResolverPermanentFetchFailure(t *testing.T) {
 	o := LoadConfig(confA)
 	sA := RunServer(o)
 	defer sA.Shutdown()
-	l := &captureDebugLogger{dbgCh: make(chan string, 100)} // has enough space to not block
-	sA.SetLogger(l, true, false)
+	l := &captureErrorLogger{errCh: make(chan string, 100)} // has enough space to not block
+	sA.SetLogger(l, false, false)
 	// Create clients
 	ncA := natsConnect(t, sA.ClientURL(), createUserCreds(t, nil, impkp))
 	defer ncA.Close()
@@ -2085,14 +2085,14 @@ func TestJWTAccountURLResolverPermanentFetchFailure(t *testing.T) {
 	defer tmr.Stop()
 	for {
 		select {
-		case line := <-l.dbgCh:
-			if strings.HasPrefix(line, "Error adding stream import to account") {
+		case line := <-l.errCh:
+			if strings.HasPrefix(line, "Error adding stream import") {
 				importErrCnt++
 			}
 		case <-tmr.C:
-			// connecting and updating, each cause 3 traces (2 + 1 on iteration) + 1 xtra fetch
+			// connecting and updating, each cause 3 errors (2 + 1 on iteration) + 1 extra fetch
 			if importErrCnt != 7 {
-				t.Fatalf("Expected 7 debug traces, got %d", importErrCnt)
+				t.Fatalf("Expected 7 import errors, got %d", importErrCnt)
 			}
 			return
 		}
@@ -3766,9 +3766,7 @@ func TestJWTAccountNATSResolverCrossClusterFetch(t *testing.T) {
 	dirBA := t.TempDir()
 	dirBB := t.TempDir()
 	// simulate a restart of the server by storing files in them
-	// Server AA & AB will completely sync
-	// Server BA & BB will completely sync
-	// Be aware that no syncing will occur between cluster
+	// The long sync interval keeps sync from copying them, so other servers must fetch them.
 	writeJWT(t, dirAA, apub, ajwt1)
 	writeJWT(t, dirBA, bpub, bjwt1)
 	// Create seed server A (using no_advertise to prevent fail over)
@@ -3780,7 +3778,7 @@ func TestJWTAccountNATSResolverCrossClusterFetch(t *testing.T) {
 		resolver: {
 			type: full
 			dir: '%s'
-			interval: "200ms"
+			interval: "1h"
 		}
 		gateway: {
 			name: "clust-A"
@@ -3803,7 +3801,7 @@ func TestJWTAccountNATSResolverCrossClusterFetch(t *testing.T) {
 		resolver: {
 			type: full
 			dir: '%s'
-			interval: "200ms"
+			interval: "1h"
 		}
 		gateway: {
 			name: "clust-A"
@@ -3829,7 +3827,7 @@ func TestJWTAccountNATSResolverCrossClusterFetch(t *testing.T) {
 		resolver: {
 			type: full
 			dir: '%s'
-			interval: "200ms"
+			interval: "1h"
 		}
 		gateway: {
 			name: "clust-B"
@@ -3855,7 +3853,7 @@ func TestJWTAccountNATSResolverCrossClusterFetch(t *testing.T) {
 		resolver: {
 			type: full
 			dir: '%s'
-			interval: "200ms"
+			interval: "1h"
 		}
 		cluster {
 			name: clust-B
@@ -3917,6 +3915,99 @@ func TestJWTAccountNATSResolverCrossClusterFetch(t *testing.T) {
 	require_JWTEqual(t, dirAB, bpub, bjwt2)           // assure that jwt got updated accordingly
 	require_JWTEqual(t, dirBA, apub, ajwt2)           // assure that jwt got updated accordingly
 	require_JWTEqual(t, dirBB, apub, ajwt2)           // assure that jwt got updated accordingly
+}
+
+func TestJWTAccountNATSResolverSyncAllRemoteClusters(t *testing.T) {
+	_, syspub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
+	_, accPub := createKey(t)
+	accClaim := jwt.NewAccountClaims(accPub)
+	accJwt1 := encodeClaim(t, accClaim, accPub)
+	// JWTs are issued with second precision.
+	time.Sleep(1100 * time.Millisecond)
+	accClaim.Tags.Add("updated")
+	accJwt2 := encodeClaim(t, accClaim, accPub)
+
+	dirA, dirB, dirC := t.TempDir(), t.TempDir(), t.TempDir()
+	for _, dir := range []string{dirA, dirB, dirC} {
+		writeJWT(t, dir, syspub, sysJwt)
+		writeJWT(t, dir, accPub, accJwt1)
+	}
+	conf := func(name, dir, gateways string) string {
+		return createConfFile(t, []byte(fmt.Sprintf(`
+			listen: 127.0.0.1:-1
+			server_name: %s
+			operator: %s
+			system_account: %s
+			resolver: {
+				type: full
+				dir: '%s'
+				allow_delete: true
+				interval: "200ms"
+			}
+			gateway {
+				name: %s
+				listen: 127.0.0.1:-1
+				%s
+			}
+		`, name, ojwt, syspub, dir, name, gateways)))
+	}
+	sA, _ := RunServerWithConfig(conf("A", dirA, _EMPTY_))
+	defer sA.Shutdown()
+	gateways := fmt.Sprintf(`gateways: [{name: "A", url: "nats://127.0.0.1:%d"}]`, sA.GatewayAddr().Port)
+	sB, _ := RunServerWithConfig(conf("B", dirB, gateways))
+	defer sB.Shutdown()
+	sC, _ := RunServerWithConfig(conf("C", dirC, gateways))
+	defer sC.Shutdown()
+	for _, s := range []*Server{sA, sB, sC} {
+		waitForOutboundGateways(t, s, 2, 5*time.Second)
+	}
+
+	// Make A and B the nearest to each other, after the first RTTs are measured.
+	for _, s := range []*Server{sA, sB} {
+		var gwcs []*client
+		s.getOutboundGatewayConnections(&gwcs)
+		checkFor(t, 5*time.Second, 50*time.Millisecond, func() error {
+			for _, gwc := range gwcs {
+				gwc.mu.Lock()
+				rtt := gwc.rtt
+				gwc.mu.Unlock()
+				if rtt == 0 {
+					return errors.New("RTT not measured yet")
+				}
+			}
+			return nil
+		})
+		gwcC := s.getOutboundGatewayConnection("C")
+		gwcC.mu.Lock()
+		gwcC.rtt = 10 * time.Second
+		gwcC.mu.Unlock()
+		s.gateway.orderOutboundConnections()
+	}
+
+	// Only C gets the newer JWT. A and B must still ask C, not just each other.
+	require_NoError(t, sC.AccountResolver().Store(accPub, accJwt2))
+	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+		for _, dir := range []string{dirA, dirB} {
+			if content, err := os.ReadFile(filepath.Join(dir, accPub+fileExtension)); err != nil {
+				return err
+			} else if string(content) != accJwt2 {
+				return errors.New("account JWT not updated yet")
+			}
+		}
+		return nil
+	})
+
+	// Only C gets the delete. A and B must apply it from C's tombstone.
+	require_NoError(t, sC.AccountResolver().(*DirAccResolver).DirJWTStore.delete(accPub, time.Now().Unix(), nil))
+	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+		for _, dir := range []string{dirA, dirB} {
+			if _, err := os.Stat(filepath.Join(dir, accPub+fileExtension)); err == nil {
+				return errors.New("account JWT not deleted yet")
+			}
+		}
+		return nil
+	})
 }
 
 func newTimeRange(start time.Time, dur time.Duration) jwt.TimeRange {
@@ -4672,6 +4763,53 @@ func TestJWTLimitsTemplate(t *testing.T) {
 	})
 }
 
+func TestJWTScopedSigningKeyTemplateProxyRequired(t *testing.T) {
+	kp, _ := nkeys.CreateAccount()
+	aPub, _ := kp.PublicKey()
+	claim := jwt.NewAccountClaims(aPub)
+	aSignScopedKp, aSignScopedPub := createKey(t)
+	signer := jwt.NewUserScope()
+	signer.Key = aSignScopedPub
+	signer.Template.ProxyRequired = true
+	claim.SigningKeys.AddScopedSigner(signer)
+	aJwt, err := claim.Encode(oKp)
+	require_NoError(t, err)
+	conf := createConfFile(t, fmt.Appendf(nil, `
+		listen: 127.0.0.1:-1
+		operator: %s
+		resolver: MEM
+		resolver_preload: {
+			%s: %s
+		}
+    `, ojwt, aPub, aJwt))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	l := &captureProxyRequiredLogger{ch: make(chan string, 1)}
+	s.SetLogger(l, true, false)
+
+	// The user JWT itself doesn't require a proxy, only the scoped template does.
+	ukp, _ := nkeys.CreateUser()
+	seed, _ := ukp.Seed()
+	upub, _ := ukp.PublicKey()
+	uclaim := newJWTTestUserClaims()
+	uclaim.Subject = upub
+	uclaim.SetScoped(true)
+	uclaim.IssuerAccount = aPub
+	require_False(t, uclaim.ProxyRequired)
+	ujwt, err := uclaim.Encode(aSignScopedKp)
+	require_NoError(t, err)
+	creds := genCredsFile(t, ujwt, seed)
+
+	_, err = nats.Connect(s.ClientURL(), nats.UserCredentials(creds))
+	require_True(t, errors.Is(err, nats.ErrAuthorization))
+	select {
+	case <-l.ch:
+	case <-time.After(time.Second):
+		t.Fatal("Expected proxy required error")
+	}
+}
+
 func TestJWTNoOperatorMode(t *testing.T) {
 	for _, login := range []bool{true, false} {
 		t.Run("", func(t *testing.T) {
@@ -4823,8 +4961,14 @@ func TestJWTActivationRevocation(t *testing.T) {
 			Type:     jwt.Stream,
 			TokenReq: true,
 		})
+		// Revoke an account that doesn't import, which must not affect the importer.
+		_, otherPub := createKey(t)
+		aExpClaim.Exports[0].RevokeAt(otherPub, time.Now())
 		aExp1Jwt := encodeClaim(t, aExpClaim, aExpPub)
 		aExpCreds := newUser(t, aExpKp)
+
+		aExpClaim.Tags.Add("unrelated")
+		aExp2Jwt := encodeClaim(t, aExpClaim, aExpPub)
 
 		aImpKp, aImpPub := createKey(t)
 
@@ -4841,10 +4985,10 @@ func TestJWTActivationRevocation(t *testing.T) {
 		}
 
 		aExpClaim.Exports[0].RevokeAt(revPubKey, time.Now())
-		aExp2Jwt := encodeClaim(t, aExpClaim, aExpPub)
+		aExp3Jwt := encodeClaim(t, aExpClaim, aExpPub)
 
 		aExpClaim.Exports[0].ClearRevocation(revPubKey)
-		aExp3Jwt := encodeClaim(t, aExpClaim, aExpPub)
+		aExp4Jwt := encodeClaim(t, aExpClaim, aExpPub)
 
 		aImpClaim := jwt.NewAccountClaims(aImpPub)
 		aImpClaim.Name = "Import"
@@ -4874,7 +5018,7 @@ func TestJWTActivationRevocation(t *testing.T) {
 			defer removeDir(t, dirSrv) // clean jwt directory
 
 			updateJwt(t, srv.ClientURL(), sysCreds, sysJwt, 1)   // update system account jwt
-			updateJwt(t, srv.ClientURL(), sysCreds, aExp2Jwt, 1) // set account jwt without revocation
+			updateJwt(t, srv.ClientURL(), sysCreds, aExp3Jwt, 1) // set account jwt with revocation
 			updateJwt(t, srv.ClientURL(), sysCreds, aImpJwt, 1)
 
 			ncExp1 := natsConnect(t, srv.ClientURL(), nats.UserCredentials(aExpCreds))
@@ -4898,7 +5042,7 @@ func TestJWTActivationRevocation(t *testing.T) {
 			defer removeDir(t, dirSrv) // clean jwt directory
 
 			updateJwt(t, srv.ClientURL(), sysCreds, sysJwt, 1)   // update system account jwt
-			updateJwt(t, srv.ClientURL(), sysCreds, aExp1Jwt, 1) // set account jwt without revocation
+			updateJwt(t, srv.ClientURL(), sysCreds, aExp1Jwt, 1) // set account jwt with unrelated revocation
 			updateJwt(t, srv.ClientURL(), sysCreds, aImpJwt, 1)
 
 			ncExp1 := natsConnect(t, srv.ClientURL(), nats.UserCredentials(aExpCreds))
@@ -4915,19 +5059,37 @@ func TestJWTActivationRevocation(t *testing.T) {
 			require_NoError(t, err)
 			require_Equal(t, string(m1.Data), "1")
 
-			updateJwt(t, srv.ClientURL(), sysCreds, aExp2Jwt, 1) // set account jwt with revocation
+			// The import adds a shadow subscription to the exporting account.
+			aExp, err := srv.LookupAccount(aExpPub)
+			require_NoError(t, err)
+			r := aExp.sl.Match("foo")
+			require_Len(t, len(r.psubs), 1)
+			shadow := r.psubs[0]
+
+			updateJwt(t, srv.ClientURL(), sysCreds, aExp2Jwt, 1) // set account jwt with unchanged revocations
 
 			require_NoError(t, ncExp1.Publish("foo", []byte("2")))
+			m2, err := sub.NextMsg(time.Second)
+			require_NoError(t, err)
+			require_Equal(t, string(m2.Data), "2")
+			// Re-checking the import would have replaced the shadow subscription.
+			r = aExp.sl.Match("foo")
+			require_Len(t, len(r.psubs), 1)
+			require_Equal(t, r.psubs[0], shadow)
+
+			updateJwt(t, srv.ClientURL(), sysCreds, aExp3Jwt, 1) // set account jwt with revocation
+
+			require_NoError(t, ncExp1.Publish("foo", []byte("3")))
 			_, err = sub.NextMsg(time.Second)
 			require_Error(t, err)
 			require_Equal(t, err.Error(), "nats: timeout")
 
-			updateJwt(t, srv.ClientURL(), sysCreds, aExp3Jwt, 1) // set account with revocation cleared
+			updateJwt(t, srv.ClientURL(), sysCreds, aExp4Jwt, 1) // set account with revocation cleared
 
-			require_NoError(t, ncExp1.Publish("foo", []byte("3")))
-			m2, err := sub.NextMsg(time.Second)
+			require_NoError(t, ncExp1.Publish("foo", []byte("4")))
+			m3, err := sub.NextMsg(time.Second)
 			require_NoError(t, err)
-			require_Equal(t, string(m2.Data), "3")
+			require_Equal(t, string(m3.Data), "4")
 		})
 	}
 	t.Run("specific-key", func(t *testing.T) {
@@ -6562,6 +6724,105 @@ func TestJWTMappings(t *testing.T) {
 	test("foo2", "bar2", true)
 }
 
+func TestClaimValidateRejectsBadMappings(t *testing.T) {
+	_, aPub := createKey(t)
+
+	t.Run("duplicate destination", func(t *testing.T) {
+		claim := jwt.NewAccountClaims(aPub)
+		claim.Mappings = map[jwt.Subject][]jwt.WeightedMapping{
+			"foo": {
+				{Subject: "dup", Weight: 50},
+				{Subject: "dup", Weight: 50},
+			},
+		}
+		err := claimValidate(claim)
+		require_Error(t, err)
+		require_True(t, strings.Contains(err.Error(), "duplicate entry"))
+	})
+
+	t.Run("invalid transform token", func(t *testing.T) {
+		claim := jwt.NewAccountClaims(aPub)
+		claim.Mappings = map[jwt.Subject][]jwt.WeightedMapping{
+			"foo.*": {{Subject: "bar.$2"}},
+		}
+		err := claimValidate(claim)
+		require_Error(t, err)
+	})
+
+	// Empty dest short-circuits ValidateMapping/NewSubjectTransform; src must
+	// still be rejected to match AddWeightedMappings' IsValidSubject(src).
+	t.Run("invalid src with empty dest", func(t *testing.T) {
+		claim := jwt.NewAccountClaims(aPub)
+		claim.Mappings = map[jwt.Subject][]jwt.WeightedMapping{
+			"foo..bar": {{Subject: ""}},
+		}
+		err := claimValidate(claim)
+		require_Error(t, err)
+		require_True(t, strings.Contains(err.Error(), "foo..bar"))
+	})
+
+	t.Run("valid mapping still accepted", func(t *testing.T) {
+		claim := jwt.NewAccountClaims(aPub)
+		claim.AddMapping("foo", jwt.WeightedMapping{Subject: "bar"})
+		require_NoError(t, claimValidate(claim))
+	})
+}
+
+func TestJWTMappingsRejectInvalidAndPreserveExisting(t *testing.T) {
+	sysKp, syspub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
+	sysCreds := newUser(t, sysKp)
+
+	aKp, aPub := createKey(t)
+	aClaim := jwt.NewAccountClaims(aPub)
+	aClaim.AddMapping("foo", jwt.WeightedMapping{Subject: "bar1"})
+	aJwtGood := encodeClaim(t, aClaim, aPub)
+
+	// Duplicate destination: jwt.Validate allows this, AddWeightedMappings does not.
+	aClaim.Mappings = map[jwt.Subject][]jwt.WeightedMapping{
+		"foo": {
+			{Subject: "dup", Weight: 50},
+			{Subject: "dup", Weight: 50},
+		},
+	}
+	aJwtDup := encodeClaim(t, aClaim, aPub)
+
+	// Invalid transform token $2 with only one wildcard capture.
+	aClaim.Mappings = map[jwt.Subject][]jwt.WeightedMapping{
+		"foo.*": {{Subject: "bar.$2"}},
+	}
+	aJwtBadTransform := encodeClaim(t, aClaim, aPub)
+
+	dirSrv := t.TempDir()
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		operator: %s
+		system_account: %s
+		resolver: {
+			type: full
+			dir: '%s'
+		}
+    `, ojwt, syspub, dirSrv)))
+	srv, _ := RunServerWithConfig(conf)
+	defer srv.Shutdown()
+	updateJwt(t, srv.ClientURL(), sysCreds, sysJwt, 1)
+
+	require_Len(t, 1, updateJwt(t, srv.ClientURL(), sysCreds, aJwtGood, 1))
+
+	// Bad pushes must fail validation (passCnt == 0) and leave foo->bar1 intact.
+	require_Len(t, 0, updateJwt(t, srv.ClientURL(), sysCreds, aJwtDup, 1))
+	require_Len(t, 0, updateJwt(t, srv.ClientURL(), sysCreds, aJwtBadTransform, 1))
+
+	nc := natsConnect(t, srv.ClientURL(), createUserCreds(t, srv, aKp))
+	defer nc.Close()
+	sub, err := nc.SubscribeSync("bar1")
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+	require_NoError(t, nc.Publish("foo", nil))
+	_, err = sub.NextMsg(500 * time.Millisecond)
+	require_NoError(t, err)
+}
+
 func TestJWTOperatorPinnedAccounts(t *testing.T) {
 	kps, pubs, jwts := [4]nkeys.KeyPair{}, [4]string{}, [4]string{}
 	for i := 0; i < 4; i++ {
@@ -7176,7 +7437,7 @@ func TestJWTImportsOnServerRestartAndClientsReconnect(t *testing.T) {
 
 	// The main account will be importing from all other accounts.
 	maxAccounts := 100
-	for i := 0; i < maxAccounts; i++ {
+	for i := range maxAccounts {
 		name := fmt.Sprintf("secondary-%d", i)
 		accKP, acc, accClaim := NewJwtAccountClaim(name)
 
@@ -7234,6 +7495,7 @@ func TestJWTImportsOnServerRestartAndClientsReconnect(t *testing.T) {
 	// Have a connection ready for each one of the accounts.
 	type namedSub struct {
 		name string
+		nc   *nats.Conn
 		sub  *nats.Subscription
 	}
 	subs := make(map[string]*namedSub)
@@ -7249,22 +7511,43 @@ func TestJWTImportsOnServerRestartAndClientsReconnect(t *testing.T) {
 
 		sub, err := nc.SubscribeSync("city.>")
 		require_NoError(t, err)
-		subs[acc] = &namedSub{user.name, sub}
+		subs[acc] = &namedSub{user.name, nc, sub}
 	}
 
 	nc := natsConnect(t, s.ClientURL(), mainCreds, nats.ReconnectWait(15*time.Millisecond), nats.MaxReconnects(-1))
 	defer nc.Close()
 
+	conns := []*nats.Conn{nc}
+	for _, nsub := range subs {
+		conns = append(conns, nsub.nc)
+	}
+	// Wait for all clients to be reconnected and their subscriptions replayed.
+	waitForClients := func(t *testing.T) {
+		t.Helper()
+		for _, conn := range conns {
+			checkFor(t, 20*time.Second, 50*time.Millisecond, func() error {
+				if !conn.IsConnected() {
+					return fmt.Errorf("client %q not reconnected yet", conn.Opts.Name)
+				}
+				return nil
+			})
+			// Round-trip so the server has processed the replayed subscriptions.
+			require_NoError(t, conn.Flush())
+		}
+	}
+
+	// Tag every publish round with an increasing sequence.
+	var round atomic.Uint64
 	send := func(t *testing.T) {
 		t.Helper()
-		for i := 0; i < maxAccounts; i++ {
-			nc.Publish(fmt.Sprintf("city.%d-1.A4BDB048-69DC-4F10-916C-2B998249DC11", i), []byte(fmt.Sprintf("test:%d", i)))
+		r := round.Add(1)
+		for i := range maxAccounts {
+			nc.Publish(fmt.Sprintf("city.%d-1.A4BDB048-69DC-4F10-916C-2B998249DC11", i), []byte(strconv.FormatUint(r, 10)))
 		}
 		nc.Flush()
 	}
 
-	ctx, done := context.WithCancel(context.Background())
-	defer done()
+	ctx := t.Context()
 	go func() {
 		for range time.NewTicker(200 * time.Millisecond).C {
 			select {
@@ -7278,27 +7561,33 @@ func TestJWTImportsOnServerRestartAndClientsReconnect(t *testing.T) {
 
 	receive := func(t *testing.T) {
 		t.Helper()
-		received := 0
+		// Only messages from a later round were published after the restart.
+		start := round.Load()
+		// One deadline for all accounts, an account that misses never recovers.
+		deadline := time.Now().Add(15 * time.Second)
+		var missed []string
 		for _, nsub := range subs {
-			// Drain first any pending messages.
-			pendingMsgs, _, _ := nsub.sub.Pending()
-			for i, _ := 0, 0; i < pendingMsgs; i++ {
-				nsub.sub.NextMsg(500 * time.Millisecond)
+			var received bool
+			for !received {
+				msg, err := nsub.sub.NextMsg(time.Until(deadline))
+				if err != nil {
+					break
+				}
+				// Skip messages from a previous round.
+				if r, err := strconv.ParseUint(string(msg.Data), 10, 64); err == nil && r > start {
+					received = true
+				}
 			}
-
-			_, err = nsub.sub.NextMsg(500 * time.Millisecond)
-			if err != nil {
-				t.Logf("WRN: Failed to receive message on account %q: %v", nsub.name, err)
-			} else {
-				received++
+			if !received {
+				missed = append(missed, nsub.name)
 			}
 		}
-		if received < (maxAccounts / 2) {
-			t.Fatalf("Too many missed messages after restart. Received %d", received)
+		if len(missed) > 0 {
+			t.Fatalf("Missed messages after restart on %d of %d accounts: %v", len(missed), maxAccounts, missed)
 		}
 	}
+	waitForClients(t)
 	receive(t)
-	time.Sleep(1 * time.Second)
 
 	restart := func(t *testing.T) *Server {
 		t.Helper()
@@ -7306,29 +7595,217 @@ func TestJWTImportsOnServerRestartAndClientsReconnect(t *testing.T) {
 		s.WaitForShutdown()
 		s, _ = RunServerWithConfig(conf)
 
-		hctx, hcancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer hcancel()
-		for range time.NewTicker(2 * time.Second).C {
-			select {
-			case <-hctx.Done():
-				t.Logf("WRN: Timed out waiting for healthz from %s", s)
-			default:
+		checkFor(t, 20*time.Second, 50*time.Millisecond, func() error {
+			if status := s.healthz(nil); status.StatusCode != 200 {
+				return fmt.Errorf("healthz not ready: %d - %s", status.StatusCode, status.Error)
 			}
-
-			status := s.healthz(nil)
-			if status.StatusCode == 200 {
-				return s
-			}
-		}
-		return nil
+			return nil
+		})
+		return s
 	}
 
 	// Takes a few restarts for issue to show up.
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		s := restart(t)
 		defer s.Shutdown()
-		time.Sleep(2 * time.Second)
+		waitForClients(t)
 		receive(t)
+	}
+}
+
+func TestJWTConcurrentAccountUpdateKeepsImportsValid(t *testing.T) {
+	preload := make(map[string]string)
+	_, sysAcc, sysAccClaim := NewJwtAccountClaim("sys")
+	sysAccJWT, err := sysAccClaim.Encode(oKp)
+	require_NoError(t, err)
+	preload[sysAcc] = sysAccJWT
+
+	// All other accounts import from this account.
+	_, mainAcc, mainAccClaim := NewJwtAccountClaim("main")
+	mainAccClaim.Exports.Add(&jwt.Export{Type: jwt.Stream, Subject: "city.>"})
+
+	maxAccounts := 20
+	accounts := make([]string, 0, maxAccounts)
+	for i := range maxAccounts {
+		_, acc, accClaim := NewJwtAccountClaim(fmt.Sprintf("secondary-%d", i))
+		accClaim.Imports.Add(&jwt.Import{
+			Type:    jwt.Stream,
+			Subject: jwt.Subject(fmt.Sprintf("city.%d-1.*", i)),
+			Account: mainAcc,
+		})
+		accJWT, err := accClaim.Encode(oKp)
+		require_NoError(t, err)
+		preload[acc] = accJWT
+		accounts = append(accounts, acc)
+	}
+	mainAccJWT, err := mainAccClaim.Encode(oKp)
+	require_NoError(t, err)
+	preload[mainAcc] = mainAccJWT
+
+	resolverPreload, err := json.Marshal(preload)
+	require_NoError(t, err)
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		operator: %s
+		system_account: %s
+		resolver: MEM
+		resolver_preload: %s
+	`, ojwt, sysAcc, string(resolverPreload))))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	// Load all accounts, setting up their imports.
+	for _, acc := range accounts {
+		_, err := s.LookupAccount(acc)
+		require_NoError(t, err)
+	}
+	main, err := s.LookupAccount(mainAcc)
+	require_NoError(t, err)
+
+	invalidImports := func() []string {
+		var invalid []string
+		for _, name := range accounts {
+			a, err := s.LookupAccount(name)
+			require_NoError(t, err)
+			a.mu.RLock()
+			for _, im := range a.imports.streams {
+				if im.invalid {
+					invalid = append(invalid, a.nameTag)
+				}
+			}
+			a.mu.RUnlock()
+		}
+		return invalid
+	}
+	require_Len(t, len(invalidImports()), 0)
+
+	// Concurrent updates of the exporting account must not invalidate imports.
+	accClaims, _, err := s.verifyAccountClaims(mainAccJWT)
+	require_NoError(t, err)
+	for range 50 {
+		var wg sync.WaitGroup
+		for range 4 {
+			wg.Go(func() {
+				s.UpdateAccountClaims(main, accClaims)
+			})
+		}
+		wg.Wait()
+		if invalid := invalidImports(); len(invalid) > 0 {
+			t.Fatalf("Imports invalidated after concurrent account update: %v", invalid)
+		}
+	}
+}
+
+func TestJWTConcurrentSystemAccountUpdateKeepsJSAPIImportValid(t *testing.T) {
+	preload := make(map[string]string)
+
+	// An expired account, so the system account importing from it stays
+	// incomplete and is updated again on every lookup.
+	_, expAcc, expAccClaim := NewJwtAccountClaim("expired")
+	expAccClaim.Exports.Add(&jwt.Export{Type: jwt.Stream, Subject: "expired.>"})
+	expAccClaim.Expires = time.Now().Add(-time.Hour).Unix()
+	expAccJWT, err := expAccClaim.Encode(oKp)
+	require_NoError(t, err)
+	preload[expAcc] = expAccJWT
+
+	// System account, importing from the expired account.
+	_, sysAcc, sysAccClaim := NewJwtAccountClaim("sys")
+	sysAccClaim.Imports.Add(&jwt.Import{
+		Type:    jwt.Stream,
+		Subject: "expired.>",
+		Account: expAcc,
+	})
+	sysAccJWT, err := sysAccClaim.Encode(oKp)
+	require_NoError(t, err)
+	preload[sysAcc] = sysAccJWT
+
+	// JetStream enabled accounts, each gets a $JS.API.> import from the system account.
+	maxAccounts := 20
+	accounts := make([]string, 0, maxAccounts)
+	for i := range maxAccounts {
+		_, acc, accClaim := NewJwtAccountClaim(fmt.Sprintf("acc-%d", i))
+		accClaim.Limits.JetStreamLimits = jwt.JetStreamLimits{
+			DiskStorage: jwt.NoLimit, MemoryStorage: jwt.NoLimit,
+		}
+		accJWT, err := accClaim.Encode(oKp)
+		require_NoError(t, err)
+		preload[acc] = accJWT
+		accounts = append(accounts, acc)
+	}
+
+	resolverPreload, err := json.Marshal(preload)
+	require_NoError(t, err)
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		jetstream: {store_dir: '%s'}
+		operator: %s
+		system_account: %s
+		resolver: MEM
+		resolver_preload: %s
+	`, t.TempDir(), ojwt, sysAcc, string(resolverPreload))))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	sacc, err := s.LookupAccount(sysAcc)
+	require_NoError(t, err)
+	for _, acc := range accounts {
+		_, err := s.LookupAccount(acc)
+		require_NoError(t, err)
+	}
+	sacc.mu.RLock()
+	incomplete := sacc.incomplete
+	sacc.mu.RUnlock()
+	require_True(t, incomplete)
+
+	// Accounts whose $JS.API.> import is missing or invalid.
+	badJSAPI := func() []string {
+		var bad []string
+		for _, name := range accounts {
+			a, err := s.LookupAccount(name)
+			require_NoError(t, err)
+			a.mu.RLock()
+			var found, invalid bool
+			for _, sis := range a.imports.services {
+				for _, si := range sis {
+					if si == nil || si.acc == nil || si.acc.Name != sysAcc {
+						continue
+					}
+					if si.from == jsAllAPI || si.to == jsAllAPI {
+						found = true
+						invalid = invalid || si.invalid
+					}
+				}
+			}
+			label := a.nameTag
+			a.mu.RUnlock()
+			if !found {
+				bad = append(bad, label+"(missing)")
+			} else if invalid {
+				bad = append(bad, label+"(invalid)")
+			}
+		}
+		return bad
+	}
+	if bad := badJSAPI(); len(bad) > 0 {
+		t.Fatalf("Before any update, $JS.API.> imports already bad: %v", bad)
+	}
+
+	sysClaims, _, err := s.verifyAccountClaims(sysAccJWT)
+	require_NoError(t, err)
+
+	// Concurrent updates of the system account must not invalidate the imports.
+	for round := range 200 {
+		var wg sync.WaitGroup
+		for range 4 {
+			wg.Go(func() {
+				s.UpdateAccountClaims(sacc, sysClaims)
+			})
+		}
+		wg.Wait()
+		if bad := badJSAPI(); len(bad) > 0 {
+			t.Fatalf("round %d: $JS.API.> imports bad for %d of %d accounts: %v",
+				round, len(bad), maxAccounts, bad)
+		}
 	}
 }
 
@@ -7912,4 +8389,592 @@ func TestJWTSystemAccountJetStreamDomainMapping(t *testing.T) {
 	defer nc.Close()
 	_, err := nc.Request(domainAPI[:len(domainAPI)-1]+"INFO", nil, 2*time.Second)
 	require_NoError(t, err)
+}
+
+func TestJWTAccountImportExportAccountFunctions(t *testing.T) {
+	sysKp, syspub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
+	sysCreds := newUser(t, sysKp)
+
+	expKp, expPub := createKey(t)
+	impKp, impPub := createKey(t)
+	expHash, impHash := getHash(expPub), getHash(impPub)
+
+	expAC := jwt.NewAccountClaims(expPub)
+	expAC.Exports.Add(&jwt.Export{Subject: "$JS.FC._.{{account-hash()}}.>", Type: jwt.Service})
+	expAC.Exports.Add(&jwt.Export{Subject: "events.{{account-hash()}}.*", Type: jwt.Stream})
+	expJwt := encodeClaim(t, expAC, expPub)
+
+	impAC := jwt.NewAccountClaims(impPub)
+	impAC.Imports.Add(&jwt.Import{Account: expPub, Subject: "$JS.FC._.{{account-hash-import()}}.>", Type: jwt.Service})
+	impAC.Imports.Add(&jwt.Import{Account: expPub, Subject: "events.{{account-hash-import()}}.*", LocalSubject: "in.{{account-hash()}}.*", Type: jwt.Stream})
+	impAC.AddMapping("m.{{account-hash()}}", jwt.WeightedMapping{Subject: "mapped.{{account-hash()}}"})
+	impJwtMap := encodeClaim(t, impAC, impPub)
+	impAC.Mappings = nil
+	impJwtNoMap := encodeClaim(t, impAC, impPub)
+
+	dirSrv := t.TempDir()
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		operator: %s
+		system_account: %s
+		resolver: {
+			type: full
+			dir: '%s'
+		}
+    `, ojwt, syspub, dirSrv)))
+	srv, _ := RunServerWithConfig(conf)
+	defer srv.Shutdown()
+	require_Len(t, 1, updateJwt(t, srv.ClientURL(), sysCreds, sysJwt, 1))
+	require_Len(t, 1, updateJwt(t, srv.ClientURL(), sysCreds, expJwt, 1))
+	require_Len(t, 1, updateJwt(t, srv.ClientURL(), sysCreds, impJwtMap, 1))
+
+	ncExp := natsConnect(t, srv.ClientURL(), createUserCreds(t, srv, expKp))
+	defer ncExp.Close()
+	ncImp := natsConnect(t, srv.ClientURL(), createUserCreds(t, srv, impKp))
+	defer ncImp.Close()
+
+	// Service import: the importer reaches the exporter's hash scoped subject.
+	expSub := natsSubSync(t, ncExp, "$JS.FC._."+expHash+".>")
+	natsFlush(t, ncExp)
+	natsPub(t, ncImp, "$JS.FC._."+expHash+".ping", []byte("fc"))
+	m := natsNexMsg(t, expSub, time.Second)
+	require_Equal(t, m.Subject, "$JS.FC._."+expHash+".ping")
+
+	// Stream import with a renamed local subject.
+	impSub := natsSubSync(t, ncImp, "in."+impHash+".*")
+	natsFlush(t, ncImp)
+	natsPub(t, ncExp, "events."+expHash+".x", []byte("ev"))
+	m = natsNexMsg(t, impSub, time.Second)
+	require_Equal(t, m.Subject, "in."+impHash+".x")
+
+	// Account mapping.
+	mapSub := natsSubSync(t, ncImp, "mapped."+impHash)
+	natsFlush(t, ncImp)
+	natsPub(t, ncImp, "m."+impHash, []byte("map"))
+	natsNexMsg(t, mapSub, time.Second)
+
+	// Updating the claims with the same mapping must keep it (the stored source is the resolved one).
+	require_Len(t, 1, updateJwt(t, srv.ClientURL(), sysCreds, impJwtMap, 1))
+	natsPub(t, ncImp, "m."+impHash, []byte("map"))
+	natsNexMsg(t, mapSub, time.Second)
+
+	// Removing it from the claims removes it, the imports are still in place.
+	require_Len(t, 1, updateJwt(t, srv.ClientURL(), sysCreds, impJwtNoMap, 1))
+	natsPub(t, ncImp, "m."+impHash, []byte("map"))
+	natsFlush(t, ncImp)
+	if _, err := mapSub.NextMsg(100 * time.Millisecond); err == nil {
+		t.Fatalf("Did not expect the mapping to still be in place")
+	}
+	natsPub(t, ncImp, "$JS.FC._."+expHash+".ping", []byte("fc"))
+	m = natsNexMsg(t, expSub, time.Second)
+	require_Equal(t, m.Subject, "$JS.FC._."+expHash+".ping")
+}
+
+func TestClaimValidateAccountFunctionMappings(t *testing.T) {
+	_, aPub := createKey(t)
+
+	claim := jwt.NewAccountClaims(aPub)
+	claim.AddMapping("foo.{{account-hash()}}", jwt.WeightedMapping{Subject: "bar.{{account-hash()}}"})
+	require_NoError(t, claimValidate(claim))
+
+	claim = jwt.NewAccountClaims(aPub)
+	claim.AddMapping("foo", jwt.WeightedMapping{Subject: "{{account-hash-import()}}"})
+	require_Error(t, claimValidate(claim), ErrMappingFunctionNotAvailable)
+
+	claim = jwt.NewAccountClaims(aPub)
+	claim.AddMapping("foo.{{account-hash-leaf-remote()}}", jwt.WeightedMapping{Subject: "bar"})
+	require_Error(t, claimValidate(claim), ErrMappingFunctionNotAvailable)
+}
+
+// A real account connection limit must still be reported as such, and not
+// as an authentication error.
+func TestJWTAccountMaxConnsStillReportedAsAccountLimit(t *testing.T) {
+	s := opTrustBasicSetup()
+	defer s.Shutdown()
+	buildMemAccResolver(s)
+
+	okp, _ := nkeys.FromSeed(oSeed)
+
+	fooKP, _ := nkeys.CreateAccount()
+	fooPub, _ := fooKP.PublicKey()
+	fooAC := jwt.NewAccountClaims(fooPub)
+	fooAC.Limits.Conn = 1
+	fooJWT, err := fooAC.Encode(okp)
+	require_NoError(t, err)
+	addAccountToMemResolver(s, fooPub, fooJWT)
+
+	c1, cr1, cs1 := createClient(t, s, fooKP)
+	defer c1.close()
+	c1.parseAsync(cs1)
+	l, _ := cr1.ReadString('\n')
+	if !strings.HasPrefix(l, "PONG") {
+		t.Fatalf("Expected PONG, got %q", l)
+	}
+
+	el := &captureErrorLogger{errCh: make(chan string, 10)}
+	s.SetLogger(el, false, false)
+
+	// This one exceeds the account connection limit.
+	c2, cr2, cs2 := createClient(t, s, fooKP)
+	defer c2.close()
+	c2.parseAsync(cs2)
+	l, _ = cr2.ReadString('\n')
+	if !strings.Contains(l, ErrTooManyAccountConnections.Error()) {
+		t.Fatalf("Expected the account connection limit error, got %q", l)
+	}
+
+	// The server must report the limit, not an authentication violation.
+	var errs []string
+	for done := false; !done; {
+		select {
+		case e := <-el.errCh:
+			errs = append(errs, e)
+		case <-time.After(500 * time.Millisecond):
+			done = true
+		}
+	}
+	for _, e := range errs {
+		if strings.Contains(e, ErrAuthentication.Error()) {
+			t.Fatalf("account connection limit was reported as an authentication error: %q", e)
+		}
+	}
+}
+
+func TestJWTAccountNATSResolverSyncKeepsDeletedAccount(t *testing.T) {
+	sysKp, syspub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
+	sysCreds := newUser(t, sysKp)
+	accKp, accPub := createKey(t)
+	accJwt := encodeClaim(t, jwt.NewAccountClaims(accPub), accPub)
+	accCreds := newUser(t, accKp)
+
+	dirs := []string{t.TempDir(), t.TempDir(), t.TempDir()}
+	for _, dir := range dirs {
+		writeJWT(t, dir, syspub, sysJwt)
+		writeJWT(t, dir, accPub, accJwt)
+	}
+	conf := func(name, dir, routes string) string {
+		return createConfFile(t, []byte(fmt.Sprintf(`
+			listen: 127.0.0.1:-1
+			server_name: %s
+			operator: %s
+			system_account: %s
+			resolver: {
+				type: full
+				dir: '%s'
+				allow_delete: true
+				interval: "200ms"
+			}
+			cluster {
+				name: C
+				listen: 127.0.0.1:-1
+				%s
+			}
+		`, name, ojwt, syspub, dir, routes)))
+	}
+	s1, _ := RunServerWithConfig(conf("S1", dirs[0], _EMPTY_))
+	defer s1.Shutdown()
+	routes := fmt.Sprintf("routes: [nats-route://127.0.0.1:%d]", s1.ClusterAddr().Port)
+	s2, _ := RunServerWithConfig(conf("S2", dirs[1], routes))
+	defer s2.Shutdown()
+	conf3 := conf("S3", dirs[2], routes)
+	s3, _ := RunServerWithConfig(conf3)
+	checkClusterFormed(t, s1, s2, s3)
+
+	// S3 is down during the delete.
+	s3.Shutdown()
+	s3.WaitForShutdown()
+
+	nc := natsConnect(t, s1.ClientURL(), nats.UserCredentials(sysCreds))
+	defer nc.Close()
+	opPub, err := oKp.PublicKey()
+	require_NoError(t, err)
+	req := jwt.NewGenericClaims(opPub)
+	req.Data["accounts"] = []string{accPub}
+	reqJwt, err := req.Encode(oKp)
+	require_NoError(t, err)
+	resp, err := nc.Request(accDeleteReqSubj, []byte(reqJwt), time.Second)
+	require_NoError(t, err)
+	require_Contains(t, string(resp.Data), "deleted 1 accounts")
+
+	hasJWT := func(dir string) bool {
+		_, err := os.Stat(filepath.Join(dir, accPub+fileExtension))
+		return err == nil
+	}
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		if hasJWT(dirs[0]) || hasJWT(dirs[1]) {
+			return errors.New("account not deleted yet")
+		}
+		return nil
+	})
+
+	// S3 comes back with the deleted account still on disk.
+	s3, _ = RunServerWithConfig(conf3)
+	defer s3.Shutdown()
+	checkClusterFormed(t, s1, s2, s3)
+
+	// Sync must apply the delete on S3, and not bring the account back on S1 and S2.
+	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+		for i, dir := range dirs {
+			if hasJWT(dir) {
+				return fmt.Errorf("account JWT exists on S%d", i+1)
+			}
+		}
+		return nil
+	})
+	for _, s := range []*Server{s1, s2, s3} {
+		_, err = nats.Connect(s.ClientURL(), nats.UserCredentials(accCreds), nats.NoReconnect())
+		require_Error(t, err)
+	}
+}
+
+func TestJWTAccountLimitsMaxPayloadAsyncInfo(t *testing.T) {
+	s := opTrustBasicSetup()
+	defer s.Shutdown()
+	buildMemAccResolver(s)
+
+	okp, _ := nkeys.FromSeed(oSeed)
+
+	fooKP, _ := nkeys.CreateAccount()
+	fooPub, _ := fooKP.PublicKey()
+	fooAC := jwt.NewAccountClaims(fooPub)
+	fooAC.Limits.Payload = 100
+	fooJWT, err := fooAC.Encode(okp)
+	require_NoError(t, err)
+	addAccountToMemResolver(s, fooPub, fooJWT)
+
+	connectClient := func(nuc *jwt.UserClaims, proto int) (*testAsyncClient, *bufio.Reader) {
+		nkp, _ := nkeys.CreateUser()
+		pub, _ := nkp.PublicKey()
+		if nuc == nil {
+			nuc = jwt.NewUserClaims(pub)
+		} else {
+			nuc.Subject = pub
+		}
+		uJWT, err := nuc.Encode(fooKP)
+		require_NoError(t, err)
+
+		c, cr, l := newClientForServer(s)
+		var info nonceInfo
+		require_NoError(t, json.Unmarshal([]byte(l[5:]), &info))
+		sigraw, _ := nkp.Sign([]byte(info.Nonce))
+		sig := base64.RawURLEncoding.EncodeToString(sigraw)
+
+		cs := fmt.Sprintf("CONNECT {\"jwt\":%q,\"sig\":%q,\"protocol\":%d}\r\nPING\r\n", uJWT, sig, proto)
+		c.parseAsync(cs)
+		pong, err := cr.ReadString('\n')
+		require_NoError(t, err)
+		if !strings.HasPrefix(pong, "PONG") {
+			t.Fatalf("Expected PONG, got %q", pong)
+		}
+		// Clients with protocol >= ClientProtoInfo also receive an initial connect INFO on first PING
+		if proto >= ClientProtoInfo {
+			connectInfo, err := cr.ReadString('\n')
+			require_NoError(t, err)
+			if !strings.HasPrefix(connectInfo, "INFO ") {
+				t.Fatalf("Expected initial connect INFO, got %q", connectInfo)
+			}
+		}
+		return c, cr
+	}
+
+	// Client 1: protocol=1, inherits account limit 100
+	c1, cr1 := connectClient(nil, ClientProtoInfo)
+	defer c1.close()
+
+	// Client 2: protocol=1, user limit = 50 (lower than account limit 100)
+	uc2 := jwt.NewUserClaims("temp")
+	uc2.Limits.Payload = 50
+	c2, cr2 := connectClient(uc2, ClientProtoInfo)
+	defer c2.close()
+
+	// Client 3: protocol=0 (legacy client, does not support async INFO)
+	c3, cr3 := connectClient(nil, 0)
+	defer c3.close()
+
+	// Verify initial effective limits
+	require_True(t, atomic.LoadInt32(&c1.client.mpay) == 100)
+	require_True(t, atomic.LoadInt32(&c2.client.mpay) == 50)
+	require_True(t, atomic.LoadInt32(&c3.client.mpay) == 100)
+
+	// Step 1: Raise account payload limit from 100 to 200
+	fooAC.Limits.Payload = 200
+	fooJWT, err = fooAC.Encode(okp)
+	require_NoError(t, err)
+	addAccountToMemResolver(s, fooPub, fooJWT)
+
+	acc, err := s.LookupAccount(fooPub)
+	require_NoError(t, err)
+	s.UpdateAccountClaims(acc, fooAC)
+
+	// Check client 1: limit updated 100 -> 200 and receives async INFO
+	require_True(t, atomic.LoadInt32(&c1.client.mpay) == 200)
+	line1, err := cr1.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(line1, "INFO ") {
+		t.Fatalf("Client 1 expected async INFO, got: %q", line1)
+	}
+	var parsedInfo Info
+	require_NoError(t, json.Unmarshal([]byte(line1[5:]), &parsedInfo))
+	if parsedInfo.MaxPayload != 200 {
+		t.Fatalf("Client 1 expected MaxPayload 200 in async INFO, got %d", parsedInfo.MaxPayload)
+	}
+
+	// Check client 2: user limit 50 < 200, so effective limit unchanged at 50, should NOT receive async INFO
+	require_True(t, atomic.LoadInt32(&c2.client.mpay) == 50)
+	// Check client 3: protocol=0, limit updated to 200, but should NOT receive async INFO
+	require_True(t, atomic.LoadInt32(&c3.client.mpay) == 200)
+
+	// Verify neither c2 nor c3 received async INFO by pinging them and expecting PONG directly
+	c2.parseAsync("PING\r\n")
+	pong2, err := cr2.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(pong2, "PONG") {
+		t.Fatalf("Client 2 expected direct PONG (no async INFO), got: %q", pong2)
+	}
+
+	c3.parseAsync("PING\r\n")
+	pong3, err := cr3.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(pong3, "PONG") {
+		t.Fatalf("Client 3 expected direct PONG (no async INFO), got: %q", pong3)
+	}
+
+	// Step 2: Lower account payload limit to 30 (< user limit 50)
+	fooAC.Limits.Payload = 30
+	fooJWT, err = fooAC.Encode(okp)
+	require_NoError(t, err)
+	addAccountToMemResolver(s, fooPub, fooJWT)
+	s.UpdateAccountClaims(acc, fooAC)
+
+	// Client 1: effective limit lowered to 30 -> receives async INFO
+	require_True(t, atomic.LoadInt32(&c1.client.mpay) == 30)
+	line1, err = cr1.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(line1, "INFO ") {
+		t.Fatalf("Client 1 expected async INFO, got: %q", line1)
+	}
+	require_NoError(t, json.Unmarshal([]byte(line1[5:]), &parsedInfo))
+	if parsedInfo.MaxPayload != 30 {
+		t.Fatalf("Client 1 expected MaxPayload 30 in async INFO, got %d", parsedInfo.MaxPayload)
+	}
+
+	// Client 2: effective limit lowered from 50 to 30 -> receives async INFO
+	require_True(t, atomic.LoadInt32(&c2.client.mpay) == 30)
+	line2, err := cr2.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(line2, "INFO ") {
+		t.Fatalf("Client 2 expected async INFO, got: %q", line2)
+	}
+	require_NoError(t, json.Unmarshal([]byte(line2[5:]), &parsedInfo))
+	if parsedInfo.MaxPayload != 30 {
+		t.Fatalf("Client 2 expected MaxPayload 30 in async INFO, got %d", parsedInfo.MaxPayload)
+	}
+
+	// Client 3: effective limit lowered to 30, but protocol 0 -> NO async INFO
+	require_True(t, atomic.LoadInt32(&c3.client.mpay) == 30)
+	c3.parseAsync("PING\r\n")
+	pong3, err = cr3.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(pong3, "PONG") {
+		t.Fatalf("Client 3 expected direct PONG, got: %q", pong3)
+	}
+}
+
+func TestReloadMaxPayloadAccountLimitsAndAsyncInfo(t *testing.T) {
+	s := opTrustBasicSetup()
+	defer s.Shutdown()
+	buildMemAccResolver(s)
+
+	okp, _ := nkeys.FromSeed(oSeed)
+
+	// Account Foo: Has account payload limit 500
+	fooKP, _ := nkeys.CreateAccount()
+	fooPub, _ := fooKP.PublicKey()
+	fooAC := jwt.NewAccountClaims(fooPub)
+	fooAC.Limits.Payload = 500
+	fooJWT, err := fooAC.Encode(okp)
+	require_NoError(t, err)
+	addAccountToMemResolver(s, fooPub, fooJWT)
+
+	// Account Bar: No account payload limit
+	barKP, _ := nkeys.CreateAccount()
+	barPub, _ := barKP.PublicKey()
+	barAC := jwt.NewAccountClaims(barPub)
+	barAC.Limits.Payload = jwt.NoLimit
+	barJWT, err := barAC.Encode(okp)
+	require_NoError(t, err)
+	addAccountToMemResolver(s, barPub, barJWT)
+
+	connectClient := func(akp nkeys.KeyPair, apub string) (*testAsyncClient, *bufio.Reader) {
+		nkp, _ := nkeys.CreateUser()
+		pub, _ := nkp.PublicKey()
+		nuc := jwt.NewUserClaims(pub)
+		uJWT, err := nuc.Encode(akp)
+		require_NoError(t, err)
+
+		c, cr, l := newClientForServer(s)
+		var info nonceInfo
+		require_NoError(t, json.Unmarshal([]byte(l[5:]), &info))
+		sigraw, _ := nkp.Sign([]byte(info.Nonce))
+		sig := base64.RawURLEncoding.EncodeToString(sigraw)
+
+		cs := fmt.Sprintf("CONNECT {\"jwt\":%q,\"sig\":%q,\"protocol\":1}\r\nPING\r\n", uJWT, sig)
+		c.parseAsync(cs)
+		pong, err := cr.ReadString('\n')
+		require_NoError(t, err)
+		if !strings.HasPrefix(pong, "PONG") {
+			t.Fatalf("Expected PONG, got %q", pong)
+		}
+		connectInfo, err := cr.ReadString('\n')
+		require_NoError(t, err)
+		if !strings.HasPrefix(connectInfo, "INFO ") {
+			t.Fatalf("Expected initial connect INFO, got %q", connectInfo)
+		}
+		return c, cr
+	}
+
+	// Client A: in Account Foo (limit 500)
+	cA, crA := connectClient(fooKP, fooPub)
+	defer cA.close()
+
+	// Client B: in Account Bar (unlimited)
+	cB, crB := connectClient(barKP, barPub)
+	defer cB.close()
+
+	s.mu.Lock()
+	s.clients[cA.cid] = cA.client
+	s.clients[cB.cid] = cB.client
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.clients, cA.cid)
+		delete(s.clients, cB.cid)
+		s.mu.Unlock()
+	}()
+
+	// Initial effective limits
+	require_True(t, atomic.LoadInt32(&cA.client.mpay) == 500)
+	oldMpayB := atomic.LoadInt32(&cB.client.mpay)
+
+	// Reload max_payload to 2048
+	newOpts := *s.getOpts()
+	newOpts.MaxPayload = 2048
+	s.setOpts(&newOpts)
+	mopt := &maxPayloadOption{newValue: 2048}
+	mopt.Apply(s)
+
+	// Client B limit changes to 2048 and receives async INFO
+	if oldMpayB != 2048 {
+		require_True(t, atomic.LoadInt32(&cB.client.mpay) == 2048)
+		lineB, err := crB.ReadString('\n')
+		require_NoError(t, err)
+		if !strings.HasPrefix(lineB, "INFO ") {
+			t.Fatalf("Client B expected async INFO, got: %q", lineB)
+		}
+		var parsedInfo Info
+		require_NoError(t, json.Unmarshal([]byte(lineB[5:]), &parsedInfo))
+		if parsedInfo.MaxPayload != 2048 {
+			t.Fatalf("Client B expected MaxPayload 2048 in async INFO, got %d", parsedInfo.MaxPayload)
+		}
+	}
+
+	// Client A limit was 500, minLimit(500, 2048) is STILL 500.
+	// Client A must NOT receive async INFO and mpay must remain 500.
+	require_True(t, atomic.LoadInt32(&cA.client.mpay) == 500)
+	cA.parseAsync("PING\r\n")
+	pongA, err := crA.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(pongA, "PONG") {
+		t.Fatalf("Client A expected direct PONG (no async INFO), got %q", pongA)
+	}
+
+	// Now reload max_payload to 250 (lower than Client A's account limit of 500)
+	newOpts2 := *s.getOpts()
+	newOpts2.MaxPayload = 250
+	s.setOpts(&newOpts2)
+	mopt2 := &maxPayloadOption{newValue: 250}
+	mopt2.Apply(s)
+
+	// Client A limit becomes 250 and receives async INFO
+	require_True(t, atomic.LoadInt32(&cA.client.mpay) == 250)
+	lineA, err := crA.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(lineA, "INFO ") {
+		t.Fatalf("Client A expected async INFO, got: %q", lineA)
+	}
+	var parsedInfoA Info
+	require_NoError(t, json.Unmarshal([]byte(lineA[5:]), &parsedInfoA))
+	if parsedInfoA.MaxPayload != 250 {
+		t.Fatalf("Client A expected MaxPayload 250 in async INFO, got %d", parsedInfoA.MaxPayload)
+	}
+
+	// Client B limit becomes 250 and receives async INFO
+	require_True(t, atomic.LoadInt32(&cB.client.mpay) == 250)
+	lineB, err := crB.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(lineB, "INFO ") {
+		t.Fatalf("Client B expected async INFO, got: %q", lineB)
+	}
+	var parsedInfoB Info
+	require_NoError(t, json.Unmarshal([]byte(lineB[5:]), &parsedInfoB))
+	if parsedInfoB.MaxPayload != 250 {
+		t.Fatalf("Client B expected MaxPayload 250 in async INFO, got %d", parsedInfoB.MaxPayload)
+	}
+}
+
+func TestApplyAccountLimitsDoesNotDisconnectAtExactSubsLimit(t *testing.T) {
+	s := opTrustBasicSetup()
+	defer s.Shutdown()
+	buildMemAccResolver(s)
+
+	okp, _ := nkeys.FromSeed(oSeed)
+
+	fooKP, _ := nkeys.CreateAccount()
+	fooPub, _ := fooKP.PublicKey()
+	fooAC := jwt.NewAccountClaims(fooPub)
+	fooAC.Limits.Subs = 1
+	fooJWT, err := fooAC.Encode(okp)
+	require_NoError(t, err)
+	addAccountToMemResolver(s, fooPub, fooJWT)
+
+	nkp, _ := nkeys.CreateUser()
+	pub, _ := nkp.PublicKey()
+	nuc := jwt.NewUserClaims(pub)
+	uJWT, err := nuc.Encode(fooKP)
+	require_NoError(t, err)
+
+	c, cr, l := newClientForServer(s)
+	defer c.close()
+	var info nonceInfo
+	require_NoError(t, json.Unmarshal([]byte(l[5:]), &info))
+	sigraw, _ := nkp.Sign([]byte(info.Nonce))
+	sig := base64.RawURLEncoding.EncodeToString(sigraw)
+
+	cs := fmt.Sprintf("CONNECT {\"jwt\":%q,\"sig\":%q,\"protocol\":1}\r\nPING\r\n", uJWT, sig)
+	c.parseAsync(cs)
+	pong, err := cr.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(pong, "PONG") {
+		t.Fatalf("Expected PONG, got %q", pong)
+	}
+	connectInfo, err := cr.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(connectInfo, "INFO ") {
+		t.Fatalf("Expected initial connect INFO, got %q", connectInfo)
+	}
+
+	c.parseAsync("SUB foo 1\r\n")
+
+	c.mu.Lock()
+	c.applyAccountLimits()
+	c.mu.Unlock()
+
+	time.Sleep(50 * time.Millisecond)
+
+	c.mu.Lock()
+	closed := c.isClosed()
+	c.mu.Unlock()
+	require_False(t, closed)
 }

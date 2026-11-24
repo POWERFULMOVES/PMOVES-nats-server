@@ -19,12 +19,13 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -63,7 +64,7 @@ func TestNRGSnapshotAndRestart(t *testing.T) {
 	sm := rg.nonLeader().(*stateAdder)
 
 	for i := 0; i < 1000; i++ {
-		delta := rand.Int63n(222)
+		delta := rand.Int64N(222)
 		expectedTotal += delta
 		leader.proposeDelta(delta)
 
@@ -145,7 +146,7 @@ func TestNRGAppendEntryDecode(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		b := copyBytes(buf)
 		// modifying the header (idx < 42) will not result in an error by decodeAppendEntry
-		bi := 42 + rand.Intn(len(b)-42)
+		bi := 42 + rand.IntN(len(b)-42)
 		if b[bi] != 0 && bi != 40 {
 			b[bi] = 0
 			_, err = decodeAppendEntry(b, nil, _EMPTY_)
@@ -229,6 +230,56 @@ func TestNRGRecoverFromFollowingNoLeader(t *testing.T) {
 	rg.waitOnLeader()
 	require_True(t, rg.leader() != nil)
 	require_NotEqual(t, rg.leader().node().Term(), term)
+}
+
+func TestNRGLeaderNotInOwnPeerSetAddsItself(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	rg := c.createMemRaftGroup("TEST", 3, newStateAdder)
+	rg.waitOnLeader()
+
+	leader := rg.leader().node().(*raft)
+	follower := rg.nonLeader().node().(*raft)
+
+	// Simulate a bootstrap peer state from a leader that didn't know about us yet,
+	// which replaces our peer set with one that doesn't include ourselves.
+	follower.Lock()
+	peers := slices.DeleteFunc(follower.peerNames(), func(p string) bool { return p == follower.id })
+	follower.processPeerState(&peerState{knownPeers: peers, clusterSize: 3})
+	follower.Unlock()
+	require_Len(t, len(follower.Peers()), 2)
+
+	// Once we become leader we must be a member again, and tell the others.
+	// The transfer silently goes to another peer if the leader hasn't heard from
+	// the follower recently, so retry until the follower is the leader.
+	require_NoError(t, leader.StepDown(follower.id))
+	checkFor(t, 5*time.Second, 250*time.Millisecond, func() error {
+		l := rg.leader()
+		if l == nil {
+			return errors.New("no leader yet")
+		}
+		if n := l.node(); n != follower {
+			n.StepDown(follower.id)
+			return fmt.Errorf("leader is %s, not %s", n.ID(), follower.id)
+		}
+		return nil
+	})
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		for _, sm := range rg {
+			n := sm.node().(*raft)
+			if peers := n.Peers(); len(peers) != 3 {
+				return fmt.Errorf("%s has %d peers", n.ID(), len(peers))
+			}
+			n.RLock()
+			_, removed := n.removed[follower.id]
+			n.RUnlock()
+			if removed {
+				return fmt.Errorf("%s still has the leader marked as removed", n.ID())
+			}
+		}
+		return nil
+	})
 }
 
 func TestNRGInlineStepdown(t *testing.T) {
@@ -490,7 +541,7 @@ func TestNRGSwitchStateClearsQueues(t *testing.T) {
 	require_Equal(t, n.prop.len(), 0)
 	require_Equal(t, n.resp.len(), 0)
 
-	n.prop.push(&proposedEntry{&Entry{}, _EMPTY_})
+	n.prop.push(&proposedEntry{Entry: &Entry{}, reply: _EMPTY_})
 	n.resp.push(&appendEntryResponse{})
 	require_Equal(t, n.prop.len(), 1)
 	require_Equal(t, n.resp.len(), 1)
@@ -498,6 +549,94 @@ func TestNRGSwitchStateClearsQueues(t *testing.T) {
 	n.switchState(Follower)
 	require_Equal(t, n.prop.len(), 0)
 	require_Equal(t, n.resp.len(), 0)
+}
+
+func TestNRGProposalFastPath(t *testing.T) {
+	s := &Server{}
+
+	n := &raft{
+		prop: newIPQueue[*proposedEntry](s, "prop", ipqSizeCalculation((*proposedEntry).size)),
+		term: 1,
+	}
+
+	// Closed fast path
+	n.state.Store(int32(Leader))
+	require_False(t, n.tryFastPathPropose(0, []byte("closed zero term")))
+	require_False(t, n.tryFastPathPropose(1, []byte("closed")))
+
+	// Simulate the leader opening the fast path for the current term.
+	n.fastPathTerm.Store(n.term)
+	require_Equal(t, n.fastPathTerm.Load(), uint64(1))
+	require_False(t, n.tryFastPathPropose(2, []byte("wrong term")))
+
+	// The term may still match after stepping down, so the state check must
+	// prevent fast-path proposals too.
+	n.state.Store(int32(Follower))
+	require_False(t, n.tryFastPathPropose(1, []byte("not leader")))
+
+	// Single and multi-entry proposals are queued in proposal order, with the
+	// leader term attached to every entry.
+	n.state.Store(int32(Leader))
+	require_True(t, n.tryFastPathPropose(1, []byte("single")))
+	multi := []*Entry{
+		newEntry(EntryNormal, []byte("multi 1")),
+		newEntry(EntryNormal, []byte("multi 2")),
+	}
+	require_True(t, n.tryFastPathProposeMulti(1, multi))
+	multi[0] = nil // The queued proposals do not retain the caller's slice.
+
+	proposals := n.prop.pop()
+	require_Len(t, len(proposals), 3)
+	require_Equal(t, string(proposals[0].Data), "single")
+	require_Equal(t, string(proposals[1].Data), "multi 1")
+	require_Equal(t, string(proposals[2].Data), "multi 2")
+	for _, pe := range proposals {
+		require_Equal(t, pe.term, uint64(1))
+		pe.returnToPool()
+	}
+	n.prop.recycle(&proposals)
+
+	// Closing the fast path clears its term and prevents further proposals.
+	n.fastPathTerm.Store(0)
+	require_Equal(t, n.fastPathTerm.Load(), uint64(0))
+	require_False(t, n.tryFastPathPropose(1, []byte("closed again")))
+}
+
+func TestNRGProposalFastPathLimits(t *testing.T) {
+	s := &Server{}
+	n := &raft{
+		prop: newIPQueue[*proposedEntry](s, "prop", ipqSizeCalculation((*proposedEntry).size)),
+		term: 1,
+	}
+	n.state.Store(int32(Leader))
+
+	for _, test := range []struct {
+		name          string
+		entries, size int
+	}{
+		{"limit entries", 8*maxBatchEntries + 1, 0},
+		{"limit bytes", 1, 8*maxBatchBytes + 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			n.fastPathTerm.Store(n.term)
+			data := make([]byte, test.size)
+			for range test.entries {
+				require_True(t, n.tryFastPathPropose(n.term, data))
+			}
+			// Adding more closes the fast path.
+			require_False(t, n.tryFastPathPropose(n.term, nil))
+			require_Equal(t, n.fastPathTerm.Load(), uint64(0))
+
+			// Reopen the fast path and try with propose multi
+			n.fastPathTerm.Store(n.term)
+			require_False(t, n.tryFastPathProposeMulti(n.term, []*Entry{newEntry(EntryNormal, nil)}))
+			require_Equal(t, n.fastPathTerm.Load(), uint64(0))
+			require_Equal(t, n.prop.len(), test.entries)
+
+			n.prop.drain()
+			require_False(t, n.checkFastPathLimits(n.term))
+		})
+	}
 }
 
 func TestNRGStepDownOnSameTermDoesntClearVote(t *testing.T) {
@@ -661,6 +800,12 @@ func TestNRGUnsuccessfulVoteRequestCampaignEarly(t *testing.T) {
 	require_Equal(t, n.vote, noVote)
 	require_NotEqual(t, n.etlr, time.Time{}) // Resets election timer as it starts campaigning.
 	n.etlr = time.Time{}
+
+	// We are follower and deny a re-sent vote for outdated candidate. Don't postpone campaigning.
+	require_NoError(t, n.processVoteRequest(&voteRequest{term: 2, lastTerm: 1, lastIndex: 2, candidate: nats0}))
+	require_Equal(t, n.term, 2)
+	require_Equal(t, n.vote, noVote)
+	require_Equal(t, n.etlr, time.Time{})
 
 	// Switch to candidate.
 	n.pterm, n.pindex = 2, 200
@@ -1330,6 +1475,42 @@ func TestNRGTruncateWALClearsPendingAppendEntryCache(t *testing.T) {
 	require_NotNil(t, n.pae[1])
 }
 
+func TestNRGFailedMembershipChangeReverts(t *testing.T) {
+	for _, typ := range []EntryType{EntryAddPeer, EntryRemovePeer} {
+		t.Run(typ.String(), func(t *testing.T) {
+			n, cleanup := initSingleMemRaftNode(t)
+			defer cleanup()
+
+			nats0 := "S1Nunr6R"   // "nats-0"
+			newPeer := "yrzKKRBu" // "nats-1"
+			n.addPeer(nats0)
+			peer := newPeer
+			if typ == EntryRemovePeer {
+				n.addPeer(newPeer)
+				peer = nats0
+			}
+			n.switchToLeader()
+
+			n.Lock()
+			csz, qn := n.csz, n.qn
+			// Storing the membership change fails.
+			n.werr = errors.New("test write error")
+			n.Unlock()
+			require_False(t, n.sendMembershipChange(newEntry(typ, []byte(peer))))
+
+			n.RLock()
+			defer n.RUnlock()
+			require_True(t, n.membChange == nil)
+			require_Equal(t, n.peers[peer] != nil, typ == EntryRemovePeer)
+			require_Equal(t, n.csz, csz)
+			require_Equal(t, n.qn, qn)
+			// A peer that was never removed must not be marked as removed.
+			_, removed := n.removed[peer]
+			require_False(t, removed)
+		})
+	}
+}
+
 func TestNRGTruncateWALRevertsUncommittedAddPeer(t *testing.T) {
 	const (
 		KindLeader = iota
@@ -1444,13 +1625,13 @@ func TestNRGTruncateWALRevertsUncommittedRemovePeer(t *testing.T) {
 			n.processAppendEntry(ae2, aesub)
 		}
 
-		// The peer is gone and quorum shrank.
+		// The peer is gone, marked removed, and quorum shrank.
 		_, ok := n.peers[oldPeer]
 		require_False(t, ok)
 		require_Equal(t, n.csz, 2)
 		require_Equal(t, n.qn, 2)
 		_, ok = n.removed[oldPeer]
-		require_False(t, ok)
+		require_True(t, ok)
 		require_NotNil(t, n.membChange)
 		require_Equal(t, n.membChange.index, 2)
 		require_Equal(t, n.membChange.peer, oldPeer)
@@ -1489,6 +1670,351 @@ func TestNRGTruncateWALRevertsUncommittedRemovePeer(t *testing.T) {
 	t.Run("Leader", func(t *testing.T) { test(KindLeader) })
 	t.Run("Follower", func(t *testing.T) { test(KindFollower) })
 	t.Run("Restart", func(t *testing.T) { test(KindRestart) })
+}
+
+func TestNRGEvictPeers(t *testing.T) {
+	nats0 := "S1Nunr6R" // "nats-0"
+	nats1 := "yrzKKRBu" // "nats-1"
+	nats2 := "cnrtt3eg" // "nats-2"
+	nats3 := "bkCGheKT" // "nats-3"
+
+	t.Run("Guards", func(t *testing.T) {
+		n, cleanup := initSingleMemRaftNode(t)
+		defer cleanup()
+
+		n.addPeer(nats0)
+
+		// Refuse for unmanaged groups.
+		_, err := n.EvictPeers([]string{nats0})
+		require_Error(t, err, errNotManaged)
+		n.Lock()
+		n.managed = true
+		n.Unlock()
+
+		// Refuse if we still have a leader.
+		n.Lock()
+		n.updateLeader(nats0)
+		n.Unlock()
+		_, err = n.EvictPeers([]string{nats0})
+		require_Error(t, err, errNotLeaderless)
+
+		n.Lock()
+		n.updateLeader(noLeader)
+		n.Unlock()
+
+		// Never evict ourselves.
+		evicted, err := n.EvictPeers([]string{n.id})
+		require_NoError(t, err)
+		require_Len(t, len(evicted), 0)
+
+		// Unknown peers are ignored.
+		evicted, err = n.EvictPeers([]string{nats1})
+		require_NoError(t, err)
+		require_Len(t, len(evicted), 0)
+
+		// The peer is evicted, size and quorum shrink. Managed groups don't
+		// track removed peers, the meta layer owns membership.
+		evicted, err = n.EvictPeers([]string{nats0})
+		require_NoError(t, err)
+		require_True(t, slices.Equal(evicted, []string{nats0}))
+		_, ok := n.peers[nats0]
+		require_False(t, ok)
+		_, ok = n.removed[nats0]
+		require_False(t, ok)
+		require_Equal(t, n.csz, 1)
+		require_Equal(t, n.qn, 1)
+
+		// Never empty out the group.
+		evicted, err = n.EvictPeers([]string{n.id})
+		require_NoError(t, err)
+		require_Len(t, len(evicted), 0)
+	})
+
+	// Evicting is only allowed if the peers left behind can't reach quorum
+	// without us, or they could commit entries we'd never see.
+	t.Run("RefusesWhenQuorumPossible", func(t *testing.T) {
+		n, cleanup := initSingleMemRaftNode(t)
+		defer cleanup()
+
+		n.addPeer(nats0)
+		n.addPeer(nats1)
+		n.addPeer(nats2)
+		n.addPeer(nats3)
+		require_Len(t, len(n.peers), 5)
+
+		n.Lock()
+		n.managed = true
+		n.updateLeader(noLeader)
+		n.Unlock()
+
+		// Three peers left is exactly quorum for the group of five, refuse.
+		_, err := n.EvictPeers([]string{nats0})
+		require_Error(t, err, errQuorumPossible)
+
+		// Two peers left can't commit without us, so we're good to go.
+		evicted, err := n.EvictPeers([]string{nats0, nats1})
+		require_NoError(t, err)
+		require_True(t, slices.Equal(evicted, []string{nats0, nats1}))
+		require_Equal(t, n.csz, 3)
+	})
+
+	// A stuck uncommitted RemovePeer of a peer we're not evicting speculatively
+	// dropped it from our peer map, but it can still be voting for everyone
+	// else. It must be counted when deciding if eviction is safe.
+	t.Run("RefusesForUncommittedRemovePeer", func(t *testing.T) {
+		n, cleanup := initSingleMemRaftNode(t)
+		defer cleanup()
+
+		n.addPeer(nats0)
+		n.addPeer(nats1)
+		n.addPeer(nats2)
+		n.addPeer(nats3)
+		require_Len(t, len(n.peers), 5)
+
+		esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+		normal := []*Entry{newEntry(EntryNormal, esm)}
+		removePeer := newEntry(EntryRemovePeer, []byte(nats3))
+		ae1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: normal})
+		ae2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 1, entries: []*Entry{removePeer}})
+		n.processAppendEntry(ae1, n.aesub)
+		n.processAppendEntry(ae2, n.aesub)
+
+		// The peer is gone speculatively, but it's still a voting member.
+		_, ok := n.peers[nats3]
+		require_False(t, ok)
+		require_Len(t, len(n.peers), 4)
+		require_Len(t, len(n.votingPeerNames()), 5)
+
+		n.Lock()
+		n.managed = true
+		n.updateLeader(noLeader)
+		n.Unlock()
+
+		// Only counting our peer map would leave two of four and evict, but the
+		// committed group is five and the three left could commit without us.
+		_, err := n.EvictPeers([]string{nats0})
+		require_Error(t, err, errQuorumPossible)
+
+		// Evicting the pending removal as well leaves too few behind, so allowed.
+		evicted, err := n.EvictPeers([]string{nats0, nats1, nats3})
+		require_NoError(t, err)
+		require_True(t, slices.Equal(evicted, []string{nats0, nats1, nats3}))
+		require_True(t, n.membChange == nil)
+		require_Equal(t, n.csz, 2)
+	})
+
+	// A stuck uncommitted RemovePeer of the peer we're evicting was already
+	// speculatively applied to the peer map. It must be reverted first so
+	// eviction properly marks the peer as removed.
+	t.Run("RevertsUncommittedRemovePeer", func(t *testing.T) {
+		n, cleanup := initSingleMemRaftNode(t)
+		defer cleanup()
+
+		n.addPeer(nats0)
+		n.addPeer(nats1)
+		require_Len(t, len(n.peers), 3)
+
+		esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+		normal := []*Entry{newEntry(EntryNormal, esm)}
+		removePeer := newEntry(EntryRemovePeer, []byte(nats1))
+		ae1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: normal})
+		ae2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 1, entries: []*Entry{removePeer}})
+		n.processAppendEntry(ae1, n.aesub)
+		n.processAppendEntry(ae2, n.aesub)
+
+		// The peer is gone speculatively, and a membership change is inflight.
+		_, ok := n.peers[nats1]
+		require_False(t, ok)
+		require_NotNil(t, n.membChange)
+
+		n.Lock()
+		n.managed = true
+		n.updateLeader(noLeader)
+		n.Unlock()
+
+		// Evicting the peer must first revert the speculative removal, then
+		// evict it for real: size and quorum adjusted.
+		evicted, err := n.EvictPeers([]string{nats1})
+		require_NoError(t, err)
+		require_True(t, slices.Equal(evicted, []string{nats1}))
+		_, ok = n.peers[nats1]
+		require_False(t, ok)
+		_, ok = n.removed[nats1]
+		require_False(t, ok)
+		require_Equal(t, n.csz, 2)
+		require_Equal(t, n.qn, 2)
+		require_True(t, n.membChange == nil)
+	})
+
+	// A scale-down or move that appended a RemovePeer of ourselves, but never
+	// committed it, already dropped us from our own peer map. Evicting the
+	// peers the meta layer removed must revert it as well, or we'd evict the
+	// others and still not be a member that can campaign.
+	t.Run("RevertsUncommittedSelfRemoval", func(t *testing.T) {
+		n, cleanup := initSingleMemRaftNode(t)
+		defer cleanup()
+
+		n.addPeer(nats0)
+		n.addPeer(nats1)
+		require_Len(t, len(n.peers), 3)
+
+		esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+		normal := []*Entry{newEntry(EntryNormal, esm)}
+		removePeer := newEntry(EntryRemovePeer, []byte(n.id))
+		ae1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: normal})
+		ae2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 1, entries: []*Entry{removePeer}})
+		n.processAppendEntry(ae1, n.aesub)
+		n.processAppendEntry(ae2, n.aesub)
+
+		// We're gone from our own peer map speculatively.
+		_, ok := n.peers[n.id]
+		require_False(t, ok)
+		require_True(t, n.pendingSelfRemoval())
+
+		n.Lock()
+		n.managed = true
+		n.updateLeader(noLeader)
+		n.Unlock()
+
+		// Evicting the other peers must revert our own pending removal first,
+		// leaving us as the sole member with quorum of one.
+		evicted, err := n.EvictPeers([]string{nats0, nats1})
+		require_NoError(t, err)
+		require_True(t, slices.Equal(evicted, []string{nats0, nats1}))
+		_, ok = n.peers[n.id]
+		require_True(t, ok)
+		require_Len(t, len(n.peers), 1)
+		require_Equal(t, n.csz, 1)
+		require_Equal(t, n.qn, 1)
+		require_False(t, n.pendingSelfRemoval())
+		require_True(t, n.membChange == nil)
+
+		// We must be able to become leader again, and commit at quorum one.
+		n.Lock()
+		n.term++
+		n.Unlock()
+		n.switchToLeader()
+		n.sendAppendEntry(normal)
+		require_Equal(t, n.commit, n.pindex)
+	})
+
+	// A stuck uncommitted AddPeer speculatively added the peer to the peer
+	// map. While the peer is part of the assignment the change must be left
+	// alone, but once the assignment doesn't know it anymore it must be
+	// reverted, or the phantom peer would keep inflating size and quorum.
+	t.Run("RevertsUncommittedAddPeer", func(t *testing.T) {
+		n, cleanup := initSingleMemRaftNode(t)
+		defer cleanup()
+
+		n.addPeer(nats0)
+		require_Len(t, len(n.peers), 2)
+
+		esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+		normal := []*Entry{newEntry(EntryNormal, esm)}
+		addPeer := newEntry(EntryAddPeer, []byte(nats1))
+		ae1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: normal})
+		ae2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 1, entries: []*Entry{addPeer}})
+		n.processAppendEntry(ae1, n.aesub)
+		n.processAppendEntry(ae2, n.aesub)
+
+		// The peer is tracked speculatively, and a membership change is inflight.
+		_, ok := n.peers[nats1]
+		require_True(t, ok)
+		require_Equal(t, n.csz, 3)
+		require_NotNil(t, n.membChange)
+
+		n.Lock()
+		n.managed = true
+		n.updateLeader(noLeader)
+		n.Unlock()
+
+		// Evicting another peer must leave the membership change and its
+		// speculatively added peer alone; the assignment still contains it.
+		evicted, err := n.EvictPeers([]string{nats0})
+		require_NoError(t, err)
+		require_True(t, slices.Equal(evicted, []string{nats0}))
+		_, ok = n.peers[nats1]
+		require_True(t, ok)
+		_, ok = n.peers[nats0]
+		require_False(t, ok)
+		_, ok = n.removed[nats0]
+		require_False(t, ok)
+		require_Equal(t, n.csz, 2)
+		require_Equal(t, n.qn, 2)
+		require_NotNil(t, n.membChange)
+
+		// Once the added peer is peer-removed or reconciled away, it shows
+		// up in the evict list itself and the change is reverted. There's
+		// nothing to remove from the peer map; the entry may still commit
+		// under another leader.
+		evicted, err = n.EvictPeers([]string{nats1})
+		require_NoError(t, err)
+		require_Len(t, len(evicted), 0)
+		_, ok = n.peers[nats1]
+		require_False(t, ok)
+		_, ok = n.removed[nats1]
+		require_False(t, ok)
+		require_Equal(t, n.csz, 1)
+		require_Equal(t, n.qn, 1)
+		require_True(t, n.membChange == nil)
+	})
+
+	// Sole survivor: eviction reverts an uncommitted AddPeer for a peer
+	// that was peer-removed, then we win the election. The entry stays in
+	// the WAL but commits as a no-op, so the phantom peer can't inflate
+	// quorum again.
+	t.Run("RevertedAddPeerCommitsAsNoopWhenLeader", func(t *testing.T) {
+		n, cleanup := initSingleMemRaftNode(t)
+		defer cleanup()
+
+		n.addPeer(nats0)
+		require_Len(t, len(n.peers), 2)
+
+		esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+		normal := []*Entry{newEntry(EntryNormal, esm)}
+		addPeer := newEntry(EntryAddPeer, []byte(nats1))
+		ae1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: normal})
+		ae2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 1, entries: []*Entry{addPeer}})
+		n.processAppendEntry(ae1, n.aesub)
+		n.processAppendEntry(ae2, n.aesub)
+		require_NotNil(t, n.membChange)
+		require_Equal(t, n.csz, 3)
+
+		n.Lock()
+		n.managed = true
+		n.updateLeader(noLeader)
+		n.Unlock()
+
+		// Evict the other real peer and the peer-removed phantom, leaving us
+		// as the sole survivor. The uncommitted AddPeer is reverted, but
+		// stays in the WAL.
+		evicted, err := n.EvictPeers([]string{nats0, nats1})
+		require_NoError(t, err)
+		require_True(t, slices.Equal(evicted, []string{nats0}))
+		require_Equal(t, n.csz, 1)
+		require_Equal(t, n.qn, 1)
+		require_True(t, n.membChange == nil)
+
+		// Become leader. This appends our peer state above the reverted
+		// entry and self-commits everything at quorum 1. The AddPeer must
+		// commit as a no-op: no phantom peer, size and quorum stay 1.
+		n.Lock()
+		n.term++
+		n.Unlock()
+		n.switchToLeader()
+
+		require_Equal(t, n.commit, 3)
+		_, ok := n.peers[nats1]
+		require_False(t, ok)
+		require_Equal(t, n.csz, 1)
+		require_Equal(t, n.qn, 1)
+
+		// The group must remain functional, new proposals commit at quorum 1.
+		n.sendAppendEntry(normal)
+		require_Equal(t, n.commit, 4)
+		_, ok = n.peers[nats1]
+		require_False(t, ok)
+	})
 }
 
 func TestNRGResetWALClearsPendingAppendEntryCache(t *testing.T) {
@@ -2600,6 +3126,165 @@ func TestNRGHealthCheckWaitForPendingCommitsWhenPaused(t *testing.T) {
 	require_True(t, n.Healthy())
 }
 
+func TestNRGHealthy(t *testing.T) {
+	// The leader grace period is twice the heartbeat interval, needs to be long enough to time it.
+	origHBInterval := hbInterval
+	hbInterval = 200 * time.Millisecond
+	defer func() { hbInterval = origHBInterval }()
+
+	s := runRaftTestServer(t)
+	defer s.Shutdown()
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+	processAE := func(n *raft, term, commit, pterm, pindex uint64, entries []*Entry) {
+		ae := &appendEntry{leader: nats0, term: term, commit: commit, pterm: pterm, pindex: pindex, entries: entries}
+		n.processAppendEntry(encode(t, ae), n.aesub)
+	}
+	leaderless := func(n *raft) {
+		n.updateLeader(noLeader)
+		n.nlt, n.lgt = time.Now().Add(-leaderlessHealthy), time.Time{}
+	}
+	// A vote request for a newer term clears the leader.
+	requestVote := func(n *raft) {
+		require_NoError(t, n.processVoteRequest(&voteRequest{term: n.term + 1, lastTerm: n.pterm, lastIndex: n.pindex, candidate: nats0}))
+	}
+
+	for i, test := range []struct {
+		title   string
+		setup   func(n *raft)
+		healthy bool
+		behind  bool // Whether falling behind was logged.
+	}{
+		{title: "follower processed leader index", healthy: true},
+		{title: "closed", setup: func(n *raft) { n.state.Store(int32(Closed)) }},
+		{title: "no commits", setup: func(n *raft) { n.commit = 0 }},
+		{title: "leader processing prior terms", setup: func(n *raft) { n.state.Store(int32(Leader)) }},
+		{title: "leader processed prior terms", healthy: true, setup: func(n *raft) {
+			n.state.Store(int32(Leader))
+			n.leaderState.Store(true)
+		}},
+		{title: "follower below leader index", behind: true, setup: func(n *raft) { n.hcindex = 2 }},
+		{title: "follower with pending commits past leader index", healthy: true, setup: func(n *raft) { n.pindex, n.commit = 2, 2 }},
+		{title: "catching up", setup: func(n *raft) { n.catchup = &catchupState{} }},
+		{title: "paused with pending commits", setup: func(n *raft) { n.paused, n.hcommit = true, 2 }},
+		{title: "paused without pending commits", healthy: true, setup: func(n *raft) { n.paused, n.hcommit = true, 1 }},
+		{title: "falling behind on applies", setup: func(n *raft) { n.quorumPaused = true }},
+		{title: "no recent leader contact", setup: func(n *raft) { n.peers[nats0].ts = time.Now().Add(-4 * hbInterval) }},
+		{title: "leader contact over two heartbeats ago", healthy: true, setup: func(n *raft) { n.peers[nats0].ts = time.Now().Add(-5 * hbInterval / 2) }},
+		{title: "new term without leader contact", setup: func(n *raft) { n.term = 2 }},
+		{title: "new term records leader index", behind: true, setup: func(n *raft) {
+			processAE(n, 2, 1, 1, 1, entries)
+			n.lgt = time.Time{}
+		}},
+		{title: "same term keeps leader index", healthy: true, setup: func(n *raft) { processAE(n, 1, 1, 1, 1, entries) }},
+		{title: "multiple entries record a single index", healthy: true, setup: func(n *raft) {
+			processAE(n, 2, 1, 1, 1, []*Entry{newEntry(EntryNormal, esm), newEntry(EntryNormal, esm), newEntry(EntryNormal, esm)})
+			processAE(n, 2, 2, 2, 2, nil)
+			n.Applied(2)
+			n.lgt = time.Time{}
+		}},
+		{title: "new term replaces leader index of truncated entry", healthy: true, setup: func(n *raft) {
+			processAE(n, 2, 1, 1, 1, entries)
+			processAE(n, 3, 1, 1, 1, nil)
+			n.lgt = time.Time{}
+		}},
+		{title: "new term within leader grace", healthy: true, setup: func(n *raft) { processAE(n, 2, 1, 1, 1, entries) }},
+		{title: "vote request within leader grace", healthy: true, setup: requestVote},
+		{title: "vote request past leader grace", setup: func(n *raft) {
+			requestVote(n)
+			n.lgt = time.Now().Add(-2 * hbInterval)
+		}},
+		{title: "vote request without grace while behind", setup: func(n *raft) {
+			n.hcindex = 2
+			requestVote(n)
+			require_False(t, n.hcbehind)
+		}},
+		{title: "vote request without grace while quorum paused", setup: func(n *raft) {
+			n.quorumPaused = true
+			requestVote(n)
+		}},
+		{title: "vote request without grace after no leader past timeout", behind: true, setup: func(n *raft) {
+			leaderless(n)
+			requestVote(n)
+			processAE(n, n.term, 1, 1, 1, entries)
+		}},
+		{title: "vote request without extending grace", setup: func(n *raft) {
+			n.hcindex = 2
+			n.lgt = time.Now().Add(-hbInterval)
+			requestVote(n)
+			time.Sleep(hbInterval * 3 / 2)
+		}},
+		{title: "vote request without grace after losing leader contact", setup: func(n *raft) {
+			n.peers[nats0].ts = time.Now().Add(-4 * hbInterval)
+			requestVote(n)
+		}},
+		{title: "election timeout without grace after losing leader contact", setup: func(n *raft) {
+			// The election timeout is at least four heartbeats, so leader contact is already lost.
+			n.peers[nats0].ts = time.Now().Add(-4 * hbInterval)
+			// Skip the peer interest check, nats-0 isn't a real server.
+			n.qn = 1
+			n.switchToCandidate()
+			require_Equal(t, n.term, 2)
+		}},
+		{title: "leader stepping down within leader grace", healthy: true, setup: func(n *raft) {
+			n.state.Store(int32(Leader))
+			n.leaderState.Store(true)
+			n.switchToFollowerLocked(noLeader)
+		}},
+		{title: "leader processing prior terms stepping down without grace", setup: func(n *raft) {
+			n.state.Store(int32(Leader))
+			n.switchToFollowerLocked(noLeader)
+		}},
+		{title: "learner stored leader index", healthy: true, setup: func(n *raft) {
+			n.managed = true
+			delete(n.peers, n.id)
+			n.commit, n.processed, n.applied = 0, 0, 0
+		}},
+		{title: "learner below leader index", behind: true, setup: func(n *raft) {
+			n.managed = true
+			delete(n.peers, n.id)
+			n.commit, n.processed, n.applied = 0, 0, 0
+			n.hcindex = 2
+		}},
+		{title: "no leader", setup: func(n *raft) {
+			n.updateLeader(noLeader)
+			n.lgt = time.Time{}
+		}},
+		{title: "no leader past timeout", healthy: true, setup: leaderless},
+		{title: "no leader past timeout with pending commits", setup: func(n *raft) {
+			leaderless(n)
+			n.pindex, n.commit = 2, 2
+		}},
+		{title: "no leader past timeout while quorum paused", healthy: true, setup: func(n *raft) {
+			leaderless(n)
+			n.quorumPaused = true
+		}},
+	} {
+		t.Run(test.title, func(t *testing.T) {
+			ms, err := newMemStore(&StreamConfig{Name: "TEST", Storage: MemoryStorage})
+			require_NoError(t, err)
+			cfg := &RaftConfig{Name: fmt.Sprintf("TEST-%d", i), Store: t.TempDir(), Log: ms}
+			require_NoError(t, s.bootstrapRaftNode(cfg, []string{s.sys.shash[:idLen]}, true))
+			n, err := s.initRaftNode(globalAccountName, cfg, pprofLabels{})
+			require_NoError(t, err)
+			n.addPeer(nats0)
+
+			// Follower that processed the leader's first entry.
+			processAE(n, 1, 0, 0, 0, entries)
+			processAE(n, 1, 1, 1, 1, nil)
+			n.Applied(1)
+
+			if test.setup != nil {
+				test.setup(n)
+			}
+			require_Equal(t, n.Healthy(), test.healthy)
+			require_Equal(t, n.hcbehind, test.behind)
+		})
+	}
+}
+
 func TestNRGAppendEntryCanEstablishQuorumAfterLeaderChange(t *testing.T) {
 	n, cleanup := initSingleMemRaftNode(t)
 	defer cleanup()
@@ -2847,6 +3532,198 @@ func TestNRGCatchupDontCountTowardQuorum(t *testing.T) {
 	require_Equal(t, msg.Reply, _EMPTY_)
 }
 
+func TestNRGCatchupAcksProgressWhenGivenProgressInbox(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Create a sample entry, the content doesn't matter, just that it's stored.
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	aeReply := "$TEST"
+	progressReply := fmt.Sprintf(raftCatchupProgressReply, "test")
+
+	nc, err := nats.Connect(n.s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+
+	sub, err := nc.SubscribeSync(aeReply)
+	require_NoError(t, err)
+	defer sub.Drain()
+	psub, err := nc.SubscribeSync(progressReply)
+	require_NoError(t, err)
+	defer psub.Drain()
+	require_NoError(t, nc.Flush())
+
+	// Timeline
+	aeMissedMsg := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries, reply: progressReply})
+	ae := appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 1, entries: entries, reply: aeReply}
+	aeCatchupTrigger := encode(t, &ae)
+
+	// Simulate we missed all messages up to this point.
+	n.processAppendEntry(aeCatchupTrigger, n.aesub)
+	require_True(t, n.catchup != nil)
+
+	// Should reply we require catchup.
+	msg, err := sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	ar := decodeAppendEntryResponse(msg.Data)
+	require_False(t, ar.success)
+	require_True(t, strings.HasPrefix(msg.Reply, "$NRG.CR"))
+
+	// A catchup entry that carries a dedicated progress inbox MUST be acked, that
+	// response is what lets the leader move its send window forward. Without it the
+	// leader can only ever have one window in flight before it gives up and stalls.
+	n.processAppendEntry(aeMissedMsg, n.catchup.sub)
+	msg, err = psub.NextMsg(time.Second)
+	require_NoError(t, err)
+	ar = decodeAppendEntryResponse(msg.Data)
+	require_Equal(t, ar.index, 1)
+	require_True(t, ar.success)
+
+	// It must NOT also show up on the general append entry inbox, since that is the
+	// path that feeds quorum.
+	_, err = sub.NextMsg(250 * time.Millisecond)
+	require_Error(t, err, nats.ErrTimeout)
+}
+
+func TestNRGCatchupSendsProgressInboxAndRefillsWindow(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	nats1 := "yrzKKRBu" // "nats-1"
+
+	n.Lock()
+	n.addPeer(nats1)
+	n.Unlock()
+
+	// Entries large enough that only a handful fit in the leader's 2MB send window,
+	// so catching this log up must span several windows.
+	const (
+		entrySize  = 512 * 1024
+		numEntries = 12
+	)
+	entries := []*Entry{newEntry(EntryNormal, make([]byte, entrySize))}
+
+	// Fill our WAL, so we have something to catch a follower up on.
+	for i := range numEntries {
+		pterm := uint64(1)
+		if i == 0 {
+			pterm = 0
+		}
+		ae := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: pterm, pindex: uint64(i), entries: entries})
+		n.processAppendEntry(ae, n.aesub)
+	}
+	require_Equal(t, n.pindex, numEntries)
+
+	catchupSubj := "$TEST.catchup"
+	nc, err := nats.Connect(n.s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+
+	sub, err := nc.SubscribeSync(catchupSubj)
+	require_NoError(t, err)
+	defer sub.Drain()
+	sub.SetPendingLimits(-1, -1)
+	require_NoError(t, nc.Flush())
+
+	n.switchToLeader()
+
+	// Pretend we haven't heard from the follower in a while. It's the only other peer,
+	// so as far as we're concerned right now we've lost quorum.
+	n.Lock()
+	n.lsut = time.Time{}
+	n.peers[nats1].ts = time.Now().Add(-2 * lostQuorumInterval)
+	n.Unlock()
+	require_True(t, n.lostQuorum())
+
+	// Ask to be caught up from the very beginning.
+	ar := newAppendEntryResponse(0, 0, nats1, false)
+	ar.reply = catchupSubj
+	n.catchupFollower(ar)
+
+	// Act as the follower. Every catchup entry is acknowledged on the reply subject
+	// the leader handed us, which is what refills its send window.
+	var received int
+	for received < numEntries {
+		msg, err := sub.NextMsg(time.Second)
+		if err != nil {
+			t.Fatalf("Only received %d of %d catchup entries before stalling: %v", received, numEntries, err)
+		}
+		// The leader must point catchup responses at a dedicated progress inbox, never
+		// at its general append entry inbox, so they can't be counted towards quorum.
+		require_True(t, strings.HasPrefix(msg.Reply, raftCatchupProgressPre))
+
+		cae, err := decodeAppendEntry(msg.Data, nil, msg.Reply)
+		require_NoError(t, err)
+		received++
+
+		par := newAppendEntryResponse(cae.term, cae.pindex+1, nats1, true)
+		require_NoError(t, nc.Publish(msg.Reply, par.encode(nil)))
+		require_NoError(t, nc.Flush())
+		arPool.Put(par)
+
+		// These acks don't go through processAppendEntryResponse, but they must still
+		// count as having heard from the peer. Otherwise, a catchup outlasting
+		// lostQuorumInterval makes us step down, while the follower is responding to us.
+		checkFor(t, time.Second, 10*time.Millisecond, func() error {
+			if n.lostQuorum() {
+				return errors.New("should not have lost quorum, peer is acking catchup progress")
+			}
+			return nil
+		})
+	}
+}
+
+func TestNRGCatchupLargeEntriesProgressesAcrossWindows(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	rg := c.createMemRaftGroup("TEST", 3, newStateAdder)
+	rg.waitOnLeader()
+
+	// The leader keeps at most maxOutstanding (2MB) of catchup entries in flight, so
+	// entries this large mean a catchup spans many send windows. A window can only be
+	// refilled once the follower reports progress on what it already received.
+	const (
+		entrySize  = 512 * 1024
+		numEntries = 64
+	)
+
+	// Take a follower down so it misses everything that follows.
+	follower := rg.nonLeader().(*stateAdder)
+	follower.stop()
+
+	leader := rg.leader().(*stateAdder)
+	for range numEntries {
+		data := make([]byte, entrySize)
+		binary.PutVarint(data, 1)
+		leader.propose(data)
+	}
+	rg.waitOnTotal(t, numEntries)
+
+	// Bring it back with an empty log, it must now be caught up from scratch.
+	follower.restart()
+
+	// Without working catchup flow control the leader pushes one 2MB window and then
+	// stalls out for a couple of seconds before the follower re-requests, which for a
+	// log this size takes the better part of a minute.
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		var err error
+		for _, sm := range rg {
+			asm := sm.(*stateAdder)
+			if total := asm.total(); total != numEntries {
+				err = errors.Join(err, fmt.Errorf("Adder on %v has wrong total: %d vs %d",
+					asm.server(), total, numEntries))
+			}
+		}
+		return err
+	})
+}
+
 func TestNRGIgnoreTrackResponseWhenNotLeader(t *testing.T) {
 	n, cleanup := initSingleMemRaftNode(t)
 	defer cleanup()
@@ -2873,7 +3750,7 @@ func TestNRGIgnoreTrackResponseWhenNotLeader(t *testing.T) {
 	require_Equal(t, n.commit, 0)
 
 	// Normally would commit the entry, but since we're not leader anymore we should ignore it.
-	n.trackResponse(&appendEntryResponse{1, 1, "peer", _EMPTY_, true})
+	n.trackResponse(&appendEntryResponse{term: 1, index: 1, peer: "peer", success: true})
 	require_Equal(t, n.commit, 0)
 }
 
@@ -3338,7 +4215,127 @@ func TestNRGDoesntRequestVoteOnWriteError(t *testing.T) {
 	require_Error(t, err, nats.ErrTimeout)
 }
 
-func TestNRGInitializeAndScaleUp(t *testing.T) {
+func TestNRGTrackPeerObserved(t *testing.T) {
+	n := &raft{managed: true, id: "A", term: 2, peers: map[string]*lps{"A": {}}, leadc: make(chan leadChange, 1), sd: t.TempDir(), dios: defaultDiskIOSemaphore()}
+
+	requireNudge := func() {
+		t.Helper()
+		select {
+		case lc := <-n.leadc:
+			require_True(t, lc.nudge)
+			require_True(t, lc.isLeader)
+			require_Equal(t, lc.term, n.term)
+		default:
+			t.Fatalf("Expected a nudge on leader change channel")
+		}
+	}
+	requireNoSignal := func() {
+		t.Helper()
+		select {
+		case lc := <-n.leadc:
+			t.Fatalf("Unexpected signal on leader change channel: %+v", lc)
+		default:
+		}
+	}
+
+	// Untracked peers of managed groups are observed when we hear from them.
+	require_True(t, n.LastHeardFromFollower("B").IsZero())
+	require_NoError(t, n.trackPeer("B"))
+	require_False(t, n.LastHeardFromFollower("B").IsZero())
+
+	// We're not the leader, so there's nothing to nudge about. Only the leader
+	// can act on a newly observed peer by adding it to the group.
+	requireNoSignal()
+
+	// Members are tracked through their own peer state.
+	require_True(t, n.LastHeardFromFollower("A").IsZero())
+	require_NoError(t, n.trackPeer("A"))
+	require_False(t, n.LastHeardFromFollower("A").IsZero())
+
+	// Once the peer becomes a member, the observed entry moves to its peer state.
+	require_Len(t, len(n.observed), 1)
+	n.addPeer("B")
+	require_Len(t, len(n.observed), 0)
+	require_False(t, n.LastHeardFromFollower("B").IsZero())
+
+	// Removed peers are still observed, as otherwise a peer that's removed
+	// and re-added shortly after will stall until the timer expires.
+	n.removed = map[string]time.Time{"C": time.Now()}
+	require_NoError(t, n.trackPeer("C"))
+	require_False(t, n.LastHeardFromFollower("C").IsZero())
+	requireNoSignal()
+
+	// As leader, first contact with a peer we hadn't observed yet nudges the
+	// upper layer, so it can check right away if this unblocks adding the peer.
+	n.leaderState.Store(true)
+	require_NoError(t, n.trackPeer("D"))
+	require_False(t, n.LastHeardFromFollower("D").IsZero())
+	requireNudge()
+
+	// Only first contact nudges, we'd otherwise signal for every response.
+	require_NoError(t, n.trackPeer("D"))
+	requireNoSignal()
+
+	// Hearing from a member doesn't nudge either, membership doesn't change.
+	require_NoError(t, n.trackPeer("A"))
+	requireNoSignal()
+
+	// A pending leader change must not be replaced by a nudge. The upper layer
+	// re-assesses membership when it processes the leader change anyway.
+	n.Lock()
+	n.updateLeadChange(true)
+	n.Unlock()
+	require_NoError(t, n.trackPeer("E"))
+	select {
+	case lc := <-n.leadc:
+		require_False(t, lc.nudge)
+	default:
+		t.Fatalf("Expected the pending leader change to be preserved")
+	}
+	// The peer is still observed, even though the nudge was dropped.
+	require_False(t, n.LastHeardFromFollower("E").IsZero())
+
+	// Stepping down stops the nudges, we can't act on them anymore.
+	n.leaderState.Store(false)
+	require_NoError(t, n.trackPeer("F"))
+	require_False(t, n.LastHeardFromFollower("F").IsZero())
+	requireNoSignal()
+}
+
+func TestNRGTrackPeerAutoAddOnlyUnmanaged(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	nats1 := "yrzKKRBu" // "nats-1"
+
+	n.state.Store(int32(Leader))
+	require_Equal(t, n.prop.len(), 0)
+
+	// As leader of an unmanaged group, hearing from an unknown peer
+	// proposes adding it to the group automatically.
+	require_NoError(t, n.trackPeer(nats0))
+	require_Equal(t, n.prop.len(), 1)
+	pe, ok := n.prop.popOne()
+	require_True(t, ok)
+	require_Equal(t, pe.Type, EntryAddPeer)
+	require_Equal(t, string(pe.Data), nats0)
+	// Unmanaged groups don't track observed peers.
+	require_Len(t, len(n.observed), 0)
+
+	// As leader of a managed group, the meta layer owns membership.
+	// Hearing from an unknown peer must not propose adding it, only
+	// record it as observed.
+	n.Lock()
+	n.managed = true
+	n.Unlock()
+	require_NoError(t, n.trackPeer(nats1))
+	require_Equal(t, n.prop.len(), 0)
+	require_Len(t, len(n.observed), 1)
+	require_False(t, n.LastHeardFromFollower(nats1).IsZero())
+}
+
+func TestNRGInitializeEmptyVote(t *testing.T) {
 	n, cleanup := initSingleMemRaftNode(t)
 	defer cleanup()
 
@@ -3352,8 +4349,6 @@ func TestNRGInitializeAndScaleUp(t *testing.T) {
 	aeMsg := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 0, pindex: 0, entries: entries})
 
 	require_True(t, n.initializing)
-	n.scaleUp = true
-	n.SetObserver(true)
 	require_Equal(t, n.term, 0)
 
 	voteReply := "$TEST"
@@ -3371,8 +4366,6 @@ func TestNRGInitializeAndScaleUp(t *testing.T) {
 	require_Equal(t, n.term, 1)
 	require_Equal(t, n.vote, nats0)
 	require_True(t, n.initializing)
-	require_True(t, n.scaleUp)
-	require_True(t, n.observer)
 
 	msg, err := sub.NextMsg(time.Second)
 	require_NoError(t, err)
@@ -3380,12 +4373,10 @@ func TestNRGInitializeAndScaleUp(t *testing.T) {
 	require_True(t, vr.granted)
 	require_False(t, vr.empty)
 
-	// Processing an append entry resets scale up and puts us out of observer mode.
+	// Processing an append entry resets initializing.
 	n.processAppendEntry(aeMsg, n.aesub)
 	require_Equal(t, n.pindex, 1)
 	require_False(t, n.initializing)
-	require_False(t, n.scaleUp)
-	require_False(t, n.observer)
 
 	// Simulate a reset.
 	n.resetWAL()
@@ -3405,8 +4396,6 @@ func TestNRGInitializeAndScaleUp(t *testing.T) {
 
 	// Reset to check if snapshot on catchup can also reset this.
 	n.initializing = true
-	n.scaleUp = true
-	n.SetObserver(true)
 	snapshotEntries := []*Entry{
 		newEntry(EntrySnapshot, nil),
 		newEntry(EntryPeerState, encodePeerState(&peerState{n.peerNames(), n.csz, n.extSt})),
@@ -3415,14 +4404,12 @@ func TestNRGInitializeAndScaleUp(t *testing.T) {
 	n.createCatchup(aeSnapshot)
 	n.processAppendEntry(aeSnapshot, n.catchup.sub)
 	require_False(t, n.initializing)
-	require_False(t, n.scaleUp)
-	require_False(t, n.observer)
 
 	// Simulate a reset.
 	n.resetWAL()
 	require_Equal(t, n.pindex, 0)
 
-	// Vote when initializing but not scaling up, must also NOT be an "empty vote".
+	// Vote when initializing must NOT be an "empty vote".
 	n.initializing = true
 	require_NoError(t, n.processVoteRequest(&voteRequest{term: 3, candidate: "_random_", reply: voteReply}))
 	require_Equal(t, n.term, 3)
@@ -3806,6 +4793,136 @@ func TestNRGTruncateOnStartup(t *testing.T) {
 	require_Equal(t, state.NumDeleted, 0)
 }
 
+func TestNRGIgnoresCorruptCommitFile(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	s := c.servers[0] // RunBasicJetStreamServer not available
+	defer c.shutdown()
+
+	storeDir := t.TempDir()
+	fcfg := FileStoreConfig{StoreDir: storeDir, BlockSize: defaultMediumBlockSize, AsyncFlush: false, srv: s}
+	scfg := StreamConfig{Name: "RAFT", Storage: FileStorage}
+	fs, err := newFileStore(fcfg, scfg)
+	require_NoError(t, err)
+
+	cfg := &RaftConfig{Name: "TEST", Store: storeDir, Log: fs, PersistCommit: true}
+
+	err = s.bootstrapRaftNode(cfg, nil, false)
+	require_NoError(t, err)
+	n, err := s.initRaftNode(globalAccountName, cfg, pprofLabels{})
+	require_NoError(t, err)
+
+	restart := func() {
+		t.Helper()
+		n.Stop()
+		n.WaitForStop()
+		// The node's run loop never started, so close the commit file here.
+		n.cf.Close()
+		require_NoError(t, fs.Stop())
+		fs, err = newFileStore(fcfg, scfg)
+		require_NoError(t, err)
+		cfg = &RaftConfig{Name: "TEST", Store: storeDir, Log: fs, PersistCommit: true}
+		n, err = s.initRaftNode(globalAccountName, cfg, pprofLabels{})
+		require_NoError(t, err)
+	}
+
+	// Create a sample entry, the content doesn't matter, just that it's stored.
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	aeMsg1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries})
+	aeMsg2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 1, entries: entries})
+	aeMsg3 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 2, entries: entries})
+	aeHeartbeat := encode(t, &appendEntry{leader: nats0, term: 1, commit: 2, pterm: 1, pindex: 3, entries: nil})
+
+	// The stored entries don't hold the commit, only the heartbeat that isn't stored does.
+	n.processAppendEntry(aeMsg1, n.aesub)
+	n.processAppendEntry(aeMsg2, n.aesub)
+	n.processAppendEntry(aeMsg3, n.aesub)
+	n.processAppendEntry(aeHeartbeat, n.aesub)
+	require_Equal(t, n.pindex, 3)
+	require_Equal(t, n.commit, 2)
+
+	cfn := filepath.Join(storeDir, commitFile)
+	buf, err := os.ReadFile(cfn)
+	require_NoError(t, err)
+	require_Len(t, len(buf), commitLen)
+
+	// A valid commit file restores the commit.
+	restart()
+	require_Equal(t, n.wcommit, 2)
+	require_Equal(t, n.commit, 2)
+
+	// A corrupt commit file is ignored.
+	corrupt := bytes.Clone(buf)
+	corrupt[0] ^= 0xff
+	require_NoError(t, os.WriteFile(cfn, corrupt, defaultFilePerms))
+	restart()
+	require_Equal(t, n.wcommit, 0)
+	require_Equal(t, n.commit, 0)
+
+	// A too short commit file is ignored.
+	require_NoError(t, os.WriteFile(cfn, buf[:8], defaultFilePerms))
+	restart()
+	require_Equal(t, n.wcommit, 0)
+	require_Equal(t, n.commit, 0)
+
+	// The commit file is rewritten once the commit moves up again.
+	n.processAppendEntry(aeHeartbeat, n.aesub)
+	require_Equal(t, n.commit, 2)
+	restart()
+	require_Equal(t, n.wcommit, 2)
+	require_Equal(t, n.commit, 2)
+}
+
+// The commit file is only written for a commit the stored log doesn't already hold.
+func TestNRGCommitFileOnlyWrittenAheadOfLog(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	s := c.servers[0]
+	defer c.shutdown()
+
+	storeDir := t.TempDir()
+	fcfg := FileStoreConfig{StoreDir: storeDir, BlockSize: defaultMediumBlockSize, AsyncFlush: false, srv: s}
+	scfg := StreamConfig{Name: "RAFT", Storage: FileStorage}
+	fs, err := newFileStore(fcfg, scfg)
+	require_NoError(t, err)
+
+	cfg := &RaftConfig{Name: "TEST", Store: storeDir, Log: fs, PersistCommit: true}
+	require_NoError(t, s.bootstrapRaftNode(cfg, nil, false))
+	n, err := s.initRaftNode(globalAccountName, cfg, pprofLabels{})
+	require_NoError(t, err)
+
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	// Each stored entry holds the commit it applies, so nothing is written.
+	for i := uint64(0); i < 3; i++ {
+		pterm := min(i, 1)
+		n.processAppendEntry(encode(t, &appendEntry{leader: nats0, term: 1, commit: i, pterm: pterm, pindex: i, entries: entries}), n.aesub)
+	}
+	require_Equal(t, n.commit, 2)
+	require_Equal(t, n.scommit, 2)
+	require_Equal(t, n.wcommit, 0)
+
+	// A heartbeat's commit isn't stored, so it's written.
+	n.processAppendEntry(encode(t, &appendEntry{leader: nats0, term: 1, commit: 3, pterm: 1, pindex: 3}), n.aesub)
+	require_Equal(t, n.commit, 3)
+	require_Equal(t, n.wcommit, 3)
+
+	// A restart recovers both.
+	n.Stop()
+	n.WaitForStop()
+	n.cf.Close()
+	require_NoError(t, fs.Stop())
+	fs, err = newFileStore(fcfg, scfg)
+	require_NoError(t, err)
+	cfg = &RaftConfig{Name: "TEST", Store: storeDir, Log: fs, PersistCommit: true}
+	n, err = s.initRaftNode(globalAccountName, cfg, pprofLabels{})
+	require_NoError(t, err)
+	require_Equal(t, n.commit, 3)
+}
+
 func TestNRGLeaderCatchupHandling(t *testing.T) {
 	n, cleanup := initSingleMemRaftNode(t)
 	defer cleanup()
@@ -3853,6 +4970,87 @@ func TestNRGLeaderCatchupHandling(t *testing.T) {
 	require_NoError(t, err)
 	require_Equal(t, ae.pterm, 1)
 	require_Equal(t, ae.pindex, 2)
+}
+
+func TestNRGSnapshotOnlyCatchupNotCaughtUpUntilConfirmed(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Create a sample entry, the content doesn't matter, just that it's stored.
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	nats1 := "yrzKKRBu" // "nats-1"
+	for i := range uint64(3) {
+		ae := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: min(i, 1), pindex: i, entries: entries})
+		n.processAppendEntry(ae, n.aesub)
+	}
+	require_Equal(t, n.pindex, 3)
+
+	// Switching to leader stores a peer state entry at index 4.
+	n.term = 1
+	n.switchToLeader()
+	require_Equal(t, n.pindex, 4)
+
+	// Fully compact the log, so catchup only requires sending the snapshot.
+	n.Lock()
+	n.commit = n.pindex
+	n.Unlock()
+	n.Applied(4)
+	require_NoError(t, n.InstallSnapshot(nil, false))
+	var state StreamState
+	n.wal.FastState(&state)
+	require_Equal(t, state.Msgs, 0)
+
+	// The follower was fully caught up.
+	n.Lock()
+	n.peers[nats1] = &lps{ts: time.Now(), li: 4}
+	n.Unlock()
+	require_True(t, n.IsFollowerCaughtUp(nats1))
+
+	// But lost its state and requests a catchup, which only sends the snapshot.
+	n.catchupFollower(newAppendEntryResponse(0, 0, nats1, false))
+	n.RLock()
+	_, ok := n.progress[nats1]
+	n.RUnlock()
+	require_False(t, ok)
+	require_False(t, n.IsFollowerCaughtUp(nats1))
+
+	// Only caught up once the follower confirms it has the snapshot.
+	n.processAppendEntryResponse(newAppendEntryResponse(1, 4, nats1, true))
+	require_True(t, n.IsFollowerCaughtUp(nats1))
+}
+
+func TestNRGLearnerCaughtUpUnderContinuousLoad(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Create a sample entry, the content doesn't matter, just that it's stored.
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+
+	n.managed = true
+	n.switchToLeader()
+	nats1 := "yrzKKRBu" // "nats-1"
+
+	// The learner always acks one entry behind, as the R1 leader commits when storing.
+	for range 3 {
+		n.Lock()
+		require_NoError(t, n.sendAppendEntryLocked(entries, true))
+		require_Equal(t, n.commit, n.pindex)
+		index := n.pindex - 1
+		n.Unlock()
+		n.processAppendEntryResponse(newAppendEntryResponse(n.term, index, nats1, true))
+	}
+	require_True(t, n.IsFollowerCaughtUp(nats1))
+
+	// Once added, the learner keeps its progress as a member.
+	n.Lock()
+	n.addPeer(nats1)
+	require_Len(t, len(n.observed), 0)
+	n.Unlock()
+	require_True(t, n.IsFollowerCaughtUp(nats1))
 }
 
 func TestNRGNewEntriesFromOldLeaderResetsWALDuringCatchup(t *testing.T) {
@@ -3992,6 +5190,54 @@ func TestNRGProcessed(t *testing.T) {
 	require_Equal(t, n.commit, 5)
 	require_Equal(t, n.processed, 4)
 	require_Equal(t, n.applied, 4)
+}
+
+func TestNRGProcessedSingleNodeTriggersEarlyElection(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Simulate a R1 node that recovered committed entries from its log on startup,
+	// but that hasn't observed a leader yet. Only when it has processed everything
+	// up to the commit index should it be allowed to become leader early.
+	n.Lock()
+	n.pterm, n.pindex, n.commit = 1, 3, 3
+	n.Unlock()
+	require_Equal(t, len(n.peers), 1)
+	require_Equal(t, n.leader, noLeader)
+	require_False(t, n.pleader.Load())
+
+	requireElectionTimerFired := func(expected bool) {
+		t.Helper()
+		select {
+		case <-n.elect.C:
+			if !expected {
+				t.Fatalf("Expected election timer to not have fired")
+			}
+		case <-time.After(250 * time.Millisecond):
+			if expected {
+				t.Fatalf("Expected election timer to have fired")
+			}
+		}
+	}
+
+	// Not everything is processed yet, must still wait out the election timeout.
+	n.Processed(1, 0)
+	requireElectionTimerFired(false)
+	n.Processed(2, 1)
+	requireElectionTimerFired(false)
+
+	// Everything up to the commit index is processed, don't wait out the election timeout.
+	n.Processed(3, 2)
+	requireElectionTimerFired(true)
+
+	// Once a leader has been observed, we must not shortcut the election timeout anymore.
+	n.Lock()
+	n.resetElectionTimeout()
+	n.updateLeader(noLeader)
+	n.pleader.Store(true)
+	n.Unlock()
+	n.Processed(3, 3)
+	requireElectionTimerFired(false)
 }
 
 func TestNRGSendAppendEntryNotLeader(t *testing.T) {
@@ -4285,6 +5531,15 @@ func TestNRGSendSnapshotInstallsSnapshot(t *testing.T) {
 	n, cleanup := initSingleMemRaftNode(t)
 	defer cleanup()
 
+	// Provide peer vote interest so the isolation guard permits campaigning.
+	// This test drives the leadership transitions directly.
+	nc, err := nats.Connect(n.s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+	_, err = nc.SubscribeSync(n.vsubj)
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+
 	nats0 := "S1Nunr6R" // "nats-0"
 	nats1 := "yrzKKRBu" // "nats-1"
 
@@ -4309,7 +5564,7 @@ func TestNRGSendSnapshotInstallsSnapshot(t *testing.T) {
 	require_Equal(t, n.snapfile, _EMPTY_)
 
 	// On scaleup, we send a snapshot.
-	require_NoError(t, n.SendSnapshot([]byte("snapshot_data")))
+	require_NoError(t, n.SendSnapshot(n.term, []byte("snapshot_data")))
 	require_Equal(t, n.pindex, 2)
 	require_Equal(t, n.snapfile, _EMPTY_)
 
@@ -5251,7 +6506,7 @@ func TestNRGProposeRemovePeerAll(t *testing.T) {
 	for i, follower := range followers {
 		require_NoError(t, leader.node().ProposeRemovePeer(follower.node().ID()))
 		checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
-			if peers = leader.node().Peers(); len(peers) == 2-i {
+			if n := leader.node(); len(n.Peers()) == 2-i && !n.MembershipChangeInProgress() {
 				return nil
 			}
 			return errors.New("membership still in progress")
@@ -5281,8 +6536,9 @@ func TestNRGLeaderResurrectsRemovedPeers(t *testing.T) {
 
 	// Remove one follower
 	require_NoError(t, leader.node().ProposeRemovePeer(followers[0].node().ID()))
+	// The leader drops the peer when proposing, but only persists it once committed.
 	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
-		if peers := leader.node().Peers(); len(peers) == 2 {
+		if n := leader.node(); len(n.Peers()) == 2 && !n.MembershipChangeInProgress() {
 			return nil
 		}
 		return errors.New("membership still in progress")
@@ -5686,6 +6942,151 @@ func TestNRGInstallSnapshotFromCheckpoint(t *testing.T) {
 	require_Error(t, err, errors.New("snapshot index mismatch"))
 }
 
+// A forced install must be able to take over from an async snapshot that's still in
+// progress, otherwise a shutdown snapshot gets suppressed.
+func TestNRGForcedInstallSnapshotAbortsInProgressCheckpoint(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Create a sample entry, the content doesn't matter, just that it's stored.
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	aeMsg1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries})
+	aeMsg2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1, entries: entries})
+	aeHeartbeat := encode(t, &appendEntry{leader: nats0, term: 1, commit: 2, pterm: 1, pindex: 2})
+
+	n.processAppendEntry(aeMsg1, n.aesub)
+	n.processAppendEntry(aeMsg2, n.aesub)
+	n.processAppendEntry(aeHeartbeat, n.aesub)
+	n.Applied(2)
+
+	// An async snapshot is in progress.
+	c, err := n.CreateSnapshotCheckpoint(false)
+	require_NoError(t, err)
+
+	// Without forcing we can't snapshot, this is what would suppress a shutdown snapshot.
+	require_Error(t, n.InstallSnapshot([]byte("blocked"), false), errSnapInProgress)
+
+	// Forcing installs directly, which aborts the checkpoint that was in progress.
+	require_NoError(t, n.InstallSnapshot([]byte("fresh"), true))
+
+	// The aborted checkpoint must not be able to install or read anything anymore.
+	_, err = c.LoadLastSnapshot()
+	require_Error(t, err, errSnapAborted)
+	_, err = c.InstallSnapshot([]byte("stale"))
+	require_Error(t, err, errSnapAborted)
+
+	// And its late abort must not cancel anything installed after it.
+	c.Abort()
+
+	snap, err := n.loadLastSnapshot()
+	require_NoError(t, err)
+	require_True(t, bytes.Equal(snap.data, []byte("fresh")))
+
+	// The aborted checkpoint targets the same file for the same term/applied index, so
+	// it must not have written anything, not even a temporary file it never renamed.
+	files, err := os.ReadDir(filepath.Join(n.sd, snapshotsDir))
+	require_NoError(t, err)
+	require_Len(t, len(files), 1)
+	require_Equal(t, files[0].Name(), fmt.Sprintf(snapFileT, 1, 2))
+}
+
+// A direct install must wait for a snapshot write that's already in flight. The async
+// install path releases the Raft lock while writing, and both would target the same
+// file, and the same temporary file it's renamed from.
+func TestNRGDirectInstallSnapshotWaitsForInFlightWrite(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Create a sample entry, the content doesn't matter, just that it's stored.
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	aeMsg1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries})
+	aeMsg2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1, entries: entries})
+	aeHeartbeat := encode(t, &appendEntry{leader: nats0, term: 1, commit: 2, pterm: 1, pindex: 2})
+
+	n.processAppendEntry(aeMsg1, n.aesub)
+	n.processAppendEntry(aeMsg2, n.aesub)
+	n.processAppendEntry(aeHeartbeat, n.aesub)
+	n.Applied(2)
+
+	// Stand in for a checkpoint that's in the middle of writing its snapshot file.
+	n.snapLock.Lock()
+
+	installed := make(chan error, 1)
+	go func() {
+		installed <- n.InstallSnapshot([]byte("fresh"), true)
+	}()
+
+	select {
+	case err := <-installed:
+		t.Fatalf("Expected install to wait for the in-flight snapshot write, got %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	n.snapLock.Unlock()
+	require_NoError(t, <-installed)
+
+	snap, err := n.loadLastSnapshot()
+	require_NoError(t, err)
+	require_True(t, bytes.Equal(snap.data, []byte("fresh")))
+}
+
+// An async install must claim the snapshot write lock before it gives up the Raft lock,
+// otherwise a direct install could slip in between its checks and its write.
+func TestNRGCheckpointInstallSnapshotWaitsForInFlightWrite(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Create a sample entry, the content doesn't matter, just that it's stored.
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	aeMsg1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries})
+	aeMsg2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1, entries: entries})
+	aeHeartbeat := encode(t, &appendEntry{leader: nats0, term: 1, commit: 2, pterm: 1, pindex: 2})
+
+	n.processAppendEntry(aeMsg1, n.aesub)
+	n.processAppendEntry(aeMsg2, n.aesub)
+	n.processAppendEntry(aeHeartbeat, n.aesub)
+	n.Applied(2)
+
+	c, err := n.CreateSnapshotCheckpoint(false)
+	require_NoError(t, err)
+
+	snapDir := filepath.Join(n.sd, snapshotsDir)
+
+	// Stand in for another snapshot write that's already in flight.
+	n.snapLock.Lock()
+
+	installed := make(chan error, 1)
+	go func() {
+		_, err := c.InstallSnapshot([]byte("async"))
+		installed <- err
+	}()
+
+	// Must not have written anything yet, not even a temporary file.
+	time.Sleep(250 * time.Millisecond)
+	files, err := os.ReadDir(snapDir)
+	require_NoError(t, err)
+	require_Len(t, len(files), 0)
+
+	n.snapLock.Unlock()
+	require_NoError(t, <-installed)
+
+	snap, err := n.loadLastSnapshot()
+	require_NoError(t, err)
+	require_True(t, bytes.Equal(snap.data, []byte("async")))
+}
+
 func TestNRGSnapshotCheckpointNodeClosed(t *testing.T) {
 	for _, test := range []struct {
 		title string
@@ -5731,6 +7132,67 @@ func TestNRGSnapshotCheckpointNodeClosed(t *testing.T) {
 			require_Equal(t, count, 1) // Must always iterate at least once to retrieve the error.
 			_, err = c.InstallSnapshot(nil)
 			require_Error(t, err, errNodeClosed)
+		})
+	}
+}
+
+func TestNRGDrainAndReplaySnapshotNodeClosed(t *testing.T) {
+	for _, test := range []struct {
+		title  string
+		close  func(n *raft)
+		replay bool
+	}{
+		{title: "Stop", close: func(n *raft) { n.Stop() }, replay: true},
+		{title: "Delete", close: func(n *raft) { n.Delete() }, replay: false},
+	} {
+		t.Run(test.title, func(t *testing.T) {
+			n, cleanup := initSingleMemRaftNode(t)
+			defer cleanup()
+
+			// Create a sample entry, the content doesn't matter, just that it's stored.
+			esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+			entries := []*Entry{newEntry(EntryNormal, esm)}
+
+			nats0 := "S1Nunr6R" // "nats-0"
+
+			// Timeline, the second message ups the pterm so we can snapshot on the first.
+			aeMsg1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries})
+			aeHeartbeat := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1, entries: nil})
+			aeMsg2 := encode(t, &appendEntry{leader: nats0, term: 2, commit: 1, pterm: 1, pindex: 1, entries: entries})
+
+			n.processAppendEntry(aeMsg1, n.aesub)
+			n.processAppendEntry(aeHeartbeat, n.aesub)
+			require_Equal(t, n.commit, 1)
+			n.Applied(1)
+			n.processAppendEntry(aeMsg2, n.aesub)
+
+			// Snapshot, so we have something to replay.
+			require_NoError(t, n.InstallSnapshot(nil, false))
+			require_True(t, n.snapfile != _EMPTY_)
+			sfile := n.snapfile
+			sdata, err := os.ReadFile(sfile)
+			require_NoError(t, err)
+
+			test.close(n)
+
+			if test.replay {
+				require_True(t, n.snapfile != _EMPTY_)
+				require_True(t, n.DrainAndReplaySnapshot())
+				return
+			}
+
+			// Delete must not leave us pointing at a file it just removed.
+			require_Equal(t, n.snapfile, _EMPTY_)
+			require_False(t, n.DrainAndReplaySnapshot())
+
+			// Snapshot filenames are only "snap.<term>.<index>", so a later
+			// incarnation of a same-named group can recreate this exact path.
+			// Even then a deleted node must refuse to replay, or we'd adopt
+			// another generation's state.
+			require_NoError(t, os.MkdirAll(filepath.Dir(sfile), defaultDirPerms))
+			require_NoError(t, os.WriteFile(sfile, sdata, defaultFilePerms))
+			n.snapfile = sfile
+			require_False(t, n.DrainAndReplaySnapshot())
 		})
 	}
 }
@@ -6163,6 +7625,14 @@ func TestNRGDontSwitchToCandidateWithInflightSelfMembershipChange(t *testing.T) 
 	n, cleanup := initSingleMemRaftNode(t)
 	defer cleanup()
 
+	// Provide peer vote interest so only membership state prevents campaigning.
+	nc, err := nats.Connect(n.s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+	_, err = nc.SubscribeSync(n.vsubj)
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+
 	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
 
 	nats0 := "S1Nunr6R" // "nats-0"
@@ -6188,9 +7658,18 @@ func TestNRGDontSwitchToCandidateWithInflightSelfMembershipChange(t *testing.T) 
 	require_Equal(t, n.membChange.index, 2)
 
 	// We must not become a candidate while our own removal is uncommitted.
+	// The election timer firing does mean we've not heard from the leader, so
+	// we must still report as leaderless. Otherwise the upper layer would never
+	// see the group as stuck and could not recover it.
+	n.Lock()
+	n.updateLeader(nats0)
+	n.Unlock()
+	require_False(t, n.Leaderless())
+
 	n.Applied(1)
 	n.switchToCandidate()
 	require_Equal(t, n.State(), Follower)
+	require_True(t, n.Leaderless())
 
 	// Truncate the uncommitted removal back to the committed index. This
 	// restores us to our own peer set and clears the inflight change.
@@ -6204,6 +7683,128 @@ func TestNRGDontSwitchToCandidateWithInflightSelfMembershipChange(t *testing.T) 
 	// Now that we're a settled member again, we can campaign.
 	n.switchToCandidate()
 	require_Equal(t, n.State(), Candidate)
+
+	// A new leader sends our removal again, and this time it commits.
+	require_Equal(t, n.term, 2)
+	aeRemoveSelf = encode(t, &appendEntry{leader: nats0, term: 2, commit: 1, pterm: 1, pindex: 1, entries: []*Entry{newEntry(EntryRemovePeer, []byte(n.id))}})
+	aeHeartbeat := encode(t, &appendEntry{leader: nats0, term: 2, commit: 2, pterm: 2, pindex: 2, entries: nil})
+	n.processAppendEntry(aeRemoveSelf, n.aesub)
+	n.processAppendEntry(aeHeartbeat, n.aesub)
+	require_Equal(t, n.State(), Follower)
+	require_Equal(t, n.commit, 2)
+	n.Applied(2)
+	require_True(t, n.membChange == nil)
+	require_Equal(t, n.csz, 2)
+
+	// We were removed, so we must not campaign, or we'd re-add ourselves as leader.
+	n.switchToCandidate()
+	require_Equal(t, n.State(), Follower)
+}
+
+func TestNRGDontSwitchToCandidateAsManagedNodeOutsidePeerSet(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Provide peer vote interest so only membership state prevents campaigning.
+	nc, err := nats.Connect(n.s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+	_, err = nc.SubscribeSync(n.vsubj)
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	// The meta layer can assign us to a group before the group leader has added
+	// us to the peer set. Simulate the leader's peer state overwriting our
+	// bootstrap peer set with a committed membership that excludes us.
+	n.Lock()
+	n.managed = true
+	n.processPeerState(&peerState{[]string{nats0}, 1, n.extSt})
+	n.Unlock()
+	_, ok := n.peers[n.id]
+	require_False(t, ok)
+
+	// We must not become a candidate while we're not in our own peer set, otherwise
+	// we could become leader outside the peer set and stall membership changes.
+	n.switchToCandidate()
+	require_Equal(t, n.State(), Follower)
+
+	// Receive the leader's peer state that adds us as a committed member.
+	n.Lock()
+	n.processPeerState(&peerState{[]string{nats0, n.id}, 2, n.extSt})
+	n.Unlock()
+	_, ok = n.peers[n.id]
+	require_True(t, ok)
+
+	// Now that we're a member, we can campaign.
+	n.switchToCandidate()
+	require_Equal(t, n.State(), Candidate)
+
+	// An unmanaged group whose peer set is complete without us means we were removed.
+	n.switchToFollower(noLeader)
+	n.Lock()
+	n.managed = false
+	n.processPeerState(&peerState{[]string{nats0}, 1, n.extSt})
+	n.Unlock()
+	_, ok = n.peers[n.id]
+	require_False(t, ok)
+	n.switchToCandidate()
+	require_Equal(t, n.State(), Follower)
+
+	// An unmanaged group can bootstrap with fewer known peers than its cluster size.
+	// We may be missing from it, but must still be able to campaign.
+	n.Lock()
+	n.processPeerState(&peerState{[]string{nats0}, 2, n.extSt})
+	n.Unlock()
+	_, ok = n.peers[n.id]
+	require_False(t, ok)
+	n.switchToCandidate()
+	require_Equal(t, n.State(), Candidate)
+}
+
+func TestNRGManagedVotesForCandidateOutsideStalePeerSet(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	nats1 := "yrzKKRBu" // "nats-1"
+	nats2 := "cnrtt3eg" // "nats-2"
+
+	// We're a lagging member of {nats-0, nats-1, us}, nats-2 was added and nats-0 removed without us seeing it.
+	n.Lock()
+	n.managed = true
+	n.processPeerState(&peerState{[]string{nats0, nats1, n.id}, 3, n.extSt})
+	n.Unlock()
+	_, ok := n.peers[nats2]
+	require_False(t, ok)
+
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+	n.processAppendEntry(encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 0, pindex: 0, entries: entries}), n.aesub)
+	require_Equal(t, n.pindex, 1)
+
+	voteReply := "$TEST"
+	nc, err := nats.Connect(n.s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+	sub, err := nc.SubscribeSync(voteReply)
+	require_NoError(t, err)
+	defer sub.Drain()
+	require_NoError(t, nc.Flush())
+
+	// nats-0 is gone and nats-1 is down, nats-2 needs our vote to become leader.
+	require_NoError(t, n.processVoteRequest(&voteRequest{term: 2, lastTerm: 1, lastIndex: 3, candidate: nats2, reply: voteReply}))
+	msg, err := sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_True(t, decodeVoteResponse(msg.Data).granted)
+	require_Equal(t, n.vote, nats2)
+
+	// A candidate outside our peer set with a log behind ours is still refused.
+	require_NoError(t, n.processVoteRequest(&voteRequest{term: 3, lastTerm: 0, lastIndex: 0, candidate: nats2, reply: voteReply}))
+	msg, err = sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_False(t, decodeVoteResponse(msg.Data).granted)
 }
 
 func TestNRGTrackPeerLag(t *testing.T) {
@@ -6681,6 +8282,293 @@ func TestNRGPausingQuorumCancelsCatchup(t *testing.T) {
 	t.Run("AlreadyPaused", func(t *testing.T) { test(t, true) })
 }
 
+func TestNRGPausedFollowerOverrunPausesQuorum(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	esm := encodeStreamMsgAllowCompress("foo", _EMPTY_, nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	// Applies are paused, like during a stream catchup.
+	require_NoError(t, n.PauseApply())
+
+	// The leader keeps replicating and committing well past the threshold.
+	total := uint64(pauseQuorumThreshold + 10_000)
+	for index := uint64(1); index <= total; index++ {
+		ae := encode(t, &appendEntry{leader: nats0, term: 1, commit: index - 1, pterm: 1, pindex: index - 1, entries: entries})
+		if index == 1 {
+			ae.pterm = 0
+		}
+		n.processAppendEntry(ae, n.aesub)
+	}
+
+	n.RLock()
+	pindex, commit, quorumPaused := n.pindex, n.commit, n.quorumPaused
+	n.RUnlock()
+
+	// The held commits must stop the follower from storing more.
+	// The check sees the previous entry's commit, which itself lags by one.
+	require_Equal(t, commit, 0)
+	require_True(t, quorumPaused)
+	require_Equal(t, pindex, pauseQuorumThreshold+2)
+
+	nc, err := nats.Connect(n.s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+	aeReply := "$TEST"
+	sub, err := nc.SubscribeSync(aeReply)
+	require_NoError(t, err)
+	defer sub.Drain()
+	require_NoError(t, nc.Flush())
+
+	// While quorum is paused, a new entry still gets us to request a newer snapshot.
+	next := encode(t, &appendEntry{leader: nats0, term: 1, commit: total, pterm: 1, pindex: total, entries: entries, reply: aeReply})
+	n.processAppendEntry(next, n.aesub)
+	msg, err := sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_True(t, decodeAppendEntryResponse(msg.Data).snapshot)
+
+	n.RLock()
+	peerstate := encodePeerState(&peerState{n.peerNames(), n.csz, n.extSt})
+	snapsub := n.snapsub
+	n.RUnlock()
+	snapEntries := []*Entry{{EntrySnapshot, []byte("snap")}, {EntryPeerState, peerstate}}
+	leaderSnapshot := func(index uint64) *appendEntry {
+		return encode(t, &appendEntry{leader: nats0, term: 1, commit: total, pterm: 1, pindex: index, entries: snapEntries})
+	}
+
+	// A snapshot within our log can keep quorum paused, while holding less than we'd normally request at.
+	snapIndex := pindex - paeWarnThreshold - 5_000
+	n.processAppendEntry(leaderSnapshot(snapIndex), snapsub)
+	n.Lock()
+	papplied := n.papplied
+	// Skip waiting for the request interval.
+	n.snapreq = time.Time{}
+	n.Unlock()
+	require_Equal(t, papplied, snapIndex)
+	require_LessThan(t, pindex-papplied, paeDropThreshold)
+
+	// We keep requesting while quorum is paused.
+	next = encode(t, &appendEntry{leader: nats0, term: 1, commit: total, pterm: 1, pindex: total, entries: entries, reply: aeReply})
+	n.processAppendEntry(next, n.aesub)
+	msg, err = sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	ar := decodeAppendEntryResponse(msg.Data)
+	require_True(t, ar.snapshot)
+	require_Equal(t, ar.index, snapIndex)
+	n.RLock()
+	quorumPaused = n.quorumPaused
+	n.RUnlock()
+	require_True(t, quorumPaused)
+
+	// The leader's snapshot is past our log, our log restarts at it.
+	n.processAppendEntry(leaderSnapshot(total), snapsub)
+
+	// The next entry resumes quorum and follows the snapshot.
+	next = encode(t, &appendEntry{leader: nats0, term: 1, commit: total, pterm: 1, pindex: total, entries: entries, reply: aeReply})
+	n.processAppendEntry(next, n.aesub)
+	msg, err = sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_True(t, decodeAppendEntryResponse(msg.Data).success)
+	n.RLock()
+	pindex, quorumPaused = n.pindex, n.quorumPaused
+	n.RUnlock()
+	require_False(t, quorumPaused)
+	require_Equal(t, pindex, total+1)
+
+	// Resuming applies the snapshot instead of replaying the held commits.
+	n.ResumeApply()
+	ces := n.apply.pop()
+	require_Len(t, len(ces), 1)
+	require_Equal(t, ces[0].Index, total)
+	require_Equal(t, ces[0].Entries[0].Type, EntrySnapshot)
+}
+
+func TestNRGPausedFollowerRequestsLeaderSnapshot(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	esm := encodeStreamMsgAllowCompress("foo", _EMPTY_, nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	nc, err := nats.Connect(n.s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+
+	aeReply, snapReply := "$TEST", "$TEST.snap"
+	sub, err := nc.SubscribeSync(aeReply)
+	require_NoError(t, err)
+	defer sub.Drain()
+	ssub, err := nc.SubscribeSync(snapReply)
+	require_NoError(t, err)
+	defer ssub.Drain()
+	require_NoError(t, nc.Flush())
+
+	// Applies are paused, like during a stream catchup.
+	require_NoError(t, n.PauseApply())
+
+	// The leader keeps replicating and committing past the request threshold.
+	// Only the last entry gets a reply, which carries our request.
+	total := uint64(paeDropThreshold + 1)
+	for index := uint64(1); index <= total; index++ {
+		ae := &appendEntry{leader: nats0, term: 1, commit: index - 1, pterm: 1, pindex: index - 1, entries: entries}
+		if index == 1 {
+			ae.pterm = 0
+		}
+		if index == total {
+			ae.reply = aeReply
+		}
+		n.processAppendEntry(encode(t, ae), n.aesub)
+	}
+
+	// We ask for a snapshot past ours, to be sent to our inbox.
+	msg, err := sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_Equal(t, len(msg.Data), snapshotRequestLen)
+	ar := decodeAppendEntryResponse(msg.Data)
+	require_True(t, ar.snapshot)
+	require_False(t, ar.success)
+	require_Equal(t, ar.index, 0)
+	n.RLock()
+	snapInbox := string(n.snapsub.subject)
+	n.RUnlock()
+	require_Equal(t, msg.Reply, snapInbox)
+
+	// The entry's own response still follows.
+	msg, err = sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_True(t, decodeAppendEntryResponse(msg.Data).success)
+
+	// The leader's snapshot arrives on our inbox and is installed.
+	n.RLock()
+	peerstate := encodePeerState(&peerState{n.peerNames(), n.csz, n.extSt})
+	snapsub := n.snapsub
+	n.RUnlock()
+	snapIndex := total / 2
+	snapEntries := []*Entry{{EntrySnapshot, []byte("snap")}, {EntryPeerState, peerstate}}
+	n.processAppendEntry(encode(t, &appendEntry{leader: nats0, term: 1, commit: total - 1, pterm: 1, pindex: snapIndex, entries: snapEntries}), snapsub)
+	n.RLock()
+	papplied := n.papplied
+	n.RUnlock()
+	require_Equal(t, papplied, snapIndex)
+
+	// Resuming stops listening for snapshots.
+	n.ResumeApply()
+	n.RLock()
+	snapsub = n.snapsub
+	n.RUnlock()
+	require_True(t, snapsub == nil)
+
+	// As leader, a request only gets our snapshot if it's past theirs.
+	n.switchToLeader()
+	n.RLock()
+	term := n.term
+	n.RUnlock()
+	request := func(index uint64) {
+		ar := newAppendEntryResponse(term, index, nats0, false)
+		ar.snapshot, ar.reply = true, snapReply
+		n.processAppendEntryResponse(ar)
+	}
+	request(snapIndex)
+	_, err = ssub.NextMsg(250 * time.Millisecond)
+	require_Error(t, err, nats.ErrTimeout)
+
+	request(0)
+	msg, err = ssub.NextMsg(time.Second)
+	require_NoError(t, err)
+	sae, err := decodeAppendEntry(msg.Data, nil, _EMPTY_)
+	require_NoError(t, err)
+	require_Equal(t, sae.pterm, 1)
+	require_Equal(t, sae.pindex, snapIndex)
+	require_Len(t, len(sae.entries), 2)
+	require_Equal(t, sae.entries[0].Type, EntrySnapshot)
+	require_Equal(t, string(sae.entries[0].Data), "snap")
+}
+
+func TestNRGPausedFollowerProcessSnapshotResponse(t *testing.T) {
+	for _, test := range []struct {
+		title    string
+		pterm    uint64
+		pindex   uint64
+		resumed  bool
+		papplied uint64   // Zero if the snapshot is ignored.
+		queued   []uint64 // Indexes queued once we resume.
+	}{
+		{title: "CommittedTermMismatch", pterm: 2, pindex: 7, queued: []uint64{5, 6, 7, 8, 9}},
+		// Entry 10 is past our held commit of 9, so it's replaced by the snapshot.
+		{title: "UncommittedTermMismatch", pterm: 2, pindex: 10, papplied: 10, queued: []uint64{10}},
+		{title: "AtCommit", pterm: 1, pindex: 4, queued: []uint64{5, 6, 7, 8, 9}},
+		// Past our commit of 9 after resuming.
+		{title: "NotPaused", pterm: 1, pindex: 10, resumed: true},
+		{title: "WithinLog", pterm: 1, pindex: 7, papplied: 7, queued: []uint64{7, 8, 9}},
+		{title: "PastLog", pterm: 1, pindex: 100, papplied: 100, queued: []uint64{100}},
+	} {
+		t.Run(test.title, func(t *testing.T) {
+			n, cleanup := initSingleMemRaftNode(t)
+			defer cleanup()
+
+			esm := encodeStreamMsgAllowCompress("foo", _EMPTY_, nil, nil, 0, 0, true)
+			entries := []*Entry{newEntry(EntryNormal, esm)}
+			nats0 := "S1Nunr6R" // "nats-0"
+
+			// Stores the entry after pindex, the leader's commit lags it by one.
+			store := func(pindex uint64) {
+				ae := &appendEntry{leader: nats0, term: 1, commit: pindex, pterm: 1, pindex: pindex, entries: entries}
+				// There's no term before the first entry.
+				if pindex == 0 {
+					ae.pterm = 0
+				}
+				n.processAppendEntry(encode(t, ae), n.aesub)
+			}
+			// Entries 1-5 with commits up to 4 are applied.
+			for pindex := range uint64(5) {
+				store(pindex)
+			}
+			// Entries 6-10 with commits up to 9 are held while paused.
+			require_NoError(t, n.PauseApply())
+			for pindex := uint64(5); pindex < 10; pindex++ {
+				store(pindex)
+			}
+			if test.resumed {
+				n.ResumeApply()
+			}
+			n.apply.drain()
+
+			n.RLock()
+			peerstate := encodePeerState(&peerState{n.peerNames(), n.csz, n.extSt})
+			n.RUnlock()
+			snapEntries := []*Entry{{EntrySnapshot, []byte("snap")}, {EntryPeerState, peerstate}}
+			sae := encode(t, &appendEntry{leader: nats0, term: 1, commit: 9, pterm: test.pterm, pindex: test.pindex, entries: snapEntries})
+
+			var state StreamState
+			n.Lock()
+			n.processSnapshotResponseLocked(sae)
+			papplied, pindex := n.papplied, n.pindex
+			n.wal.FastState(&state)
+			n.Unlock()
+
+			// Our log still ends at 10, unless it restarts at a snapshot past it.
+			// An installed snapshot compacts it up to the snapshot.
+			require_Equal(t, papplied, test.papplied)
+			require_Equal(t, pindex, max(10, test.papplied))
+			require_Equal(t, state.FirstSeq, test.papplied+1)
+			if test.resumed {
+				return
+			}
+
+			// Resuming applies an installed snapshot first, then replays the held commits after it.
+			n.ResumeApply()
+			var queued []uint64
+			for _, ce := range n.apply.pop() {
+				queued = append(queued, ce.Index)
+			}
+			require_True(t, slices.Equal(queued, test.queued))
+		})
+	}
+}
+
 func TestNRGApplyCommitDoesNotResetWALAtSnapshotBoundary(t *testing.T) {
 	n, cleanup := initSingleMemRaftNode(t)
 	defer cleanup()
@@ -6798,7 +8686,7 @@ func TestNRGReset(t *testing.T) {
 
 	// Add another peer in addition to ourselves.
 	other := nats1
-	n.peers[other] = &lps{time.Time{}, 0}
+	n.peers[other] = &lps{}
 	n.adjustClusterSizeAndQuorum()
 	n.updateLeader(other)
 
@@ -6813,7 +8701,7 @@ func TestNRGReset(t *testing.T) {
 	n.snapfile = sfile
 
 	// Push something onto each queue so we can verify they are drained.
-	_, err := n.prop.push(&proposedEntry{&Entry{}, _EMPTY_})
+	_, err := n.prop.push(&proposedEntry{Entry: &Entry{}, reply: _EMPTY_})
 	require_NoError(t, err)
 	_, err = n.entry.push(&appendEntry{})
 	require_NoError(t, err)
@@ -6994,11 +8882,26 @@ func TestNRGCatchupRerequestDoesNotOrphanProgressQueue(t *testing.T) {
 
 	// Follower requests a catchup, which starts a catchup run that blocks
 	// waiting for index updates after sending up to 2MB of entries.
+	nc, err := nats.Connect(n.s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+	sub, err := nc.SubscribeSync("$NRG.CR.TEST.1")
+	require_NoError(t, err)
+	defer sub.Drain()
+	require_NoError(t, nc.Flush())
+
 	n.catchupFollower(&appendEntryResponse{term: 1, index: 0, peer: nats1, reply: "$NRG.CR.TEST.1"})
 	n.RLock()
 	q1 := n.progress[nats1]
 	n.RUnlock()
 	require_True(t, q1 != nil)
+
+	// Grab the progress inbox of the first run, its subscription going away is
+	// how we know the run's deferred cleanup has completed.
+	pmsg, err := sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	progressInbox := pmsg.Reply
+	require_True(t, strings.HasPrefix(progressInbox, "$NRG.CP."))
 
 	// Wait for the first run to consume the initial index update, so we know
 	// it has started and captured its view of the last index (4) before we
@@ -7025,11 +8928,9 @@ func TestNRGCatchupRerequestDoesNotOrphanProgressQueue(t *testing.T) {
 	require_True(t, q2 != nil)
 	require_True(t, q1 != q2)
 
-	// Wait for the first run's deferred cleanup. On exit it proposes adding
-	// the (unknown) peer, which is observable on the proposal queue since the
-	// run loop isn't started in this test.
-	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
-		if n.prop.len() == 0 {
+	// Wait for the first run's deferred cleanup, which unsubscribes its progress inbox.
+	checkFor(t, 5*time.Second, 10*time.Millisecond, func() error {
+		if r := n.s.SystemAccount().sl.Match(progressInbox); len(r.psubs) > 0 {
 			return errors.New("first catchup run still active")
 		}
 		return nil
@@ -7042,6 +8943,150 @@ func TestNRGCatchupRerequestDoesNotOrphanProgressQueue(t *testing.T) {
 	q := n.progress[nats1]
 	n.RUnlock()
 	require_True(t, q == q2)
+}
+
+func TestNRGCatchupRerequestLosesCatchupSignal(t *testing.T) {
+	test := func(t *testing.T, stall bool) {
+		n, cleanup := initSingleMemRaftNode(t)
+		defer cleanup()
+
+		esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+		entries := []*Entry{newEntry(EntryNormal, esm)}
+
+		nats0 := "S1Nunr6R" // "nats-0"
+
+		// One committed entry, so we have some log.
+		n.processAppendEntry(encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries}), n.aesub)
+		n.processAppendEntry(encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1}), n.aesub)
+		require_Equal(t, n.commit, 1)
+
+		// Leader is at 5, we're at 1, so request a catchup.
+		n.processAppendEntry(encode(t, &appendEntry{leader: nats0, term: 1, commit: 5, pterm: 1, pindex: 5, entries: entries}), n.aesub)
+		require_True(t, n.catchup != nil)
+		require_False(t, n.catchup.signal)
+		require_Equal(t, n.catchup.cindex, 5)
+
+		// Snapshot at 3 installs and signals the upper layer.
+		n.RLock()
+		ps := encodePeerState(&peerState{n.peerNames(), n.csz, n.extSt})
+		n.RUnlock()
+		aeSnap := encode(t, &appendEntry{leader: nats0, term: 1, commit: 3, pterm: 1, pindex: 3,
+			entries: []*Entry{{EntrySnapshot, []byte("snapshot")}, {EntryPeerState, ps}}})
+		n.processAppendEntry(aeSnap, n.catchup.sub)
+		require_Equal(t, n.pindex, 3)
+		require_True(t, n.catchup != nil)
+		require_True(t, n.catchup.signal)
+
+		if stall {
+			// No progress for 2s, so the catchup is stalled and re-requested.
+			hb := encode(t, &appendEntry{leader: nats0, term: 1, commit: 5, pterm: 1, pindex: 5})
+			n.processAppendEntry(hb, n.aesub)
+			require_True(t, n.catchup != nil)
+			n.Lock()
+			n.catchup.active = time.Now().Add(-3 * time.Second)
+			n.Unlock()
+			n.processAppendEntry(hb, n.aesub)
+			require_True(t, n.catchup != nil)
+			require_True(t, n.catchup.signal)
+		}
+
+		// Catchup entries 4 and 5 carry the leader's old commit, so we don't re-signal.
+		n.processAppendEntry(encode(t, &appendEntry{leader: nats0, term: 1, commit: 3, pterm: 1, pindex: 3, entries: entries}), n.catchup.sub)
+		n.processAppendEntry(encode(t, &appendEntry{leader: nats0, term: 1, commit: 3, pterm: 1, pindex: 4, entries: entries}), n.catchup.sub)
+		require_Equal(t, n.pindex, 5)
+		require_Equal(t, n.commit, 3)
+
+		// We're current now, the catchup is canceled.
+		n.processAppendEntry(encode(t, &appendEntry{leader: nats0, term: 1, commit: 5, pterm: 1, pindex: 5}), n.aesub)
+		require_True(t, n.catchup == nil)
+		require_Equal(t, n.commit, 5)
+
+		// Must have seen EntryCatchup followed by nil.
+		var sawCatchup, sawDone bool
+		for _, ce := range n.apply.pop() {
+			if ce == nil {
+				if sawCatchup {
+					sawDone = true
+				}
+				continue
+			}
+			for _, e := range ce.Entries {
+				if e.Type == EntryCatchup {
+					sawCatchup = true
+				}
+			}
+		}
+		require_True(t, sawCatchup)
+		require_True(t, sawDone)
+	}
+
+	t.Run("NoStall", func(t *testing.T) { test(t, false) })
+	t.Run("Stall", func(t *testing.T) { test(t, true) })
+}
+
+func TestNRGCatchupDoesNotAddPeerOnCompletion(t *testing.T) {
+	nats0 := "S1Nunr6R" // "nats-0"
+	nats1 := "yrzKKRBu" // "nats-1"
+
+	for _, test := range []struct {
+		title   string
+		prepare func(n *raft)
+	}{
+		{
+			title: "Managed",
+			// The meta layer owns membership, the group must never add peers itself.
+			prepare: func(n *raft) { n.managed = true },
+		},
+		{
+			title: "Removed",
+			// The peer was just removed, catching it up must not bring it back.
+			prepare: func(n *raft) { n.removed = map[string]time.Time{nats1: time.Now()} },
+		},
+		{
+			title: "Unmanaged",
+			// Even here the catchup itself doesn't add, hearing from the peer does.
+			prepare: func(n *raft) {},
+		},
+	} {
+		t.Run(test.title, func(t *testing.T) {
+			n, cleanup := initSingleMemRaftNode(t)
+			defer cleanup()
+
+			// Create a sample entry, the content doesn't matter, just that it's stored.
+			esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+			entries := []*Entry{newEntry(EntryNormal, esm)}
+			aeMsg := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries})
+			require_NoError(t, n.storeToWAL(aeMsg))
+
+			n.Lock()
+			test.prepare(n)
+			n.term = 1
+			n.Unlock()
+			n.switchToLeader()
+
+			// The run loop isn't started in this test, so proposals stay observable.
+			n.prop.drain()
+
+			// Catch up a peer that is not a member of the group. The catchup has the
+			// whole WAL available, so it runs to completion on its own.
+			n.catchupFollower(&appendEntryResponse{term: 1, index: 0, peer: nats1, reply: "$NRG.CR.TEST.1"})
+			checkFor(t, 5*time.Second, 10*time.Millisecond, func() error {
+				n.RLock()
+				defer n.RUnlock()
+				if n.progress[nats1] != nil {
+					return errors.New("catchup still running")
+				}
+				return nil
+			})
+
+			// Finishing the catchup must not have proposed the peer into the group.
+			require_Equal(t, n.prop.len(), 0)
+			n.RLock()
+			_, isPeer := n.peers[nats1]
+			n.RUnlock()
+			require_False(t, isPeer)
+		})
+	}
 }
 
 func TestNRGCatchupFollowerNoWaitGroupLeakWhenGoRoutineFails(t *testing.T) {
@@ -7158,7 +9203,9 @@ func TestNRGPartitionedPeerRemove(t *testing.T) {
 	hub, rg := c.createMockMemRaftGroup("MOCK", 2, newStateAdder)
 	defer hub.healPartitions()
 
-	leader := rg.waitOnLeader().node()
+	leaderSM := rg.waitOnLeader()
+	require_NotNil(t, leaderSM)
+	leader := leaderSM.node()
 	require_Equal(t, leader.ClusterSize(), 2)
 	require_Equal(t, len(rg.followers()), 1)
 	follower := rg.followers()[0].node()
@@ -7208,6 +9255,71 @@ func TestNRGPartitionedPeerRemove(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+func TestNRGIsolatedNodeDoesNotCampaign(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	hub, rg := c.createMockMemRaftGroup("MOCK", 3, newStateAdder)
+	defer hub.healPartitions()
+
+	leader := rg.waitOnLeader()
+	require_NotNil(t, leader)
+	isolated := rg.followers()[0].node().(*raft)
+	require_NotEqual(t, isolated.ID(), leader.node().ID())
+	require_False(t, isolated.Leader())
+	require_Equal(t, isolated.State(), Follower)
+	leaderTerm := leader.node().Term()
+	require_Equal(t, isolated.Term(), leaderTerm)
+	hub.partition(isolated.ID(), 1)
+
+	var requests atomic.Int64
+	hub.setAfterMsgHook(func(subject, reply string, msg []byte) {
+		if subject != isolated.vsubj {
+			return
+		}
+		vr := decodeVoteRequest(msg, reply)
+		if vr != nil && vr.candidate == isolated.ID() {
+			requests.Add(1)
+		}
+	})
+
+	initialTerm := isolated.Term()
+	require_NoError(t, isolated.CampaignImmediately())
+	isolated.RLock()
+	campaignReset := isolated.etlr
+	isolated.RUnlock()
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		isolated.RLock()
+		retried := isolated.etlr.After(campaignReset)
+		isolated.RUnlock()
+		if !retried {
+			return errors.New("isolated node has not handled its campaign timeout")
+		}
+		return nil
+	})
+	require_Equal(t, isolated.State(), Follower)
+	require_Equal(t, isolated.Term(), initialTerm)
+	require_Equal(t, requests.Load(), int64(0))
+
+	// Heal the node and have the current leader contact it. Since the isolated
+	// node never campaigned, it should rejoin as a follower in the same term.
+	hub.heal(isolated.ID())
+	leader.node().(*raft).sendHeartbeat()
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		if isolated.GroupLeader() != leader.node().ID() {
+			return errors.New("healed node has not recognized the current leader")
+		}
+		return nil
+	})
+	require_True(t, leader.node().Leader())
+	require_Equal(t, leader.node().Term(), leaderTerm)
+	require_Equal(t, isolated.State(), Follower)
+	require_Equal(t, isolated.Term(), leaderTerm)
+
+	leader.(*stateAdder).proposeDelta(1)
+	rg.waitOnTotal(t, 1)
 }
 
 func TestNRGPeerAddAndPartitionLeader(t *testing.T) {
@@ -7406,4 +9518,2126 @@ func TestNRGRemovedPeerVoteDoesNotElectLeader(t *testing.T) {
 		t.Fatalf("removed peer %q helped elect second leader %q while %q was leader",
 			nodeD.node().ID(), nodeC.node().ID(), nodeA.node().ID())
 	}
+}
+
+// rescueStoreEntry stores a single entry so the node's log is non-empty, and
+// clears the notion of a leader again so a rescue can be applied.
+func rescueStoreEntry(t *testing.T, n *raft) {
+	t.Helper()
+	nats0 := "S1Nunr6R" // "nats-0"
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+	aeMsg := encode(t, &appendEntry{leader: nats0, term: 1, lterm: 1, commit: 0, pterm: 0, pindex: 0, entries: entries})
+	n.processAppendEntry(aeMsg, n.aesub)
+	require_Equal(t, n.pindex, 1)
+	n.Lock()
+	n.updateLeader(noLeader)
+	n.Unlock()
+}
+
+func TestNRGRescueQuorum(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	// Pretend to be part of a 5-node group.
+	n.csz, n.qn = 5, 3
+
+	// Invalid quorum sizes, the quorum can only be lowered.
+	_, _, err := n.RescueQuorum(0)
+	require_Error(t, err, errRescueBadQuorum)
+	_, _, err = n.RescueQuorum(4)
+	require_Error(t, err, errRescueBadQuorum)
+
+	// Reject if we know of a current leader.
+	n.leader = nats0
+	_, _, err = n.RescueQuorum(2)
+	require_Error(t, err, errRescueLeaderKnown)
+	n.leader = noLeader
+
+	// Reject if we are not a voting member.
+	n.observer = true
+	_, _, err = n.RescueQuorum(2)
+	require_Error(t, err, errRescueNotVoting)
+	n.observer = false
+
+	lp := n.peers[n.id]
+	delete(n.peers, n.id)
+	_, _, err = n.RescueQuorum(2)
+	require_Error(t, err, errRescueNotVoting)
+	n.peers[n.id] = lp
+
+	// Reject while our own log is still empty.
+	_, _, err = n.RescueQuorum(2)
+	require_Error(t, err, errRescueEmptyLog)
+	rescueStoreEntry(t, n)
+
+	// A quorum equal to the current effective quorum also applies, arming
+	// the rescue without changing the quorum.
+	prev, cur, err := n.RescueQuorum(3)
+	require_NoError(t, err)
+	require_Equal(t, prev, 3)
+	require_Equal(t, cur, 3)
+	require_Equal(t, n.qn, 3)
+	require_True(t, n.rescue != nil)
+
+	// Lower the quorum.
+	prev, cur, err = n.RescueQuorum(2)
+	require_NoError(t, err)
+	require_Equal(t, prev, 3)
+	require_Equal(t, cur, 2)
+	require_Equal(t, n.qn, 2)
+	require_True(t, n.rescue != nil)
+
+	// And lower it further.
+	prev, cur, err = n.RescueQuorum(1)
+	require_NoError(t, err)
+	require_Equal(t, prev, 2)
+	require_Equal(t, cur, 1)
+	require_Equal(t, n.qn, 1)
+	require_True(t, n.rescue != nil)
+
+	// The rescued quorum is now the effective quorum, it can't be raised.
+	_, _, err = n.RescueQuorum(2)
+	require_Error(t, err, errRescueBadQuorum)
+	require_Equal(t, n.qn, 1)
+	n.Lock()
+	n.rescue.Stop()
+	n.rescue = nil
+	n.Unlock()
+}
+
+func TestNRGRescueQuorumRecalc(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	rescueStoreEntry(t, n)
+	n.csz, n.qn = 5, 3
+	_, _, err := n.RescueQuorum(2)
+	require_NoError(t, err)
+
+	// Peer set changes that would recompute quorum above the rescued
+	// value keep the rescued quorum.
+	n.Lock()
+	n.csz = 4
+	n.recalcQuorum()
+	n.Unlock()
+	require_Equal(t, n.qn, 2)
+	require_True(t, n.rescue != nil)
+
+	// Once the natural quorum reaches the rescued value the rescue is
+	// automatically stopped.
+	n.Lock()
+	n.csz = 2
+	n.recalcQuorum()
+	n.Unlock()
+	require_Equal(t, n.qn, 2)
+	require_True(t, n.rescue == nil)
+
+	// With the rescue stopped, quorum recalculation applies as usual.
+	n.Lock()
+	n.csz = 1
+	n.recalcQuorum()
+	n.Unlock()
+	require_Equal(t, n.qn, 1)
+	require_True(t, n.rescue == nil)
+}
+
+func TestNRGRescueQuorumKeptOnPeerState(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	nats1 := "yrzKKRBu" // "nats-1"
+
+	rescueStoreEntry(t, n)
+	n.csz, n.qn = 3, 2
+	_, _, err := n.RescueQuorum(1)
+	require_NoError(t, err)
+
+	// A peer state update from a newly elected leader must not undo the rescue.
+	n.Lock()
+	n.processPeerState(&peerState{knownPeers: []string{n.id, nats0, nats1}, clusterSize: 3})
+	n.Unlock()
+	require_Equal(t, n.csz, 3)
+	require_Equal(t, n.qn, 1)
+	require_True(t, n.rescue != nil)
+	n.Lock()
+	n.rescue.Stop()
+	n.rescue = nil
+	n.Unlock()
+}
+
+func TestNRGRescueQuorumExpires(t *testing.T) {
+	rescueQuorumTimeout = 100 * time.Millisecond
+	defer func() { rescueQuorumTimeout = rescueQuorumTimeoutDefault }()
+
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	rescueStoreEntry(t, n)
+	n.csz, n.qn = 5, 3
+	_, _, err := n.RescueQuorum(2)
+	require_NoError(t, err)
+	require_Equal(t, n.qn, 2)
+
+	// When the rescue expires the natural quorum is restored.
+	checkFor(t, 2*time.Second, 25*time.Millisecond, func() error {
+		n.RLock()
+		defer n.RUnlock()
+		if n.rescue != nil {
+			return fmt.Errorf("rescue still active")
+		}
+		if n.qn != 3 {
+			return fmt.Errorf("expected quorum restored to 3, got %d", n.qn)
+		}
+		return nil
+	})
+}
+
+func TestNRGRescueQuorumCountsEmptyVotes(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	// Store an entry so our own log is non-empty.
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+	aeMsg := encode(t, &appendEntry{leader: nats0, term: 1, lterm: 1, commit: 0, pterm: 0, pindex: 0, entries: entries})
+	n.processAppendEntry(aeMsg, n.aesub)
+	require_Equal(t, n.pindex, 1)
+
+	// Pretend to be part of a 5-node group that can't elect a leader anymore,
+	// and rescue the quorum down to 2. The peer must be added first, adding
+	// it adjusts the cluster size to the known peers.
+	n.Lock()
+	n.addPeer(nats0)
+	n.csz, n.qn = 5, 3
+	n.updateLeader(noLeader)
+	n.Unlock()
+	_, cur, err := n.RescueQuorum(2)
+	require_NoError(t, err)
+	require_Equal(t, cur, 2)
+
+	// The other survivor grants its vote, but has an empty log.
+	nc, err := nats.Connect(n.s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+	sub, err := nc.Subscribe(n.vsubj, func(m *nats.Msg) {
+		req := decodeVoteRequest(m.Data, m.Reply)
+		resp := voteResponse{term: req.term, peer: nats0, granted: true, empty: true}
+		m.Respond(resp.encode())
+	})
+	require_NoError(t, err)
+	defer sub.Drain()
+	require_NoError(t, nc.Flush())
+
+	// During an active rescue an empty grant counts toward quorum for a
+	// candidate with a non-empty log, so we must win the election.
+	n.switchToCandidate()
+	require_Equal(t, n.State(), Candidate)
+	n.runAsCandidate()
+	require_Equal(t, n.State(), Leader)
+
+	n.Lock()
+	n.rescue.Stop()
+	n.rescue = nil
+	n.Unlock()
+}
+
+func TestNRGRescueQuorumEmptyVotesRequireRescue(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	// Store an entry so our own log is non-empty.
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+	aeMsg := encode(t, &appendEntry{leader: nats0, term: 1, lterm: 1, commit: 0, pterm: 0, pindex: 0, entries: entries})
+	n.processAppendEntry(aeMsg, n.aesub)
+	require_Equal(t, n.pindex, 1)
+
+	// Pretend to be part of a 5-node group with the same lowered quorum as an
+	// active rescue would apply, but without arming the rescue itself. The
+	// peer must be added first, adding it adjusts the cluster size to the
+	// known peers.
+	n.Lock()
+	n.addPeer(nats0)
+	n.csz, n.qn = 5, 2
+	n.updateLeader(noLeader)
+	n.Unlock()
+
+	// The other server grants its vote, but has an empty log.
+	nc, err := nats.Connect(n.s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+	sub, err := nc.Subscribe(n.vsubj, func(m *nats.Msg) {
+		req := decodeVoteRequest(m.Data, m.Reply)
+		resp := voteResponse{term: req.term, peer: nats0, granted: true, empty: true}
+		m.Respond(resp.encode())
+	})
+	require_NoError(t, err)
+	defer sub.Drain()
+	require_NoError(t, nc.Flush())
+
+	// Without an active rescue, empty grants never count toward quorum.
+	// The election times out instead.
+	n.switchToCandidate()
+	require_Equal(t, n.State(), Candidate)
+	n.runAsCandidate()
+	require_NotEqual(t, n.State(), Leader)
+}
+
+func TestNRGEntryBytesEstimate(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	n.Lock()
+	defer n.Unlock()
+
+	const largeEntryBytes = 512 * 1024
+	for _, test := range []struct {
+		name     string
+		pindex   uint64
+		papplied uint64
+		bytes    uint64
+		entries  uint64
+		expected uint64
+	}{
+		{"no entries in the wal", 0, 0, 0, 100, 0},
+		{"no bytes in the wal", 1000, 0, 0, 100, 0},
+		{"pindex equals papplied", 1000, 1000, 1024, 100, 0},
+		{"large entries", 1000, 0, 1000 * largeEntryBytes, 100, 100 * largeEntryBytes},
+		{"small entries", 1000, 0, 1000 * 1024, 100, 100 * 1024},
+		{"offset by papplied", 1500, 500, 1000 * largeEntryBytes, 100, 100 * largeEntryBytes},
+		{"asking for more than we hold", 1000, 0, 1000 * largeEntryBytes, 2000, 2000 * largeEntryBytes},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			n.pindex, n.papplied, n.bytes = test.pindex, test.papplied, test.bytes
+			require_Equal(t, n.entryBytes(test.entries), test.expected)
+		})
+	}
+}
+
+func TestNRGOverrunUsesBytesWhenEntryCountIsLow(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	n.Lock()
+	defer n.Unlock()
+
+	// A backlog of large entries. The entry count stays two orders of magnitude
+	// below the count threshold the whole time, so only the byte threshold can
+	// catch this.
+	const largeEntryBytes = 512 * 1024
+	setAverage := func(entries, avg uint64) {
+		n.papplied, n.pindex, n.bytes = 0, entries, entries*avg
+	}
+
+	// 2500 entries of 512KiB is ~1.22GB, over pauseQuorumBytes.
+	setAverage(2500, largeEntryBytes)
+	require_True(t, 2500 < uint64(pauseQuorumThreshold))
+	require_True(t, n.overrun(2500, pauseQuorumThreshold, pauseQuorumBytes))
+
+	// 900 entries of 512KiB is ~460MB, under pauseQuorumBytes.
+	setAverage(900, largeEntryBytes)
+	require_False(t, n.overrun(900, pauseQuorumThreshold, pauseQuorumBytes))
+
+	// The entry count path must still work for small entries.
+	setAverage(2500, 1024)
+	require_False(t, n.overrun(2500, pauseQuorumThreshold, pauseQuorumBytes))
+	setAverage(pauseQuorumThreshold+1, 1024)
+	require_True(t, n.overrun(pauseQuorumThreshold+1, pauseQuorumThreshold, pauseQuorumBytes))
+}
+
+func TestNRGLeaderOverrunOnLargeEntries(t *testing.T) {
+	const largeEntryBytes = 512 * 1024
+	for _, test := range []struct {
+		name     string
+		lagging  string // which counter lags behind
+		expected bool
+		avg      uint64
+	}{
+		{"uncommitted large entries", "commit", true, largeEntryBytes},
+		{"uncommitted small entries", "commit", false, 1024},
+		{"unapplied large entries", "applied", true, largeEntryBytes},
+		{"unapplied small entries", "applied", false, 1024},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			n, cleanup := initSingleMemRaftNode(t)
+			defer cleanup()
+
+			n.Lock()
+			defer n.Unlock()
+
+			// 2500 entries is far below pauseQuorumThreshold, so whether we are
+			// overrun depends entirely on the byte estimate.
+			const entries = 2500
+			n.papplied, n.pindex, n.bytes = 0, entries, entries*test.avg
+			if test.lagging == "commit" {
+				// We are not getting quorum from our followers.
+				n.commit, n.applied = 0, 0
+			} else {
+				// We are committing but too slow to apply.
+				n.commit, n.applied = entries, 0
+			}
+
+			require_Equal(t, n.isLeaderOverrun(), test.expected)
+		})
+	}
+}
+
+func TestNRGCachePendingEntryBoundedByBytes(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		payloadSize int
+		inserts     int
+		capped      bool
+	}{
+		// Large entries: the cache fills up to paeDropBytes and stops
+		// there, nowhere near paeDropThreshold.
+		{"large entries stop at the byte cap", 512 * 1024, 1000, true},
+		// Small entries: 1000 of them is ~1MB, so nothing is dropped.
+		{"small entries are all cached", 1024, 1000, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			n, cleanup := initSingleMemRaftNode(t)
+			defer cleanup()
+
+			entries := []*Entry{newEntry(EntryNormal, make([]byte, test.payloadSize))}
+			ae := encode(t, &appendEntry{leader: "S1Nunr6R", term: 1, entries: entries})
+
+			n.Lock()
+			defer n.Unlock()
+
+			sz := n.entryStoreSize(ae)
+			require_True(t, sz > 0)
+
+			// We stop caching once we'd go over paeDropBytes.
+			expected := test.inserts
+			if test.capped {
+				expected = int((paeDropBytes + sz - 1) / sz)
+			}
+
+			// A long history of entries that were applied but not snapshotted yet
+			// must not dilute what we account for, only what's cached counts.
+			n.papplied, n.bytes = 0, 100*1024*1024
+
+			for i := 1; i <= test.inserts; i++ {
+				n.pindex = uint64(i)
+				n.cachePendingEntry(ae)
+			}
+
+			require_Len(t, len(n.pae), expected)
+			// Whatever we dropped, it was not because of the entry count.
+			require_True(t, len(n.pae) < paeDropThreshold)
+			// We must account for exactly what we've cached.
+			require_Equal(t, n.paeBytes, uint64(len(n.pae))*sz)
+		})
+	}
+}
+
+func TestNRGCachePendingEntryBytesAccounting(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	newAE := func(index uint64, payload int) *appendEntry {
+		entries := []*Entry{newEntry(EntryNormal, make([]byte, payload))}
+		return encode(t, &appendEntry{leader: nats0, term: 1, pterm: 1, pindex: index - 1, entries: entries})
+	}
+
+	n.Lock()
+	defer n.Unlock()
+
+	large := newAE(3, 4*1024)
+	ssz, lsz := n.entryStoreSize(newAE(1, 128)), n.entryStoreSize(large)
+	require_True(t, lsz > ssz)
+
+	// Cache a couple of entries.
+	for i := uint64(1); i <= 3; i++ {
+		n.pindex = i
+		n.cachePendingEntry(newAE(i, 128))
+	}
+	require_Len(t, len(n.pae), 3)
+	require_Equal(t, n.paeBytes, 3*ssz)
+
+	// Re-caching an index with a different value must not account for it twice.
+	n.pindex = 3
+	n.cachePendingEntry(large)
+	require_Len(t, len(n.pae), 3)
+	require_Equal(t, n.paeBytes, 2*ssz+lsz)
+
+	// Truncating must remove the bytes of the entries the WAL no longer has.
+	n.pterm, n.pindex = 1, 3
+	n.truncateWAL(1, 2)
+	require_Len(t, len(n.pae), 2)
+	require_Equal(t, n.paeBytes, 2*ssz)
+
+	// Resetting the cache clears our accounting.
+	n.resetPendingEntries()
+	require_Len(t, len(n.pae), 0)
+	require_Equal(t, n.paeBytes, 0)
+}
+
+func TestNRGCatchupSnapshotClearsCoveredMembershipChange(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	nats0 := "S1Nunr6R"   // "nats-0"
+	oldPeer := "yrzKKRBu" // "nats-1"
+	n.Lock()
+	n.addPeer(nats0)
+	n.addPeer(oldPeer)
+	n.Unlock()
+	require_Len(t, len(n.peers), 3)
+
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	aeMsg := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: []*Entry{newEntry(EntryNormal, esm)}})
+	aeRemovePeer := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 1, entries: []*Entry{newEntry(EntryRemovePeer, []byte(oldPeer))}})
+	n.processAppendEntry(aeMsg, n.aesub)
+	n.processAppendEntry(aeRemovePeer, n.aesub)
+	require_Equal(t, n.pindex, 2)
+	require_True(t, n.MembershipChangeInProgress())
+	require_Equal(t, n.membChange.index, 2)
+
+	// The leader is way ahead, this triggers catchup.
+	aeTriggerCatchup := encode(t, &appendEntry{leader: nats0, term: 1, commit: 100, pterm: 1, pindex: 100, entries: nil})
+	n.processAppendEntry(aeTriggerCatchup, n.aesub)
+	require_True(t, n.catchup != nil)
+
+	// The leader catches us up with a snapshot at index 100 whose peer state already
+	// reflects the removal. Index 2 is below the snapshot, so it will never be applied.
+	snapshotEntries := []*Entry{
+		newEntry(EntrySnapshot, nil),
+		newEntry(EntryPeerState, encodePeerState(&peerState{[]string{n.id, nats0}, 2, n.extSt})),
+	}
+	aeCatchupSnapshot := encode(t, &appendEntry{leader: nats0, term: 1, commit: 100, pterm: 1, pindex: 100, entries: snapshotEntries})
+	n.processAppendEntry(aeCatchupSnapshot, n.catchup.sub)
+	require_Equal(t, n.commit, 100)
+	_, ok := n.peers[oldPeer]
+	require_False(t, ok)
+	require_Equal(t, n.csz, 2)
+
+	// The change is committed as far as we're concerned, it must not linger.
+	require_False(t, n.MembershipChangeInProgress())
+	require_True(t, n.membChange == nil)
+
+	// And if we become leader we can still change membership.
+	n.term = 2
+	n.switchToLeader()
+	require_NoError(t, n.ProposeRemovePeer(nats0))
+}
+
+func TestNRGApplyEarlierMembershipChangeKeepsLaterInflight(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	peer := "yrzKKRBu"  // "nats-1"
+	n.Lock()
+	n.addPeer(nats0)
+	n.Unlock()
+	require_Len(t, len(n.peers), 2)
+
+	// Store AddPeer at index 1 and RemovePeer of the same peer at index 2, both uncommitted,
+	// like a node that is caught up through a scale up followed by a scale down.
+	aeAddPeer := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: []*Entry{newEntry(EntryAddPeer, []byte(peer))}})
+	aeRemovePeer := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 1, entries: []*Entry{newEntry(EntryRemovePeer, []byte(peer))}})
+	n.processAppendEntry(aeAddPeer, n.aesub)
+	n.processAppendEntry(aeRemovePeer, n.aesub)
+	require_Equal(t, n.pindex, 2)
+	require_NotNil(t, n.membChange)
+	require_Equal(t, n.membChange.index, 2)
+	_, ok := n.peers[peer]
+	require_False(t, ok)
+
+	// The leader commits index 1 only. The peer is a committed member now,
+	// but its removal at index 2 is still inflight.
+	aeCommit := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 2, entries: nil})
+	n.processAppendEntry(aeCommit, n.aesub)
+	require_Equal(t, n.commit, 1)
+	_, ok = n.peers[peer]
+	require_False(t, ok)
+	require_True(t, n.MembershipChangeInProgress())
+	require_NotNil(t, n.membChange)
+	require_Equal(t, n.membChange.index, 2)
+	require_Equal(t, n.membChange.peer, peer)
+
+	// We win an election and commit index 2 ourselves. The removal is real, not
+	// reverted, and must be applied.
+	n.term = 2
+	n.switchToLeader()
+	n.Lock()
+	err := n.applyCommit(2)
+	n.Unlock()
+	require_NoError(t, err)
+	_, ok = n.peers[peer]
+	require_False(t, ok)
+	require_Equal(t, n.csz, 2)
+	require_True(t, n.membChange == nil)
+}
+
+func TestNRGMembershipChangeTakesEffectOnStoreNotCommit(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	peer := "yrzKKRBu"  // "nats-1"
+	n.Lock()
+	n.addPeer(nats0)
+	n.Unlock()
+	require_Len(t, len(n.peers), 2)
+	require_Equal(t, n.csz, 2)
+	require_Equal(t, n.qn, 2)
+
+	// Storing the uncommitted AddPeer changes membership.
+	aeAddPeer := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: []*Entry{newEntry(EntryAddPeer, []byte(peer))}})
+	n.processAppendEntry(aeAddPeer, n.aesub)
+	require_Equal(t, n.pindex, 1)
+	require_Equal(t, n.commit, 0)
+	_, ok := n.peers[peer]
+	require_True(t, ok)
+	require_Equal(t, n.csz, 3)
+	require_Equal(t, n.qn, 2)
+	ps, err := readPeerState(n.dios, n.sd)
+	require_NoError(t, err)
+	require_True(t, slices.Contains(ps.knownPeers, peer))
+	require_Equal(t, ps.clusterSize, 3)
+	require_Equal(t, n.apply.len(), 0)
+
+	// Committing only makes it official.
+	aeCommit := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1, entries: nil})
+	n.processAppendEntry(aeCommit, n.aesub)
+	require_Equal(t, n.commit, 1)
+	require_True(t, n.membChange == nil)
+	_, ok = n.peers[peer]
+	require_True(t, ok)
+	require_Equal(t, n.csz, 3)
+	require_Equal(t, n.qn, 2)
+	ces := n.apply.pop()
+	require_Len(t, len(ces), 1)
+	require_Equal(t, ces[0].Index, 1)
+	require_Len(t, len(ces[0].Entries), 1)
+	require_Equal(t, ces[0].Entries[0].Type, EntryAddPeer)
+
+	// Same for RemovePeer.
+	aeRemovePeer := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1, entries: []*Entry{newEntry(EntryRemovePeer, []byte(peer))}})
+	n.processAppendEntry(aeRemovePeer, n.aesub)
+	require_Equal(t, n.pindex, 2)
+	require_Equal(t, n.commit, 1)
+	_, ok = n.peers[peer]
+	require_False(t, ok)
+	_, ok = n.removed[peer]
+	require_True(t, ok)
+	require_Equal(t, n.csz, 2)
+	require_Equal(t, n.qn, 2)
+	ps, err = readPeerState(n.dios, n.sd)
+	require_NoError(t, err)
+	require_False(t, slices.Contains(ps.knownPeers, peer))
+	require_Equal(t, ps.clusterSize, 2)
+
+	// Nothing changes on commit.
+	aeCommit = encode(t, &appendEntry{leader: nats0, term: 1, commit: 2, pterm: 1, pindex: 2, entries: nil})
+	n.processAppendEntry(aeCommit, n.aesub)
+	require_Equal(t, n.commit, 2)
+	require_True(t, n.membChange == nil)
+	_, ok = n.peers[peer]
+	require_False(t, ok)
+	_, ok = n.removed[peer]
+	require_True(t, ok)
+	require_Equal(t, n.csz, 2)
+	ces = n.apply.pop()
+	require_Len(t, len(ces), 1)
+	require_Equal(t, ces[0].Index, 2)
+	require_Equal(t, ces[0].Entries[0].Type, EntryRemovePeer)
+}
+
+func TestNRGPeerStateTakesEffectOnStoreNotCommit(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	peer := "yrzKKRBu"  // "nats-1"
+	n.Lock()
+	n.addPeer(nats0)
+	n.Unlock()
+	require_Len(t, len(n.peers), 2)
+
+	// Storing the uncommitted peer state changes membership.
+	psData := encodePeerState(&peerState{[]string{n.id, nats0, peer}, 3, n.extSt})
+	aePeerState := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: []*Entry{newEntry(EntryPeerState, psData)}})
+	n.processAppendEntry(aePeerState, n.aesub)
+	require_Equal(t, n.pindex, 1)
+	require_Equal(t, n.commit, 0)
+	_, ok := n.peers[peer]
+	require_True(t, ok)
+	require_Equal(t, n.csz, 3)
+	require_Equal(t, n.qn, 2)
+	ps, err := readPeerState(n.dios, n.sd)
+	require_NoError(t, err)
+	require_True(t, slices.Contains(ps.knownPeers, peer))
+
+	// A later peer state that drops the peer also applies on store.
+	psData = encodePeerState(&peerState{[]string{n.id, nats0}, 2, n.extSt})
+	aePeerState = encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 1, entries: []*Entry{newEntry(EntryPeerState, psData)}})
+	n.processAppendEntry(aePeerState, n.aesub)
+	require_Equal(t, n.pindex, 2)
+	_, ok = n.peers[peer]
+	require_False(t, ok)
+	_, ok = n.removed[peer]
+	require_True(t, ok)
+	require_Equal(t, n.csz, 2)
+
+	// Committing both must not rewind to the older peer state.
+	aeCommit := encode(t, &appendEntry{leader: nats0, term: 1, commit: 2, pterm: 1, pindex: 2, entries: nil})
+	n.processAppendEntry(aeCommit, n.aesub)
+	require_Equal(t, n.commit, 2)
+	_, ok = n.peers[peer]
+	require_False(t, ok)
+	require_Equal(t, n.csz, 2)
+}
+
+func TestNRGSnapshotCatchupPeerStateNotAheadOfLog(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+	s0, s1 := c.servers[0], c.servers[1]
+	lid, aid, cid := s0.sys.shash[:idLen], s1.sys.shash[:idLen], c.servers[2].sys.shash[:idLen]
+	peers := []string{lid, aid, cid}
+
+	// Subscribe to the replies sent by the hand-driven nodes.
+	nc, err := nats.Connect(s0.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+	sub, err := nc.SubscribeSync("$TEST.>")
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+
+	// Leader L, not running its loop, driven by hand.
+	lms, err := newMemStore(&StreamConfig{Name: "L", Storage: MemoryStorage})
+	require_NoError(t, err)
+	lcfg := &RaftConfig{Name: "L", Store: t.TempDir(), Log: lms, Managed: true}
+	require_NoError(t, s0.bootstrapRaftNode(lcfg, peers, true))
+	l, err := s0.initRaftNode(globalAccountName, lcfg, pprofLabels{})
+	require_NoError(t, err)
+	defer l.shutdown()
+
+	// L follows C in term 1, stores and commits two entries.
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	normal := []*Entry{newEntry(EntryNormal, esm)}
+	l.processAppendEntry(encode(t, &appendEntry{leader: cid, term: 1, commit: 0, pterm: 0, pindex: 0, entries: normal}), l.aesub)
+	l.processAppendEntry(encode(t, &appendEntry{leader: cid, term: 1, commit: 2, pterm: 1, pindex: 1, entries: normal}), l.aesub)
+	l.Applied(2)
+	require_NoError(t, l.InstallSnapshot([]byte("snap"), false))
+
+	// L becomes leader in term 2 and stores an uncommitted RemovePeer(C) above the snapshot.
+	l.Lock()
+	l.term = 2
+	l.Unlock()
+	l.switchToLeader()
+	require_True(t, l.sendMembershipChange(newEntry(EntryRemovePeer, []byte(cid))))
+	l.RLock()
+	require_False(t, slices.Contains(l.peerNames(), cid))
+	l.RUnlock()
+
+	// L catches up A with its snapshot, then crashes before A receives the RemovePeer entry.
+	l.Lock()
+	_, err = l.sendSnapshotToFollower("$TEST.SNAP")
+	l.Unlock()
+	require_NoError(t, err)
+	msg, err := sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_Equal(t, msg.Subject, "$TEST.SNAP")
+	sae, err := decodeAppendEntry(msg.Data, nil, _EMPTY_)
+	require_NoError(t, err)
+	require_Len(t, len(sae.entries), 2)
+	// The snapshot still carries the membership {L, A, C} from before the RemovePeer.
+	sent, err := decodePeerState(sae.entries[1].Data)
+	require_NoError(t, err)
+	require_True(t, slices.Contains(sent.knownPeers, cid))
+
+	// Follower A, empty, a member of the committed membership {L, A, C}.
+	ams, err := newMemStore(&StreamConfig{Name: "A", Storage: MemoryStorage})
+	require_NoError(t, err)
+	acfg := &RaftConfig{Name: "A", Store: t.TempDir(), Log: ams, Managed: true}
+	require_NoError(t, s1.bootstrapRaftNode(acfg, peers, true))
+	a, err := s1.initRaftNode(globalAccountName, acfg, pprofLabels{})
+	require_NoError(t, err)
+	defer a.shutdown()
+
+	a.Lock()
+	a.createCatchup(sae)
+	csub := a.catchup.sub
+	a.Unlock()
+	a.processAppendEntry(sae, csub)
+
+	a.RLock()
+	apindex, apeers, acsz, amc := a.pindex, a.peerNames(), a.csz, a.membChange
+	a.RUnlock()
+	require_Equal(t, apindex, 2)
+	// A's log has no membership change, so its membership must be the committed one.
+	require_True(t, amc == nil)
+	require_True(t, slices.Contains(apeers, cid))
+	require_Equal(t, acsz, 3)
+
+	// The snapshot file A persisted pairs data at index 2 with a membership that must match it.
+	a.Lock()
+	snap, err := a.loadLastSnapshot()
+	a.Unlock()
+	require_NoError(t, err)
+	ps, err := decodePeerState(snap.peerstate)
+	require_NoError(t, err)
+	require_True(t, slices.Contains(ps.knownPeers, cid))
+
+	// L is gone, C (a committed member, log equally up-to-date) campaigns. A must be able to vote for it.
+	require_NoError(t, a.processVoteRequest(&voteRequest{term: 3, lastTerm: 1, lastIndex: 2, candidate: cid, reply: "$TEST.VOTE"}))
+	msg, err = sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_Equal(t, msg.Subject, "$TEST.VOTE")
+	require_True(t, decodeVoteResponse(msg.Data).granted)
+}
+
+func TestNRGCommitRevertedSelfRemovalDoesNotStepDown(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	n.Lock()
+	n.managed = true
+	n.addPeer(nats0)
+	n.updateLeader(nats0)
+	n.Unlock()
+	require_Len(t, len(n.peers), 2)
+
+	// Storing our removal makes us a non-member.
+	aeRemovePeer := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: []*Entry{newEntry(EntryRemovePeer, []byte(n.id))}})
+	n.processAppendEntry(aeRemovePeer, n.aesub)
+	require_Equal(t, n.pindex, 1)
+	require_True(t, n.pendingSelfRemoval())
+	_, ok := n.peers[n.id]
+	require_False(t, ok)
+
+	// The leader is gone and gets evicted, which reverts our removal.
+	n.Lock()
+	n.updateLeader(noLeader)
+	n.Unlock()
+	evicted, err := n.EvictPeers([]string{nats0})
+	require_NoError(t, err)
+	require_True(t, slices.Equal(evicted, []string{nats0}))
+	require_True(t, n.membChange == nil)
+	_, ok = n.peers[n.id]
+	require_True(t, ok)
+	require_Equal(t, n.csz, 1)
+
+	// Committing the reverted removal must not step us down, but is still passed up.
+	n.term = 2
+	n.switchToLeader()
+	n.Lock()
+	err = n.applyCommit(1)
+	n.Unlock()
+	require_NoError(t, err)
+	require_Equal(t, n.State(), Leader)
+	_, ok = n.peers[n.id]
+	require_True(t, ok)
+	require_Equal(t, n.csz, 1)
+	// Becoming leader also commits a peer state entry, so look for ours.
+	var found bool
+	for _, ce := range n.apply.pop() {
+		if ce.Index == 1 {
+			require_Len(t, len(ce.Entries), 1)
+			require_Equal(t, ce.Entries[0].Type, EntryRemovePeer)
+			found = true
+		}
+	}
+	require_True(t, found)
+}
+
+func TestNRGApplyOlderMembershipChangeDoesNotRewindNewer(t *testing.T) {
+	test := func(t *testing.T, managed bool) {
+		n, cleanup := initSingleMemRaftNode(t)
+		defer cleanup()
+		n.managed = managed
+
+		nats0 := "S1Nunr6R" // "nats-0"
+		n.addPeer(nats0)
+		require_Len(t, len(n.peers), 2)
+
+		type state struct {
+			commit, hcommit uint64
+			member, voting  bool
+			csz             int
+			pending         bool
+		}
+		snapshot := func() state {
+			n.Lock()
+			defer n.Unlock()
+			_, member := n.peers[n.id]
+			return state{n.commit, n.hcommit, member, n.votingMemberLocked(), n.csz, n.membChange != nil}
+		}
+
+		esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+		normal := []*Entry{newEntry(EntryNormal, esm)}
+		removeSelf := []*Entry{newEntry(EntryRemovePeer, []byte(n.id))}
+		addSelf := []*Entry{newEntry(EntryAddPeer, []byte(n.id))}
+
+		// A normal entry, then pause applying, like a stream catchup does.
+		ae1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: normal})
+		n.processAppendEntry(ae1, n.aesub)
+		require_NoError(t, n.PauseApply())
+
+		// Our removal, then our re-addition, both stored but not applied.
+		ae2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1, entries: removeSelf})
+		ae3 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 2, pterm: 1, pindex: 2, entries: addSelf})
+		n.processAppendEntry(ae2, n.aesub)
+		n.processAppendEntry(ae3, n.aesub)
+
+		st := snapshot()
+		require_Equal(t, st.hcommit, 2)
+		require_True(t, st.member)
+		require_Equal(t, st.csz, 2)
+		require_True(t, st.voting)
+
+		// Resuming applies the older removal. It must not rewind past the stored addition.
+		n.ResumeApply()
+
+		st = snapshot()
+		require_Equal(t, st.commit, 2)
+		require_True(t, st.member)
+		require_Equal(t, st.csz, 2)
+		require_True(t, st.voting)
+
+		// The leader commits our addition. We must apply it, since we are a member.
+		ae4 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 3, pterm: 1, pindex: 3, entries: nil})
+		n.processAppendEntry(ae4, n.aesub)
+
+		st = snapshot()
+		require_Equal(t, st.commit, 3)
+		require_True(t, st.member)
+		require_Equal(t, st.csz, 2)
+		require_False(t, st.pending)
+		require_True(t, st.voting)
+	}
+
+	t.Run("Managed", func(t *testing.T) { test(t, true) })
+	t.Run("Unmanaged", func(t *testing.T) { test(t, false) })
+}
+
+func TestNRGLearnerSnapshotAppliedOnBecomingMember(t *testing.T) {
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	setup := func(t *testing.T) (*raft, func()) {
+		n, cleanup := initSingleMemRaftNode(t)
+		n.Lock()
+		n.managed = true
+		// The leader's peer set does not contain us: we are a learner.
+		n.processPeerState(&peerState{[]string{nats0}, 1, n.extSt})
+		n.updateLeader(nats0)
+		require_False(t, n.votingMemberLocked())
+		n.Unlock()
+
+		// Leader is way ahead; this triggers catchup.
+		aeTriggerCatchup := encode(t, &appendEntry{leader: nats0, term: 1, commit: 100, pterm: 1, pindex: 100, entries: nil})
+		n.processAppendEntry(aeTriggerCatchup, n.aesub)
+		require_True(t, n.catchup != nil)
+
+		// Leader sends a snapshot at the catchup point.
+		snapshotEntries := []*Entry{
+			newEntry(EntrySnapshot, []byte("snap")),
+			newEntry(EntryPeerState, encodePeerState(&peerState{[]string{nats0}, 1, n.extSt})),
+		}
+		aeCatchupSnapshot := encode(t, &appendEntry{leader: nats0, term: 1, commit: 100, pterm: 1, pindex: 100, entries: snapshotEntries})
+		n.processAppendEntry(aeCatchupSnapshot, n.catchup.sub)
+
+		// Installed, but not committed or applied.
+		n.Lock()
+		defer n.Unlock()
+		require_Equal(t, n.pindex, 100)
+		require_Equal(t, n.papplied, 100)
+		require_Equal(t, n.commit, 0)
+		require_NotEqual(t, n.snapfile, _EMPTY_)
+		require_Len(t, n.apply.len(), 0)
+		return n, cleanup
+	}
+
+	t.Run("Applied", func(t *testing.T) {
+		n, cleanup := setup(t)
+		defer cleanup()
+
+		// Our addition makes us a member, the snapshot is applied first.
+		aeAddSelf := encode(t, &appendEntry{leader: nats0, term: 1, commit: 100, pterm: 1, pindex: 100, entries: []*Entry{newEntry(EntryAddPeer, []byte(n.id))}})
+		n.processAppendEntry(aeAddSelf, n.aesub)
+
+		n.Lock()
+		defer n.Unlock()
+		require_True(t, n.votingMemberLocked())
+		require_Equal(t, n.pindex, 101)
+		require_Equal(t, n.commit, 100)
+
+		// Catchup is done, the snapshot is applied without a catchup signal.
+		require_True(t, n.catchup == nil)
+		require_Len(t, n.apply.len(), 1)
+		ce, ok := n.apply.popOne()
+		require_True(t, ok)
+		require_Equal(t, ce.Index, 100)
+		require_Equal(t, ce.Entries[0].Type, EntrySnapshot)
+		require_Equal(t, string(ce.Entries[0].Data), "snap")
+	})
+
+	// A snapshot that can't be loaded on becoming a member must restart catchup.
+	t.Run("LoadFailureRequestsNewSnapshot", func(t *testing.T) {
+		n, cleanup := setup(t)
+		defer cleanup()
+
+		aeReply := "$TEST"
+		nc, err := nats.Connect(n.s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+		require_NoError(t, err)
+		defer nc.Close()
+		sub, err := nc.SubscribeSync(aeReply)
+		require_NoError(t, err)
+		require_NoError(t, nc.Flush())
+
+		// The snapshot goes missing before we become a member.
+		require_NoError(t, os.Remove(n.snapfile))
+
+		aeAddSelf := encode(t, &appendEntry{leader: nats0, term: 1, commit: 100, pterm: 1, pindex: 100, reply: aeReply, entries: []*Entry{newEntry(EntryAddPeer, []byte(n.id))}})
+		n.processAppendEntry(aeAddSelf, n.aesub)
+
+		// We asked the leader to catch us up from scratch.
+		msg, err := sub.NextMsg(time.Second)
+		require_NoError(t, err)
+		ar := decodeAppendEntryResponse(msg.Data)
+		require_False(t, ar.success)
+		require_Equal(t, ar.index, 0)
+		require_NotEqual(t, msg.Reply, _EMPTY_)
+
+		n.Lock()
+		defer n.Unlock()
+		require_True(t, n.catchup != nil)
+		require_Equal(t, n.pindex, 0)
+		require_Equal(t, n.papplied, 0)
+		require_Equal(t, n.commit, 0)
+		require_Equal(t, n.snapfile, _EMPTY_)
+		require_Len(t, n.apply.len(), 0)
+		var state StreamState
+		n.wal.FastState(&state)
+		require_Equal(t, state.Msgs, 0)
+		// Our addition was discarded with the log, the leader resends it.
+		require_True(t, n.membChange == nil)
+		require_False(t, n.votingMemberLocked())
+		_, ok := n.peers[nats0]
+		require_True(t, ok)
+	})
+}
+
+func TestNRGLearnerOverrunTruncatesToSnapshot(t *testing.T) {
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+	n.Lock()
+	n.managed = true
+	n.processPeerState(&peerState{[]string{nats0}, 1, n.extSt})
+	n.updateLeader(nats0)
+	require_False(t, n.votingMemberLocked())
+	n.Unlock()
+
+	aeReply := "$TEST"
+	nc, err := nats.Connect(n.s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+	sub, err := nc.SubscribeSync(aeReply)
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+
+	// Leader is ahead, catch up with a snapshot at index 100.
+	aeTriggerCatchup := encode(t, &appendEntry{leader: nats0, term: 1, commit: 100, pterm: 1, pindex: 100, reply: aeReply, entries: nil})
+	n.processAppendEntry(aeTriggerCatchup, n.aesub)
+	_, err = sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_True(t, n.catchup != nil)
+	snapshotEntries := []*Entry{
+		newEntry(EntrySnapshot, []byte("snap")),
+		newEntry(EntryPeerState, encodePeerState(&peerState{[]string{nats0}, 1, n.extSt})),
+	}
+	aeCatchupSnapshot := encode(t, &appendEntry{leader: nats0, term: 1, commit: 100, pterm: 1, pindex: 100, entries: snapshotEntries})
+	n.processAppendEntry(aeCatchupSnapshot, n.catchup.sub)
+	n.Lock()
+	require_Equal(t, n.pindex, 100)
+	require_Equal(t, n.papplied, 100)
+	require_Equal(t, n.commit, 0)
+	snapfile := n.snapfile
+	n.Unlock()
+
+	// Live entries are stored, but never committed or compacted.
+	entries := []*Entry{newEntry(EntryNormal, []byte("x"))}
+	tail := uint64(pauseQuorumThreshold + 1)
+	for i := range tail {
+		ae := encode(t, &appendEntry{leader: nats0, term: 1, commit: 100 + i, pterm: 1, pindex: 100 + i, reply: "$BULK", entries: entries})
+		n.processAppendEntry(ae, n.aesub)
+	}
+	n.Lock()
+	require_Equal(t, n.pindex, 100+tail)
+	require_Equal(t, n.papplied, 100)
+	require_Equal(t, n.commit, 0)
+	require_Len(t, n.apply.len(), 0)
+	n.Unlock()
+
+	// The next entry sees the overrun: drop the tail, catch up from the snapshot.
+	pindex := 100 + tail
+	ae := encode(t, &appendEntry{leader: nats0, term: 1, commit: pindex, pterm: 1, pindex: pindex, reply: aeReply, entries: entries})
+	n.processAppendEntry(ae, n.aesub)
+
+	msg, err := sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	ar := decodeAppendEntryResponse(msg.Data)
+	require_False(t, ar.success)
+	require_Equal(t, ar.index, 100)
+	require_NotEqual(t, msg.Reply, _EMPTY_)
+
+	n.Lock()
+	defer n.Unlock()
+	require_True(t, n.catchup != nil)
+	require_Equal(t, n.pindex, 100)
+	require_Equal(t, n.pterm, 1)
+	require_Equal(t, n.papplied, 100)
+	require_Equal(t, n.commit, 0)
+	// The snapshot is kept, only the tail is gone.
+	require_Equal(t, n.snapfile, snapfile)
+	var state StreamState
+	n.wal.FastState(&state)
+	require_Equal(t, state.Msgs, 0)
+	require_False(t, n.votingMemberLocked())
+}
+
+func TestNRGLearnerOverrunDuringCatchupRequestsCatchupOnNewEntry(t *testing.T) {
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+	n.Lock()
+	n.managed = true
+	n.processPeerState(&peerState{[]string{nats0}, 1, n.extSt})
+	n.updateLeader(nats0)
+	require_False(t, n.votingMemberLocked())
+	n.Unlock()
+
+	aeReply, progressReply := "$TEST", "$PROGRESS"
+	nc, err := nats.Connect(n.s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+	sub, err := nc.SubscribeSync(aeReply)
+	require_NoError(t, err)
+	psub, err := nc.SubscribeSync(progressReply)
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+
+	// Leader is far ahead, catch up with a snapshot at index 100 followed by entries.
+	tail := uint64(pauseQuorumThreshold + 1)
+	lindex := 100 + tail + 10
+	aeTriggerCatchup := encode(t, &appendEntry{leader: nats0, term: 1, commit: lindex, pterm: 1, pindex: lindex, reply: aeReply, entries: nil})
+	n.processAppendEntry(aeTriggerCatchup, n.aesub)
+	_, err = sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_True(t, n.catchup != nil)
+	snapshotEntries := []*Entry{
+		newEntry(EntrySnapshot, []byte("snap")),
+		newEntry(EntryPeerState, encodePeerState(&peerState{[]string{nats0}, 1, n.extSt})),
+	}
+	aeCatchupSnapshot := encode(t, &appendEntry{leader: nats0, term: 1, commit: 100, pterm: 1, pindex: 100, entries: snapshotEntries})
+	n.processAppendEntry(aeCatchupSnapshot, n.catchup.sub)
+
+	// Catchup entries are stored, but never committed or compacted.
+	entries := []*Entry{newEntry(EntryNormal, []byte("x"))}
+	for i := range tail + 1 {
+		ae := encode(t, &appendEntry{leader: nats0, term: 1, commit: lindex, pterm: 1, pindex: 100 + i, reply: progressReply, entries: entries})
+		n.processAppendEntry(ae, n.catchup.sub)
+	}
+
+	// The overrun truncated to the snapshot and canceled the catchup without
+	// replying to the progress inbox.
+	n.Lock()
+	catchup, pindex, papplied := n.catchup, n.pindex, n.papplied
+	n.Unlock()
+	require_True(t, catchup == nil)
+	require_Equal(t, pindex, 100)
+	require_Equal(t, papplied, 100)
+	_, err = psub.NextMsg(250 * time.Millisecond)
+	require_Error(t, err, nats.ErrTimeout)
+
+	// The next new entry requests a new catchup from the leader.
+	ae := encode(t, &appendEntry{leader: nats0, term: 1, commit: lindex, pterm: 1, pindex: lindex, reply: aeReply, entries: entries})
+	n.processAppendEntry(ae, n.aesub)
+	msg, err := sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	ar := decodeAppendEntryResponse(msg.Data)
+	require_False(t, ar.success)
+	require_Equal(t, ar.index, 100)
+	require_NotEqual(t, msg.Reply, _EMPTY_)
+
+	n.Lock()
+	defer n.Unlock()
+	require_True(t, n.catchup != nil)
+	require_Equal(t, n.catchup.cindex, lindex)
+}
+
+func TestNRGMemberCatchupAfterWALResetNotTreatedAsLearner(t *testing.T) {
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+	n.Lock()
+	n.managed = true
+	// We are a voting member.
+	n.processPeerState(&peerState{[]string{nats0, n.id}, 2, n.extSt})
+	n.updateLeader(nats0)
+	require_True(t, n.votingMemberLocked())
+	n.Unlock()
+
+	aeReply := "$TEST"
+	nc, err := nats.Connect(n.s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+	sub, err := nc.SubscribeSync(aeReply)
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+
+	// Store five entries, the first three committed.
+	entries := []*Entry{newEntry(EntryNormal, []byte("x"))}
+	for i := range uint64(5) {
+		ae := encode(t, &appendEntry{leader: nats0, term: 1, commit: min(i, 3), pterm: min(i, 1), pindex: i, entries: entries})
+		n.processAppendEntry(ae, n.aesub)
+	}
+	n.Lock()
+	require_Equal(t, n.pindex, 5)
+	require_Equal(t, n.commit, 3)
+	n.apply.drain()
+	n.Unlock()
+
+	// Snapshot as a member.
+	n.Applied(3)
+	require_NoError(t, n.InstallSnapshot([]byte("snap"), false))
+
+	// Lose an entry past our snapshot.
+	n.Lock()
+	require_Equal(t, n.papplied, 3)
+	if ae := n.pae[4]; ae != nil {
+		n.paeBytes -= n.entryStoreSize(ae)
+		delete(n.pae, 4)
+	}
+	removed, err := n.wal.RemoveMsg(4)
+	require_NoError(t, err)
+	require_True(t, removed)
+	n.Unlock()
+
+	// Committing it fails to load it, which resets our log.
+	aeHeartbeat := encode(t, &appendEntry{leader: nats0, term: 1, commit: 5, pterm: 1, pindex: 5, entries: nil})
+	n.processAppendEntry(aeHeartbeat, n.aesub)
+	n.Lock()
+	require_Equal(t, n.pindex, 0)
+	require_Equal(t, n.commit, 0)
+	require_Equal(t, n.snapfile, _EMPTY_)
+	require_True(t, n.votingMemberLocked())
+	n.Unlock()
+
+	// The leader is ahead, this triggers catchup.
+	aeTriggerCatchup := encode(t, &appendEntry{leader: nats0, term: 1, commit: 5, pterm: 1, pindex: 5, reply: aeReply, entries: nil})
+	n.processAppendEntry(aeTriggerCatchup, n.aesub)
+	msg, err := sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	ar := decodeAppendEntryResponse(msg.Data)
+	require_False(t, ar.success)
+	require_Equal(t, ar.index, 0)
+	n.Lock()
+	require_True(t, n.catchup != nil)
+	catchupSub := n.catchup.sub
+	n.Unlock()
+
+	// The leader still has its log, it catches us up with entries instead of a snapshot.
+	aeCatchup := encode(t, &appendEntry{leader: nats0, term: 1, commit: 5, pterm: 0, pindex: 0, reply: aeReply, entries: entries})
+	n.processAppendEntry(aeCatchup, catchupSub)
+
+	// No new catchup is requested.
+	if msg, err = sub.NextMsg(250 * time.Millisecond); err == nil {
+		ar = decodeAppendEntryResponse(msg.Data)
+		t.Fatalf("Catchup restarted from [%d:%d]", ar.term, ar.index)
+	}
+	require_Error(t, err, nats.ErrTimeout)
+
+	n.Lock()
+	defer n.Unlock()
+	require_True(t, n.catchup != nil)
+	require_True(t, n.catchup.sub == catchupSub)
+	require_Equal(t, n.pindex, 1)
+	require_Equal(t, n.commit, 1)
+
+	// The caught up entry is applied.
+	var applied bool
+	for ce, ok := n.apply.popOne(); ok; ce, ok = n.apply.popOne() {
+		if ce.Index == 1 {
+			applied = true
+			require_Equal(t, ce.Entries[0].Type, EntryNormal)
+		}
+	}
+	require_True(t, applied)
+}
+
+func TestNRGLearnerDoesNotCommitBeforeMembership(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 2)
+	defer c.shutdown()
+	s1, s2 := c.servers[0], c.servers[1]
+	p1, p2 := s1.Node(), s2.Node()
+	rgPeers := []string{p1, p2}
+
+	cfg1 := &RaftConfig{Name: "G", Store: t.TempDir(), Log: c.createWAL("G", MemoryStorage), Managed: true}
+	sm1 := c.createStateMachine(s1, cfg1, []string{p1}, newStateAdder)
+	n1 := sm1.node()
+	require_NoError(t, n1.CampaignImmediately())
+	require_NotNil(t, smGroup{sm1}.waitOnLeader())
+	a1 := sm1.(*stateAdder)
+	a1.proposeDelta(10)
+	a1.proposeDelta(20)
+	a1.proposeDelta(30)
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		if a1.total() != 60 {
+			return fmt.Errorf("n1 total %d", a1.total())
+		}
+		return nil
+	})
+
+	cfg2 := &RaftConfig{Name: "G", Store: t.TempDir(), Log: c.createWAL("G", MemoryStorage), Managed: true, ScaleUp: true}
+	sm2 := c.createStateMachine(s2, cfg2, rgPeers, newStateAdder)
+	n2 := sm2.node()
+	a2 := sm2.(*stateAdder)
+
+	// The destination may store entries, but must not commit any until added.
+	li, _, _ := n1.Progress()
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		if i2, _, _ := n2.Progress(); i2 < li {
+			return fmt.Errorf("n2 index %d, want %d", i2, li)
+		}
+		return nil
+	})
+	// Allow a few heartbeats to carry the leader's commit.
+	time.Sleep(5 * hbInterval)
+	_, c2, _ := n2.Progress()
+	if c2 > 0 || a2.total() != 0 {
+		t.Fatalf("destination committed %d entries (total %d) while not a member of the leader's peer set %v", c2, a2.total(), n1.PeerNames())
+	}
+
+	// Restart the source as a member with a fresh memstore, as createRaftGroup would.
+	a1.stop()
+	a1.restart()
+	leader := smGroup{sm1, sm2}.waitOnLeader()
+	require_NotNil(t, leader)
+	require_Equal(t, leader, sm1)
+}
+
+func TestNRGLearnerSnapshotNotCommittedOnRestart(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	s := c.servers[0] // RunBasicJetStreamServer not available
+	defer c.shutdown()
+
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	storeDir := t.TempDir()
+	fcfg := FileStoreConfig{StoreDir: storeDir, BlockSize: defaultMediumBlockSize, AsyncFlush: false, srv: s}
+	scfg := StreamConfig{Name: "RAFT", Storage: FileStorage}
+	fs, err := newFileStore(fcfg, scfg)
+	require_NoError(t, err)
+
+	cfg := &RaftConfig{Name: "TEST", Store: storeDir, Log: fs, Managed: true}
+	id := s.sys.shash[:idLen]
+	require_NoError(t, s.bootstrapRaftNode(cfg, []string{id}, true))
+	n, err := s.initRaftNode(globalAccountName, cfg, pprofLabels{})
+	require_NoError(t, err)
+
+	n.Lock()
+	// The leader's peer set does not contain us: we are a learner.
+	n.processPeerState(&peerState{[]string{nats0}, 1, n.extSt})
+	n.updateLeader(nats0)
+	require_False(t, n.votingMemberLocked())
+	n.Unlock()
+
+	// Leader is way ahead; this triggers catchup and sends a snapshot.
+	aeTriggerCatchup := encode(t, &appendEntry{leader: nats0, term: 1, commit: 100, pterm: 1, pindex: 100, entries: nil})
+	n.processAppendEntry(aeTriggerCatchup, n.aesub)
+	require_True(t, n.catchup != nil)
+	snapshotEntries := []*Entry{
+		newEntry(EntrySnapshot, []byte("snap")),
+		newEntry(EntryPeerState, encodePeerState(&peerState{[]string{nats0}, 1, n.extSt})),
+	}
+	aeCatchupSnapshot := encode(t, &appendEntry{leader: nats0, term: 1, commit: 100, pterm: 1, pindex: 100, entries: snapshotEntries})
+	n.processAppendEntry(aeCatchupSnapshot, n.catchup.sub)
+
+	// One more committed entry after the snapshot, stored but not applied.
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	aeMsg := encode(t, &appendEntry{leader: nats0, term: 1, commit: 101, pterm: 1, pindex: 100, entries: []*Entry{newEntry(EntryNormal, esm)}})
+	n.processAppendEntry(aeMsg, n.aesub)
+
+	n.Lock()
+	require_Equal(t, n.pindex, 101)
+	require_Equal(t, n.papplied, 100)
+	require_Equal(t, n.commit, 0)
+	require_Len(t, n.apply.len(), 0)
+	n.Unlock()
+
+	// Restart.
+	n.Stop()
+	n.WaitForStop()
+	require_NoError(t, fs.Stop())
+	fs, err = newFileStore(fcfg, scfg)
+	require_NoError(t, err)
+	cfg = &RaftConfig{Name: "TEST", Store: storeDir, Log: fs, Managed: true}
+	n, err = s.initRaftNode(globalAccountName, cfg, pprofLabels{})
+	require_NoError(t, err)
+	defer n.Stop()
+
+	// Still a learner: nothing is committed or applied.
+	n.Lock()
+	require_False(t, n.votingMemberLocked())
+	require_Equal(t, n.pindex, 101)
+	require_Equal(t, n.papplied, 100)
+	require_Equal(t, n.commit, 0)
+	require_Len(t, n.apply.len(), 0)
+	n.updateLeader(nats0)
+	n.Unlock()
+
+	// Our addition is stored, we are a member now.
+	aeAddSelf := encode(t, &appendEntry{leader: nats0, term: 1, commit: 101, pterm: 1, pindex: 101, entries: []*Entry{newEntry(EntryAddPeer, []byte(n.id))}})
+	n.processAppendEntry(aeAddSelf, n.aesub)
+
+	n.Lock()
+	defer n.Unlock()
+	require_True(t, n.votingMemberLocked())
+	require_Equal(t, n.pindex, 102)
+	require_Equal(t, n.commit, 101)
+
+	// The snapshot is applied first, then the entry after it.
+	require_Len(t, n.apply.len(), 2)
+	ce, ok := n.apply.popOne()
+	require_True(t, ok)
+	require_Equal(t, ce.Index, 100)
+	require_Equal(t, ce.Entries[0].Type, EntrySnapshot)
+	require_Equal(t, string(ce.Entries[0].Data), "snap")
+	ce, ok = n.apply.popOne()
+	require_True(t, ok)
+	require_Equal(t, ce.Index, 101)
+	require_Equal(t, ce.Entries[0].Type, EntryNormal)
+}
+
+func TestNRGScaleUpEmptyCandidateNeedsAllEmptyServers(t *testing.T) {
+	const dataHolder = "S1Nunr6R"
+	const freshPeer = "yrzKKRBu"
+	const otherFresh = "cnrtt3eg"
+
+	for _, test := range []struct {
+		name string
+		// The peers besides ourselves, and the grants of those that answer.
+		peers  []string
+		grants map[string]bool // peer -> its log is empty
+		// Whether we're the preferred peer, i.e. we hold the data being scaled up from.
+		preferred bool
+		expected  RaftState
+	}{
+		{
+			// The other peer's grant hides its empty log, so our own vote must count as empty.
+			name: "GrantHidesEmptyLog", peers: []string{dataHolder, freshPeer},
+			grants: map[string]bool{freshPeer: false}, expected: Candidate,
+		},
+		{
+			// All peers answered empty, so nothing can be truncated.
+			name: "AllEmpty", peers: []string{freshPeer},
+			grants: map[string]bool{freshPeer: true}, expected: Leader,
+		},
+		{
+			// The R1 source holds the data despite its empty log, so it wins on quorum.
+			name: "PreferredWinsOnQuorum", peers: []string{freshPeer, otherFresh},
+			grants: map[string]bool{freshPeer: true}, preferred: true, expected: Leader,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			n, cleanup := initSingleMemRaftNode(t)
+			defer cleanup()
+
+			n.Lock()
+			// A scale up peer with an empty log is never initializing.
+			n.initializing = false
+			for _, peer := range test.peers {
+				n.addPeer(peer)
+			}
+			n.lsut = time.Time{}
+			n.Unlock()
+
+			// The preferred peer campaigns immediately, which marks it as holding the data.
+			if test.preferred {
+				require_NoError(t, n.CampaignImmediately())
+			}
+
+			require_Equal(t, n.pindex, 0)
+			require_Equal(t, n.csz, len(test.peers)+1)
+			require_Equal(t, n.QuorumNeeded(), 2)
+			// Must not be an observer, there can be no leader left to be fed by.
+			require_False(t, n.IsObserver())
+
+			nc, err := nats.Connect(n.s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+			require_NoError(t, err)
+			defer nc.Close()
+			sub, err := nc.Subscribe(n.vsubj, func(m *nats.Msg) {
+				req := decodeVoteRequest(m.Data, m.Reply)
+				for peer, empty := range test.grants {
+					resp := voteResponse{term: req.term, peer: peer, granted: true, empty: empty}
+					m.Respond(resp.encode())
+				}
+			})
+			require_NoError(t, err)
+			defer sub.Drain()
+			require_NoError(t, nc.Flush())
+
+			n.switchToCandidate()
+			require_Equal(t, n.State(), Candidate)
+			n.runAsCandidate()
+			require_Equal(t, n.State(), test.expected)
+		})
+	}
+}
+
+// A scale up peer can't campaign, rescue, or take a transfer until the leader adds it, catchup only counts once complete.
+func TestNRGScaleUpPeerObserverUntilAdded(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+	s := c.servers[0]
+	id := s.sys.shash[:idLen]
+	peers := serverPeerNames(c.servers)
+	others := slices.DeleteFunc(copyStrings(peers), func(p string) bool { return p == id })
+	leader := others[0]
+	withUs := encodePeerState(&peerState{peers, len(peers), extUndetermined})
+
+	for _, test := range []struct {
+		name string
+		// The leader's entries naming us, sent live or as a catchup, nil if the meta layer's assignment lifts scale up.
+		entries []*Entry
+		catchup bool
+		joins   bool
+	}{
+		{"AddPeer", []*Entry{newEntry(EntryAddPeer, []byte(id))}, false, true},
+		{"PeerState", []*Entry{newEntry(EntryPeerState, withUs)}, false, true},
+		{"NotAMember", []*Entry{newEntry(EntryPeerState, encodePeerState(&peerState{others, len(others), extUndetermined}))}, false, false},
+		{"CatchupAddPeer", []*Entry{newEntry(EntryAddPeer, []byte(id))}, true, true},
+		{"CatchupPeerState", []*Entry{newEntry(EntryPeerState, withUs)}, true, true},
+		{"CatchupSnapshot", []*Entry{newEntry(EntrySnapshot, []byte("snap")), newEntry(EntryPeerState, withUs)}, true, true},
+		{"Assignment", nil, false, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ms, err := newMemStore(&StreamConfig{Name: "TEST", Storage: MemoryStorage})
+			require_NoError(t, err)
+			cfg := &RaftConfig{Name: "TEST", Store: t.TempDir(), Log: ms, Managed: true, ScaleUp: true}
+			require_NoError(t, s.bootstrapRaftNode(cfg, []string{id, leader}, true))
+			n, err := s.initRaftNode(globalAccountName, cfg, pprofLabels{})
+			require_NoError(t, err)
+			defer n.shutdown()
+
+			// A scale up peer's data lives elsewhere, it mustn't relax the empty log checks.
+			n.RLock()
+			initializing := n.initializing
+			n.RUnlock()
+			require_False(t, initializing)
+
+			// Interest from a voter, so only scale up keeps us from switching to candidate.
+			nc := natsConnect(t, s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+			defer nc.Close()
+			natsSubSync(t, nc, n.vsubj)
+			natsFlush(t, nc)
+
+			_, _, err = n.RescueQuorum(1)
+			require_Error(t, err, errRescueNotVoting)
+			n.switchToCandidate()
+			require_Equal(t, n.State(), Follower)
+			// We still vote for a member.
+			require_NoError(t, n.processVoteRequest(&voteRequest{term: 1, candidate: leader, reply: "$TEST"}))
+			n.processAppendEntry(encode(t, &appendEntry{leader: leader, term: 1, entries: []*Entry{newEntry(EntryLeaderTransfer, []byte(id))}}), n.aesub)
+			n.RLock()
+			vote, lxfer := n.vote, n.lxfer
+			n.RUnlock()
+			require_Equal(t, vote, leader)
+			require_False(t, lxfer)
+
+			switch {
+			case test.entries == nil:
+				n.Lock()
+				n.etlr = time.Time{}
+				n.Unlock()
+				n.SetScaleUp(false)
+				// Without an entry from a leader resetting it, leaving must arm a real election timer itself.
+				n.RLock()
+				etlr := n.etlr
+				n.RUnlock()
+				require_False(t, etlr.IsZero())
+			case test.catchup:
+				n.Lock()
+				n.createCatchup(&appendEntry{leader: leader, term: 1, pterm: 1, pindex: 2})
+				csub := n.catchup.sub
+				n.Unlock()
+				// A snapshot doesn't follow on from our log, the other entries do.
+				pindex := uint64(1)
+				if test.entries[0].Type == EntrySnapshot {
+					pindex = 5
+				}
+				n.processAppendEntry(encode(t, &appendEntry{leader: leader, term: 1, lterm: 1, commit: 1, pterm: 1, pindex: pindex, entries: test.entries}), csub)
+				require_True(t, n.IsObserver())
+				// The leader's next entry completes the catchup.
+				n.RLock()
+				pindex = n.pindex
+				n.RUnlock()
+				n.processAppendEntry(encode(t, &appendEntry{leader: leader, term: 1, commit: pindex, pterm: 1, pindex: pindex}), n.aesub)
+			default:
+				n.processAppendEntry(encode(t, &appendEntry{leader: leader, term: 1, commit: 1, pterm: 1, pindex: 1, entries: test.entries}), n.aesub)
+			}
+			require_Equal(t, n.IsObserver(), !test.joins)
+		})
+	}
+}
+
+func TestNRGReloadDebugDoesNotDeadlockWithUnregister(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+	s := n.s
+
+	// A node exiting its run goroutine holds its lock while it unregisters itself.
+	n.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			n.Unlock()
+		}
+	}()
+	reloaded := make(chan struct{})
+	go func() {
+		s.reloadDebugRaftNodes(true)
+		close(reloaded)
+	}()
+
+	// Give the reload the chance to take rnMu and wait for the node's lock.
+	for start := time.Now(); time.Since(start) < 250*time.Millisecond; {
+		if !s.rnMu.TryLock() {
+			break
+		}
+		s.rnMu.Unlock()
+		runtime.Gosched()
+	}
+
+	unregistered := make(chan struct{})
+	go func() {
+		s.unregisterRaftNode(n.group)
+		close(unregistered)
+	}()
+	select {
+	case <-unregistered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("unregisterRaftNode deadlocked with reloadDebugRaftNodes")
+	}
+
+	n.Unlock()
+	locked = false
+	<-reloaded
+}
+
+func TestNRGReleasesWALOnShutdownBeforeRouting(t *testing.T) {
+	s := runServerWaitingForRouting(t)
+	n := s.getJetStream().getMetaGroup().(*raft)
+	n.RLock()
+	require_NotNil(t, n.cf)
+	n.RUnlock()
+
+	s.Shutdown()
+	requireRaftNodeReleased(t, s, n)
+}
+
+func TestNRGReleasesWALOnStopBeforeRouting(t *testing.T) {
+	s := runServerWaitingForRouting(t)
+	defer s.Shutdown()
+	n := s.getJetStream().getMetaGroup().(*raft)
+	n.RLock()
+	require_NotNil(t, n.cf)
+	n.RUnlock()
+
+	done := make(chan struct{})
+	go func() {
+		n.Stop()
+		n.WaitForStop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitForStop hung while the node was waiting for routing")
+	}
+	requireRaftNodeReleased(t, s, n)
+}
+
+func TestNRGReleasesWALOnServerQuitBeforeRouting(t *testing.T) {
+	s := runServerWaitingForRouting(t)
+	storeDir := t.TempDir()
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir, srv: s}, StreamConfig{Name: "RAFT", Storage: FileStorage})
+	require_NoError(t, err)
+	cfg := &RaftConfig{Name: "TEST", Store: storeDir, Log: fs}
+	require_NoError(t, s.bootstrapRaftNode(cfg, nil, false))
+	rn, err := s.startRaftNode(globalAccountName, cfg, pprofLabels{})
+	require_NoError(t, err)
+	n := rn.(*raft)
+
+	// A node Shutdown does not stop, for instance one registered after it
+	// stopped the others, only sees the server quit.
+	s.unregisterRaftNode(n.group)
+	// Shutdown waits for the run goroutine to return.
+	s.Shutdown()
+	requireRaftNodeReleased(t, s, n)
+}
+
+func TestNRGReleasesWALWhenRunNotStarted(t *testing.T) {
+	s := runRaftTestServer(t)
+	defer s.Shutdown()
+
+	storeDir := t.TempDir()
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir, srv: s}, StreamConfig{Name: "RAFT", Storage: FileStorage})
+	require_NoError(t, err)
+	cfg := &RaftConfig{Name: "TEST", Store: storeDir, Log: fs}
+	require_NoError(t, s.bootstrapRaftNode(cfg, nil, false))
+
+	// Simulate server shutdown: goroutines are no longer started.
+	s.grMu.Lock()
+	s.grRunning = false
+	s.grMu.Unlock()
+
+	rn, err := s.startRaftNode(globalAccountName, cfg, pprofLabels{})
+	require_NoError(t, err)
+	n := rn.(*raft)
+
+	done := make(chan struct{})
+	go func() {
+		n.Stop()
+		n.WaitForStop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitForStop hung for a run goroutine that was never started")
+	}
+	requireRaftNodeReleased(t, s, n)
+}
+
+// createClusterWithoutJetStream creates a routed cluster without a meta group, which would be slow to elect under long election timeouts.
+func createClusterWithoutJetStream(t *testing.T) *cluster {
+	modify := func(_, _, _, conf string) string { return strings.Replace(conf, "jetstream:", "#jetstream:", 1) }
+	return createJetStreamClusterAndModHook(t, jsClusterTempl, "R3S", _EMPTY_, 3, 14_622, false, modify)
+}
+
+func TestNRGPreferredCandidateResendsVoteRequest(t *testing.T) {
+	// A long election timeout ensures any retries happen within a single term.
+	omin, omax := minElectionTimeout, maxElectionTimeout
+	minElectionTimeout, maxElectionTimeout = time.Minute, 2*time.Minute
+	defer func() { minElectionTimeout, maxElectionTimeout = omin, omax }()
+
+	for _, preferred := range []bool{true, false} {
+		t.Run(fmt.Sprintf("Preferred=%v", preferred), func(t *testing.T) {
+			c := createClusterWithoutJetStream(t)
+			defer c.shutdown()
+
+			// Only the first peer has created its node, the others have not yet.
+			peers := serverPeerNames(c.servers)
+			cfg := &RaftConfig{Name: "TEST", Store: t.TempDir(), Log: c.createWAL("TEST", MemoryStorage)}
+			n := c.createStateMachine(c.servers[0], cfg, peers, newStateAdder).node().(*raft)
+
+			// Listen for vote requests in place of the other peers.
+			nc, err := nats.Connect(c.servers[1].ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+			require_NoError(t, err)
+			defer nc.Close()
+			sub, err := nc.SubscribeSync(n.vsubj)
+			require_NoError(t, err)
+			require_NoError(t, nc.Flush())
+			sacc := c.servers[0].SystemAccount()
+			checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+				if np, _ := sacc.sl.NumInterest(n.vsubj); np < 2 {
+					return errors.New("vote subject interest not propagated yet")
+				}
+				return nil
+			})
+
+			if preferred {
+				require_NoError(t, n.CampaignImmediately())
+			} else {
+				require_NoError(t, n.Campaign())
+			}
+			msg, err := sub.NextMsg(2 * time.Second)
+			require_NoError(t, err)
+			vr := decodeVoteRequest(msg.Data, msg.Reply)
+			require_NotNil(t, vr)
+			require_Equal(t, vr.candidate, n.ID())
+
+			if !preferred {
+				// A regular candidate relies on its election timer to retry.
+				_, err = sub.NextMsg(time.Second)
+				require_Error(t, err, nats.ErrTimeout)
+				require_Equal(t, n.State(), Candidate)
+				return
+			}
+
+			// The preferred candidate re-sends the same vote request, without bumping its term.
+			for range 2 {
+				msg, err = sub.NextMsg(2 * time.Second)
+				require_NoError(t, err)
+				rvr := decodeVoteRequest(msg.Data, msg.Reply)
+				require_NotNil(t, rvr)
+				require_Equal(t, *rvr, *vr)
+			}
+
+			// A peer that came up late grants the re-sent vote request.
+			vresp := &voteResponse{term: vr.term, peer: peers[1], granted: true}
+			require_NoError(t, msg.Respond(vresp.encode()))
+			checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+				if n.State() != Leader {
+					return errors.New("not leader yet")
+				}
+				return nil
+			})
+			require_Equal(t, n.Term(), vr.term)
+		})
+	}
+}
+
+func TestNRGPreferredCandidateRetriesOnInsufficientInterest(t *testing.T) {
+	// A long election timeout ensures a quick retry can't come from the election timer.
+	omin, omax := minElectionTimeout, maxElectionTimeout
+	minElectionTimeout, maxElectionTimeout = time.Minute, 2*time.Minute
+	defer func() { minElectionTimeout, maxElectionTimeout = omin, omax }()
+
+	for _, preferred := range []bool{true, false} {
+		t.Run(fmt.Sprintf("Preferred=%v", preferred), func(t *testing.T) {
+			c := createClusterWithoutJetStream(t)
+			defer c.shutdown()
+
+			// Only the first peer has created its node, so there's no interest from the others.
+			peers := serverPeerNames(c.servers)
+			cfg := &RaftConfig{Name: "TEST", Store: t.TempDir(), Log: c.createWAL("TEST", MemoryStorage)}
+			n := c.createStateMachine(c.servers[0], cfg, peers, newStateAdder).node().(*raft)
+
+			if preferred {
+				require_NoError(t, n.CampaignImmediately())
+			} else {
+				require_NoError(t, n.Campaign())
+			}
+			n.RLock()
+			campaignReset := n.etlr
+			n.RUnlock()
+
+			// Wait for the campaign to be rejected for insufficient interest.
+			var rejected time.Time
+			checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+				n.RLock()
+				rejected = n.etlr
+				n.RUnlock()
+				if !rejected.After(campaignReset) {
+					return errors.New("campaign not handled yet")
+				}
+				return nil
+			})
+			require_Equal(t, n.State(), Follower)
+			require_Equal(t, n.Term(), 0)
+
+			// Listen for vote requests in place of the other peers.
+			nc, err := nats.Connect(c.servers[1].ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+			require_NoError(t, err)
+			defer nc.Close()
+			sub, err := nc.SubscribeSync(n.vsubj)
+			require_NoError(t, err)
+			require_NoError(t, nc.Flush())
+
+			if !preferred {
+				// A regular node waits for its election timer before retrying.
+				_, err = sub.NextMsg(time.Second)
+				require_Error(t, err, nats.ErrTimeout)
+				require_Equal(t, n.State(), Follower)
+				require_Equal(t, n.Term(), 0)
+				return
+			}
+
+			// The preferred peer retries quickly, and campaigns once the other peers have interest.
+			msg, err := sub.NextMsg(2 * time.Second)
+			require_NoError(t, err)
+			vr := decodeVoteRequest(msg.Data, msg.Reply)
+			require_NotNil(t, vr)
+			require_Equal(t, vr.candidate, n.ID())
+			require_Equal(t, vr.term, 1)
+
+			vresp := &voteResponse{term: vr.term, peer: peers[1], granted: true}
+			require_NoError(t, msg.Respond(vresp.encode()))
+			checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+				if n.State() != Leader {
+					return errors.New("not leader yet")
+				}
+				return nil
+			})
+		})
+	}
+}
+
+func TestNRGLeaderTransferTargetRetriesQuickly(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	n.Lock()
+	n.lxfer = true
+	n.commit = n.processed + 1
+	n.Unlock()
+
+	n.switchToCandidate()
+	require_Equal(t, n.State(), Follower)
+	select {
+	case <-n.electTimer().C:
+	case <-time.After(2 * minCampaignTimeout):
+		t.Fatal("Transfer target didn't retry quickly")
+	}
+}
+
+func TestNRGLeaderTransferTargetFollowsNewLeader(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	nats1 := "yrzKKRBu" // "nats-1"
+
+	// The old leader names us as its successor.
+	entries := []*Entry{newEntry(EntryLeaderTransfer, []byte(n.id))}
+	n.processAppendEntry(encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries}), n.aesub)
+	require_True(t, n.lxfer)
+
+	// Granting another candidate our vote moves us to its term.
+	require_NoError(t, n.processVoteRequest(&voteRequest{term: 2, lastTerm: 1, lastIndex: 1, candidate: nats1}))
+	require_Equal(t, n.term, 2)
+	require_True(t, n.lxfer)
+
+	// Following the new leader in that same term clears the transfer.
+	n.processAppendEntry(encode(t, &appendEntry{leader: nats1, term: 2, commit: 0, pterm: 1, pindex: 1, entries: nil}), n.aesub)
+	require_Equal(t, n.leader, nats1)
+	require_False(t, n.lxfer)
+}
+
+func TestNRGStepDownToStalledPeerElectsQuickly(t *testing.T) {
+	for _, replicas := range []int{3, 5} {
+		t.Run(fmt.Sprintf("R%d", replicas), func(t *testing.T) {
+			c := createJetStreamClusterExplicit(t, fmt.Sprintf("R%dS", replicas), replicas)
+			defer c.shutdown()
+
+			rg := c.createRaftGroup("TEST", replicas, newStateAdder)
+			leader := rg.waitOnLeader()
+			require_NotNil(t, leader)
+
+			// Stand-in for a successor stuck in writeTermVote.
+			stalled := rg.nonLeader().node().(*raft)
+			stalled.Lock()
+			unlock := time.AfterFunc(10*time.Second, stalled.Unlock)
+			defer func() {
+				if unlock.Stop() {
+					stalled.Unlock()
+				}
+			}()
+
+			require_NoError(t, leader.node().StepDown(stalled.ID()))
+			// Like in lame duck mode, the old leader only votes.
+			leader.node().SetObserver(true)
+
+			// Without shortening the followers' election timers, this would take at least 1.5s.
+			checkFor(t, minElectionTimeout-100*time.Millisecond, 10*time.Millisecond, func() error {
+				if rg.leader() == nil {
+					return errors.New("no leader yet")
+				}
+				return nil
+			})
+		})
+	}
+}
+
+func TestNRGVoteRequestPersistsNewTerm(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	// Granting persists the new term with the vote.
+	require_NoError(t, n.processVoteRequest(&voteRequest{term: 1, lastTerm: 0, lastIndex: 0, candidate: nats0}))
+	term, voted, err := n.readTermVote()
+	require_NoError(t, err)
+	require_Equal(t, term, 1)
+	require_Equal(t, voted, nats0)
+
+	// Denying an outdated candidate still persists the new term.
+	n.pterm, n.pindex = 1, 100
+	require_NoError(t, n.processVoteRequest(&voteRequest{term: 2, lastTerm: 1, lastIndex: 2, candidate: nats0}))
+	term, voted, err = n.readTermVote()
+	require_NoError(t, err)
+	require_Equal(t, term, 2)
+	require_Equal(t, voted, noVote)
+}
+
+func TestNRGStepDownPrefersCaughtUpPeer(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	rg := c.createRaftGroup("TEST", 3, newStateAdder)
+
+	// Repeat, as peers are visited in random order.
+	for range 10 {
+		leader := rg.waitOnLeader()
+		require_NotNil(t, leader)
+		ln := leader.node().(*raft)
+
+		// Followers only count as caught up once they've acked since the election.
+		leader.(*stateAdder).proposeDelta(1)
+		followers := rg.followers()
+		checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+			for _, f := range followers {
+				if !ln.IsFollowerCaughtUp(f.node().ID()) {
+					return fmt.Errorf("follower %s not caught up", f.node().ID())
+				}
+			}
+			return nil
+		})
+
+		// Pretend we're catching up one of the followers.
+		catchingUp := followers[0].node().ID()
+		ln.Lock()
+		if ln.progress == nil {
+			ln.progress = make(map[string]*ipQueue[uint64])
+		}
+		q := newIPQueue[uint64](ln.s, "test")
+		ln.progress[catchingUp] = q
+		ln.Unlock()
+
+		require_NoError(t, ln.StepDown())
+		ln.Lock()
+		delete(ln.progress, catchingUp)
+		ln.Unlock()
+		q.unregister()
+
+		nl := rg.waitOnLeader()
+		require_NotNil(t, nl)
+		require_NotEqual(t, nl.node().ID(), catchingUp)
+	}
+}
+
+func TestNRGLogDrainedWithPoppedProposal(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	rg := c.createMemRaftGroup("TEST", 1, newStateAdder)
+	n := rg.waitOnLeader().node().(*raft)
+	waitDrained := func() {
+		t.Helper()
+		checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+			if drained, err := n.LogDrained(n.Term()); err != nil {
+				return err
+			} else if !drained {
+				return errors.New("log not drained")
+			}
+			return nil
+		})
+	}
+	waitDrained()
+
+	// Hold the lock, the leader loop pops the proposal but can't add it to the log.
+	var pindex uint64
+	for popped := false; !popped; {
+		n.Lock()
+		pindex = n.pindex
+		n.prop.push(newProposedEntry(newEntry(EntryNormal, binary.AppendVarint(nil, 1)), _EMPTY_, n.term))
+		for start := time.Now(); !popped && time.Since(start) < 100*time.Millisecond; {
+			popped = n.prop.len() == 0 && n.prop.inProgress() > 0
+			time.Sleep(time.Millisecond)
+		}
+		// The leader loop was waiting on the lock itself, try again.
+		if !popped {
+			n.Unlock()
+			waitDrained()
+		}
+	}
+
+	// A reader waiting on the lock gets it before the leader loop adds the proposal to the log.
+	drained := make(chan bool, 1)
+	term := n.term
+	go func() {
+		ok, _ := n.LogDrained(term)
+		drained <- ok
+	}()
+	time.Sleep(50 * time.Millisecond)
+	n.Unlock()
+	require_False(t, <-drained)
+
+	// Once drained, the log includes the proposal.
+	waitDrained()
+	index, _, _ := n.Progress()
+	require_True(t, index > pindex)
+}
+
+func TestNRGLogDrainedNotLeader(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Not the leader yet.
+	_, err := n.LogDrained(n.term)
+	require_Error(t, err, errNotLeader)
+
+	n.switchToCandidate()
+	n.switchToLeader()
+	term := n.term
+	_, err = n.LogDrained(term)
+	require_NoError(t, err)
+
+	// Not the leader in an older term.
+	_, err = n.LogDrained(term - 1)
+	require_Error(t, err, errNotLeader)
+
+	// Not the leader after stepping down, even if re-elected in a newer term.
+	require_NoError(t, n.StepDown())
+	_, err = n.LogDrained(term)
+	require_Error(t, err, errNotLeader)
+}
+
+func TestNRGSnapshotInCurrentTermAfterSend(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Provide peer vote interest so the isolation guard permits campaigning.
+	nc, err := nats.Connect(n.s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+	_, err = nc.SubscribeSync(n.vsubj)
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+
+	// Peers that never respond, so the sent snapshot isn't committed.
+	n.Lock()
+	n.addPeer("S1Nunr6R")
+	n.addPeer("yrzKKRBu")
+	n.Unlock()
+
+	// Become leader, without a snapshot yet.
+	n.switchToCandidate()
+	n.switchToLeader()
+	require_NoError(t, n.applyCommit(1))
+	require_Equal(t, n.snapfile, _EMPTY_)
+	require_False(t, n.SnapshotInCurrentTerm())
+
+	// A sent snapshot counts before it's committed and installed.
+	require_NoError(t, n.SendSnapshot(n.term, []byte("snapshot_data")))
+	require_Equal(t, n.snapfile, _EMPTY_)
+	require_True(t, n.SnapshotInCurrentTerm())
+
+	// Not in a newer term.
+	n.Lock()
+	n.term++
+	n.Unlock()
+	require_False(t, n.SnapshotInCurrentTerm())
 }

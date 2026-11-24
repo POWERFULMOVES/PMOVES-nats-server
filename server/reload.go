@@ -18,6 +18,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"reflect"
 	"slices"
@@ -54,6 +55,9 @@ type option interface {
 	// IsAuthChange indicates if this option requires reloading authorization.
 	IsAuthChange() bool
 
+	// IsAuthCalloutChange indicates if callout clients must authorize again.
+	IsAuthCalloutChange() bool
+
 	// IsTLSChange indicates if this option requires reloading TLS.
 	IsTLSChange() bool
 
@@ -85,6 +89,10 @@ func (n noopOption) IsTraceLevelChange() bool {
 }
 
 func (n noopOption) IsAuthChange() bool {
+	return false
+}
+
+func (n noopOption) IsAuthCalloutChange() bool {
 	return false
 }
 
@@ -306,6 +314,18 @@ type authOption struct {
 }
 
 func (o authOption) IsAuthChange() bool {
+	return true
+}
+
+// authCalloutOption closes callout clients when authentication settings change.
+type authCalloutOption struct {
+	authOption
+}
+
+// Authorization is reloaded after all options have been applied.
+func (o *authCalloutOption) Apply(s *Server) {}
+
+func (o *authCalloutOption) IsAuthCalloutChange() bool {
 	return true
 }
 
@@ -651,10 +671,26 @@ type maxPayloadOption struct {
 func (m *maxPayloadOption) Apply(server *Server) {
 	server.mu.Lock()
 	server.info.MaxPayload = m.newValue
+	info := server.copyInfo()
+	clients := make([]*client, 0, len(server.clients))
 	for _, client := range server.clients {
-		atomic.StoreInt32(&client.mpay, int32(m.newValue))
+		clients = append(clients, client)
 	}
 	server.mu.Unlock()
+
+	for _, client := range clients {
+		client.mu.Lock()
+		oldMpay := atomic.LoadInt32(&client.mpay)
+		if client.acc != nil {
+			client.applyAccountLimits()
+		} else {
+			atomic.StoreInt32(&client.mpay, m.newValue)
+		}
+		if oldMpay != atomic.LoadInt32(&client.mpay) {
+			client.sendAsyncInfo(info)
+		}
+		client.mu.Unlock()
+	}
 	server.Noticef("Reloaded: max_payload = %d", m.newValue)
 }
 
@@ -767,6 +803,16 @@ func (jso *jetStreamLimitsOption) Apply(s *Server) {
 
 func (jso *jetStreamLimitsOption) IsStatszChange() bool {
 	return true
+}
+
+// For changes to the server-wide JetStream limits.
+type jetStreamServerLimitsOption struct {
+	noopOption
+	newValue JSLimitOpts
+}
+
+func (jso *jetStreamServerLimitsOption) Apply(s *Server) {
+	s.Noticef("Reloaded: JetStream limits")
 }
 
 type defaultSentinelOption struct {
@@ -943,6 +989,23 @@ func getLeafNodeOptionsChanges(s *Server, old, new *LeafNodeOpts) (*leafNodeOpti
 		remoteErrFormat = "remote %s: %s"
 		maxAttempts     = 20
 	)
+
+	// Without a running server, only check the remotes of both configs.
+	if s == nil {
+		added := slices.Clone(new.Remotes)
+		for _, orlo := range old.Remotes {
+			var rlo *RemoteLeafOpts
+			// Remotes that are not found are removed, which is supported.
+			if rlo, added = getRemoteLeafOpts(orlo.name(), added); rlo == nil {
+				continue
+			}
+			if err := validateRemoteLeafOpts(orlo, rlo); err != nil {
+				return nil, fmt.Errorf(remoteErrFormat, rlo.safeName(), err)
+			}
+		}
+		return nil, nil
+	}
+
 	var (
 		nlo *leafNodeOption
 		// Track whether any existing remote was not found (i.e. removed).
@@ -986,14 +1049,7 @@ forLoop:
 			}
 			// Now we need to make sure that there are no changes that we don't
 			// support for a RemoteLeafOpts.
-			err := checkConfigsEqual(lrc.RemoteLeafOpts, rlo, []string{
-				"Compression",
-				"Disabled",
-				"TLS",
-				"TLSHandshakeFirst",
-				"TLSConfig",
-			})
-			if err != nil {
+			if err := validateRemoteLeafOpts(lrc.RemoteLeafOpts, rlo); err != nil {
 				lrc.RUnlock()
 				s.mu.RUnlock()
 				return nil, fmt.Errorf(remoteErrFormat, rlo.safeName(), err)
@@ -1054,6 +1110,30 @@ forLoop:
 	}
 
 	return nlo, nil
+}
+
+// validateRemoteLeafOpts ensures the new RemoteLeafOpts does not change some of the
+// fields that do not support reload.
+func validateRemoteLeafOpts(old, new *RemoteLeafOpts) error {
+	err := checkConfigsEqual(old, new, []string{
+		"Compression",
+		"Disabled",
+		"TLS",
+		"TLSHandshakeFirst",
+		"TLSConfig",
+		"Proxy",
+	})
+	if err != nil {
+		return err
+	}
+	// Proxy TLS is always applied, everything else in the proxy must be unchanged.
+	oldProxy, newProxy := old.Proxy, new.Proxy
+	oldProxy.TLSConfig, oldProxy.TLSTimeout = nil, 0
+	newProxy.TLSConfig, newProxy.TLSTimeout = nil, 0
+	if oldProxy != newProxy {
+		return fmt.Errorf("field %q: only the proxy TLS configuration can be changed", "Proxy")
+	}
+	return nil
 }
 
 func usersHaveChanged(ousers, nusers []*User) bool {
@@ -1139,6 +1219,8 @@ func (l *leafNodeOption) Apply(s *Server) {
 		lrc.Lock()
 		// TLSConfig is always applied.
 		lrc.TLSConfig = rlo.opts.TLSConfig.Clone()
+		lrc.Proxy.TLSConfig = rlo.opts.Proxy.TLSConfig.Clone()
+		lrc.Proxy.TLSTimeout = rlo.opts.Proxy.TLSTimeout
 		// Now update what has been detected has changed.
 		if rlo.tlsFirstChanged {
 			lrc.TLSHandshakeFirst = rlo.opts.TLSHandshakeFirst
@@ -1303,13 +1385,13 @@ func (s *Server) recheckPinnedCerts(curOpts *Options, newOpts *Options) {
 	disconnectClients := []*client{}
 	protoToPinned := map[int]PinnedCertSet{}
 	if !reflect.DeepEqual(newOpts.TLSPinnedCerts, curOpts.TLSPinnedCerts) {
-		protoToPinned[NATS] = curOpts.TLSPinnedCerts
+		protoToPinned[NATS] = newOpts.TLSPinnedCerts
 	}
 	if !reflect.DeepEqual(newOpts.MQTT.TLSPinnedCerts, curOpts.MQTT.TLSPinnedCerts) {
-		protoToPinned[MQTT] = curOpts.MQTT.TLSPinnedCerts
+		protoToPinned[MQTT] = newOpts.MQTT.TLSPinnedCerts
 	}
 	if !reflect.DeepEqual(newOpts.Websocket.TLSPinnedCerts, curOpts.Websocket.TLSPinnedCerts) {
-		protoToPinned[WS] = curOpts.Websocket.TLSPinnedCerts
+		protoToPinned[WS] = newOpts.Websocket.TLSPinnedCerts
 	}
 	for _, c := range s.clients {
 		if c.kind != CLIENT {
@@ -1409,28 +1491,83 @@ func (s *Server) Reload() error {
 	return s.ReloadOptions(newOpts)
 }
 
+// waitForStartup blocks until Start() has finished. It returns
+// ErrServerNotRunning if the server shuts down first.
+func (s *Server) waitForStartup() error {
+	select {
+	case <-s.startupComplete:
+		return nil
+	case <-s.quitCh:
+		return ErrServerNotRunning
+	}
+}
+
 // ReloadOptions applies any supported options from the provided Options
 // type. This returns an error if an option which doesn't support
 // hot-swapping was changed.
 // The provided Options type should not be re-used afterwards.
 // Either use Options.Clone() to pass a copy, or make a new one.
 func (s *Server) ReloadOptions(newOpts *Options) error {
+	// If the server is starting, wait for startup to finish;
+	// this avoids racing against the initial setup.
+	if s.isRunning() {
+		if err := s.waitForStartup(); err != nil {
+			return err
+		}
+	}
+
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
 
 	s.mu.Lock()
-
 	curOpts := s.getOpts()
-
-	clientOrgPort := curOpts.Port
-	clusterOrgPort := curOpts.Cluster.Port
-	gatewayOrgPort := curOpts.Gateway.Port
-	leafnodesOrgPort := curOpts.LeafNode.Port
-	websocketOrgPort := curOpts.Websocket.Port
-	mqttOrgPort := curOpts.MQTT.Port
-
+	newOpts = prepareReloadOptions(curOpts, newOpts)
 	s.mu.Unlock()
 
+	if err := s.reloadOptions(curOpts, newOpts); err != nil {
+		return err
+	}
+
+	s.recheckPinnedCerts(curOpts, newOpts)
+
+	s.varzMu.Lock()
+	s.mu.Lock()
+	s.configTime = time.Now().UTC()
+	s.updateVarzConfigReloadableFields(s.varz)
+	s.mu.Unlock()
+	s.varzMu.Unlock()
+	return nil
+}
+
+// CheckReloadOptions checks whether the provided Options can be reloaded, without
+// applying them. Errors that require a restart wrap ErrConfigReloadNotSupported.
+// The provided Options type should not be re-used afterwards.
+// Either use Options.Clone() to pass a copy, or make a new one.
+func (s *Server) CheckReloadOptions(newOpts *Options) error {
+	// If the server is starting, wait for startup to finish;
+	// this avoids racing against the initial setup.
+	if s.isRunning() {
+		if err := s.waitForStartup(); err != nil {
+			return err
+		}
+	}
+
+	// Comparing sorts the current options, so don't race a reload.
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+
+	s.mu.Lock()
+	curOpts := s.getOpts()
+	newOpts = prepareReloadOptions(curOpts, newOpts)
+	s.mu.Unlock()
+
+	_, err := checkReloadOptions(s, curOpts, newOpts)
+	return err
+}
+
+// prepareReloadOptions applies the command line flags and defaults to the new options,
+// so they can be compared against the current options.
+func prepareReloadOptions(curOpts, newOpts *Options) *Options {
 	// In case "-cluster ..." was provided through the command line, this will
 	// properly set the Cluster.Host/Port etc...
 	if l := curOpts.Cluster.ListenStr; l != _EMPTY_ {
@@ -1452,38 +1589,49 @@ func (s *Server) ReloadOptions(newOpts *Options) error {
 	// If that's the case, set it to the saved value when the accept loop was
 	// created.
 	if newOpts.Port == 0 {
-		newOpts.Port = clientOrgPort
+		newOpts.Port = curOpts.Port
 	}
 	// We don't do that for cluster, so check against -1.
 	if newOpts.Cluster.Port == -1 {
-		newOpts.Cluster.Port = clusterOrgPort
+		newOpts.Cluster.Port = curOpts.Cluster.Port
 	}
 	if newOpts.Gateway.Port == -1 {
-		newOpts.Gateway.Port = gatewayOrgPort
+		newOpts.Gateway.Port = curOpts.Gateway.Port
 	}
 	if newOpts.LeafNode.Port == -1 {
-		newOpts.LeafNode.Port = leafnodesOrgPort
+		newOpts.LeafNode.Port = curOpts.LeafNode.Port
 	}
 	if newOpts.Websocket.Port == -1 {
-		newOpts.Websocket.Port = websocketOrgPort
+		newOpts.Websocket.Port = curOpts.Websocket.Port
 	}
 	if newOpts.MQTT.Port == -1 {
-		newOpts.MQTT.Port = mqttOrgPort
+		newOpts.MQTT.Port = curOpts.MQTT.Port
 	}
+	return newOpts
+}
 
-	if err := s.reloadOptions(curOpts, newOpts); err != nil {
+// CheckReload checks whether a server running with the current options can reload the new options.
+// Errors that require a restart wrap ErrConfigReloadNotSupported.
+// Both options are changed by the check and should not be re-used.
+func CheckReload(curOpts, newOpts *Options) error {
+	setBaselineOptions(curOpts)
+	if err := validateOptions(curOpts); err != nil {
 		return err
 	}
+	return checkReload(curOpts, newOpts)
+}
 
-	s.recheckPinnedCerts(curOpts, newOpts)
-
-	s.varzMu.Lock()
-	s.mu.Lock()
-	s.configTime = time.Now().UTC()
-	s.updateVarzConfigReloadableFields(s.varz)
-	s.mu.Unlock()
-	s.varzMu.Unlock()
-	return nil
+// checkReload returns an error if going from the current to the new options
+// requires a restart instead of a reload, which wraps ErrConfigReloadNotSupported.
+// The current options must already be validated like on server startup.
+// Both options are changed by the check.
+// Checks that depend on the state of a running server are skipped.
+func checkReload(curOpts, newOpts *Options) error {
+	// A running server reloads from the same file, so ignore a different path.
+	newOpts.ConfigFile = curOpts.ConfigFile
+	newOpts = prepareReloadOptions(curOpts, newOpts)
+	_, err := checkReloadOptions(nil, curOpts, newOpts)
+	return err
 }
 func applyBoolFlags(newOpts, flagOpts *Options) {
 	// Reset fields that may have been set to `true` in
@@ -1513,6 +1661,22 @@ func applyBoolFlags(newOpts, flagOpts *Options) {
 // reloadOptions reloads the server config with the provided options. If an
 // option that doesn't support hot-swapping is changed, this returns an error.
 func (s *Server) reloadOptions(curOpts, newOpts *Options) error {
+	changed, err := checkReloadOptions(s, curOpts, newOpts)
+	if err != nil {
+		return err
+	}
+
+	// Create a context that is used to pass special info that we may need
+	// while applying the new options.
+	ctx := reloadContext{oldClusterPerms: curOpts.Cluster.Permissions}
+	s.setOpts(newOpts)
+	s.applyOptions(&ctx, changed)
+	return nil
+}
+
+// checkReloadOptions validates the new options and returns the options that have changed.
+// The server is nil when checking without a running server.
+func checkReloadOptions(s *Server, curOpts, newOpts *Options) ([]option, error) {
 	// Apply to the new options some of the options that may have been set
 	// that can't be configured in the config file (this can happen in
 	// applications starting NATS Server programmatically).
@@ -1525,20 +1689,9 @@ func (s *Server) reloadOptions(curOpts, newOpts *Options) error {
 	// may be set, etc... but that should be ok since the current options
 	// went through the same process on startup/previous reload.
 	if err := validateOptions(newOpts); err != nil {
-		return err
+		return nil, err
 	}
-
-	changed, err := s.diffOptions(newOpts)
-	if err != nil {
-		return err
-	}
-
-	// Create a context that is used to pass special info that we may need
-	// while applying the new options.
-	ctx := reloadContext{oldClusterPerms: curOpts.Cluster.Permissions}
-	s.setOpts(newOpts)
-	s.applyOptions(&ctx, changed)
-	return nil
+	return diffOptions(s, curOpts, newOpts)
 }
 
 // For the purpose of comparing, impose a order on slice data types where order does not matter
@@ -1579,10 +1732,9 @@ func imposeOrder(value any) error {
 
 // diffOptions returns a slice containing options which have been changed. If
 // an option that doesn't support hot-swapping is changed, this returns an
-// error.
-func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
+// error. The server is nil when checking without a running server.
+func diffOptions(s *Server, oldOpts, newOpts *Options) ([]option, error) {
 	var (
-		oldOpts   = s.getOpts()
 		oldConfig = reflect.ValueOf(oldOpts).Elem()
 		newConfig = reflect.ValueOf(newOpts).Elem()
 		diffOpts  = []option{}
@@ -1590,13 +1742,17 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 
 		// Need to keep track of whether JS is being disabled
 		// to prevent changing limits at runtime.
-		jsEnabled           = s.JetStreamEnabled()
+		jsEnabled           = oldOpts.JetStream
 		disableJS           bool
 		jsMemLimitsChanged  bool
 		jsFileLimitsChanged bool
 		jsStoreDirChanged   bool
 		jsLimitsUpdate      *jetStreamLimitsOption
 	)
+	// A running server knows whether JetStream actually started.
+	if s != nil {
+		jsEnabled = s.JetStreamEnabled()
+	}
 	for i := 0; i < oldConfig.NumField(); i++ {
 		field := oldConfig.Type().Field(i)
 		// field.PkgPath is empty for exported fields, and is not for unexported ones.
@@ -1700,14 +1856,22 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			// If there are added accounts, first make sure that we can look them up.
 			// If we can't let's fail the reload.
 			for _, acc := range co.accsAdded {
-				if _, err := s.LookupAccount(acc); err != nil {
+				var err error
+				if s != nil {
+					_, err = s.LookupAccount(acc)
+				} else if oldOpts.AccountResolver == nil && !isReservedAccount(acc) && acc != DEFAULT_SYSTEM_ACCOUNT &&
+					!slices.ContainsFunc(oldOpts.Accounts, func(a *Account) bool { return a.Name == acc }) {
+					// Without a running server, only accounts in the config can be looked up.
+					err = ErrMissingAccount
+				}
+				if err != nil {
 					return nil, fmt.Errorf("unable to add account %q to the list of dedicated routes: %v", acc, err)
 				}
 			}
 			// If pool_size has been set to negative (but was not before), then let's
 			// add the system account to the list of removed accounts (we don't have
 			// to check if already there, duplicates are ok in that case).
-			if newClusterOpts.PoolSize < 0 && oldClusterOpts.PoolSize >= 0 {
+			if s != nil && newClusterOpts.PoolSize < 0 && oldClusterOpts.PoolSize >= 0 {
 				if sys := s.SystemAccount(); sys != nil {
 					co.accsRemoved = append(co.accsRemoved, sys.GetName())
 				}
@@ -1747,7 +1911,7 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			// We can't move from no resolver to one. So check for that.
 			if (oldValue == nil && newValue != nil) ||
 				(oldValue != nil && newValue == nil) {
-				return nil, fmt.Errorf("config reload does not support moving to or from an account resolver")
+				return nil, fmt.Errorf("%w for moving to or from an account resolver", ErrConfigReloadNotSupported)
 			}
 			diffOpts = append(diffOpts, &accountsOption{})
 		case "accountresolvertlsconfig":
@@ -1779,8 +1943,8 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			// If there is really a change prevents reload.
 			if !reflect.DeepEqual(tmpOld, tmpNew) {
 				// See TODO(ik) note below about printing old/new values.
-				return nil, fmt.Errorf("config reload not supported for %s: old=%v, new=%v",
-					field.Name, oldValue, newValue)
+				return nil, fmt.Errorf("%w for %s: old=%v, new=%v",
+					ErrConfigReloadNotSupported, field.Name, oldValue, newValue)
 			}
 		case "leafnode":
 			tmpOld := oldValue.(LeafNodeOpts)
@@ -1790,7 +1954,7 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			// If there was an unsupported change, we will get an error with the name
 			// of the (first) field and its old and new value.
 			if err != nil {
-				return nil, fmt.Errorf("config reload not supported for %s: %v", field.Name, err)
+				return nil, fmt.Errorf("%w for %s: %v", ErrConfigReloadNotSupported, field.Name, err)
 			}
 			// If there was an actual change...
 			if lno != nil {
@@ -1817,7 +1981,7 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 					// Allow the change but error in case JS was not disabled.
 					jsStoreDirChanged = true
 				} else {
-					return nil, fmt.Errorf("config reload not supported for jetstream storage directory")
+					return nil, fmt.Errorf("%w for jetstream storage directory", ErrConfigReloadNotSupported)
 				}
 			}
 		case "jetstreammaxmemory", "jetstreammaxstore":
@@ -1857,10 +2021,19 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 					}
 				case fromUnset && toSet:
 					// Prevent changing from dynamic max memory / file at runtime.
-					return nil, fmt.Errorf("config reload not supported for jetstream dynamic max memory and store")
+					return nil, fmt.Errorf("%w for jetstream dynamic max memory and store", ErrConfigReloadNotSupported)
 				default:
-					return nil, fmt.Errorf("config reload not supported for decreasing jetstream max memory and store")
+					return nil, fmt.Errorf("%w for decreasing jetstream max memory and store", ErrConfigReloadNotSupported)
 				}
+			}
+		case "jetstreamlimits":
+			// Server-wide JetStream limits are enforced when assets are created or updated.
+			// Some limits, like MaxRequestBatch, MaxAckPending, Duplicates, are materialized
+			// into the asset's config, so existing assets keep the value they had originally.
+			new := newValue.(JSLimitOpts)
+			old := oldValue.(JSLimitOpts)
+			if new != old {
+				diffOpts = append(diffOpts, &jetStreamServerLimitsOption{newValue: new})
 			}
 		case "jetstreammetacompact", "jetstreammetacompactsize", "jetstreammetacompactsync":
 			// Allowed at runtime but monitorCluster looks at s.opts directly, so no further work needed here.
@@ -1868,8 +2041,8 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			// Not reloadable at runtime; preserve the current value while JetStream is disabled,
 			// e.g. the entire jetstream{} block was deleted.
 			if newOpts.JetStream {
-				return nil, fmt.Errorf("config reload not supported for %s: old=%v, new=%v",
-					field.Name, oldValue, newValue)
+				return nil, fmt.Errorf("%w for %s: old=%v, new=%v",
+					ErrConfigReloadNotSupported, field.Name, oldValue, newValue)
 			} else {
 				newOpts.JetStreamConcurrentIOs = oldValue.(int)
 			}
@@ -1882,8 +2055,8 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			// If there is really a change prevents reload.
 			if !reflect.DeepEqual(tmpOld, tmpNew) {
 				// See TODO(ik) note below about printing old/new values.
-				return nil, fmt.Errorf("config reload not supported for %s: old=%v, new=%v",
-					field.Name, oldValue, newValue)
+				return nil, fmt.Errorf("%w for %s: old=%v, new=%v",
+					ErrConfigReloadNotSupported, field.Name, oldValue, newValue)
 			}
 		case "mqtt":
 			diffOpts = append(diffOpts, &mqttAckWaitReload{newValue: newValue.(MQTTOpts).AckWait})
@@ -1904,8 +2077,8 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 
 			if !reflect.DeepEqual(tmpOld, tmpNew) {
 				// See TODO(ik) note below about printing old/new values.
-				return nil, fmt.Errorf("config reload not supported for %s: old=%v, new=%v",
-					field.Name, oldValue, newValue)
+				return nil, fmt.Errorf("%w for %s: old=%v, new=%v",
+					ErrConfigReloadNotSupported, field.Name, oldValue, newValue)
 			}
 			tmpNew.AckWait = newValue.(MQTTOpts).AckWait
 			tmpNew.MaxAckPending = newValue.(MQTTOpts).MaxAckPending
@@ -1937,20 +2110,20 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			if oldValue != _EMPTY_ && newValue == _EMPTY_ {
 				for _, user := range newOpts.Users {
 					if user.Username == oldValue {
-						return nil, fmt.Errorf("config reload not supported for %s: old=%v, new=%v",
-							field.Name, oldValue, newValue)
+						return nil, fmt.Errorf("%w for %s: old=%v, new=%v",
+							ErrConfigReloadNotSupported, field.Name, oldValue, newValue)
 					}
 				}
 			} else {
-				return nil, fmt.Errorf("config reload not supported for %s: old=%v, new=%v",
-					field.Name, oldValue, newValue)
+				return nil, fmt.Errorf("%w for %s: old=%v, new=%v",
+					ErrConfigReloadNotSupported, field.Name, oldValue, newValue)
 			}
 		case "defaultsentinel":
 			diffOpts = append(diffOpts, &defaultSentinelOption{newValue: newValue.(string)})
 		case "systemaccount":
 			if oldValue != DEFAULT_SYSTEM_ACCOUNT || newValue != _EMPTY_ {
-				return nil, fmt.Errorf("config reload not supported for %s: old=%v, new=%v",
-					field.Name, oldValue, newValue)
+				return nil, fmt.Errorf("%w for %s: old=%v, new=%v",
+					ErrConfigReloadNotSupported, field.Name, oldValue, newValue)
 			}
 		case "ocspconfig":
 			diffOpts = append(diffOpts, &ocspOption{newValue: newValue.(*OCSPConfig)})
@@ -1981,21 +2154,24 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			// the URL array.
 
 			// Bail out if attempting to reload any unsupported options.
-			return nil, fmt.Errorf("config reload not supported for %s: old=%v, new=%v",
-				field.Name, oldValue, newValue)
+			return nil, fmt.Errorf("%w for %s: old=%v, new=%v",
+				ErrConfigReloadNotSupported, field.Name, oldValue, newValue)
 		}
 	}
 
 	// If not disabling JS but limits have changed then it is an error.
 	if !disableJS {
 		if jsMemLimitsChanged || jsFileLimitsChanged {
-			return nil, fmt.Errorf("config reload not supported for jetstream max memory and max store")
+			return nil, fmt.Errorf("%w for jetstream max memory and max store", ErrConfigReloadNotSupported)
 		}
 		if jsStoreDirChanged {
-			return nil, fmt.Errorf("config reload not supported for jetstream storage dir")
+			return nil, fmt.Errorf("%w for jetstream storage dir", ErrConfigReloadNotSupported)
 		}
 	}
 
+	if s != nil && s.trustedKeys == nil && calloutInputsChanged(oldOpts, newOpts) {
+		diffOpts = append(diffOpts, &authCalloutOption{})
+	}
 	return diffOpts, nil
 }
 
@@ -2018,6 +2194,7 @@ func (s *Server) applyOptions(ctx *reloadContext, opts []option) {
 	var (
 		reloadLogging      = false
 		reloadAuth         = false
+		closeCallouts      = false
 		reloadClusterPerms = false
 		reloadClientTrcLvl = false
 		reloadJetstream    = false
@@ -2035,6 +2212,9 @@ func (s *Server) applyOptions(ctx *reloadContext, opts []option) {
 		}
 		if opt.IsAuthChange() {
 			reloadAuth = true
+		}
+		if opt.IsAuthCalloutChange() {
+			closeCallouts = true
 		}
 		if opt.IsClusterPoolSizeOrAccountsChange() {
 			co = opt.(*clusterOption)
@@ -2058,7 +2238,7 @@ func (s *Server) applyOptions(ctx *reloadContext, opts []option) {
 		s.reloadClientTraceLevel()
 	}
 	if reloadAuth {
-		s.reloadAuthorization()
+		s.reloadAuthorization(closeCallouts)
 	}
 	if reloadClusterPerms {
 		s.reloadClusterPermissions(ctx.oldClusterPerms)
@@ -2173,8 +2353,9 @@ func (s *Server) reloadClientTraceLevel() {
 
 // reloadAuthorization reconfigures the server authorization settings,
 // disconnects any clients who are no longer authorized, and removes any
-// unauthorized subscriptions.
-func (s *Server) reloadAuthorization() {
+// unauthorized subscriptions. Existing callout clients keep their
+// authorization unless closeCallouts is set or their account was removed.
+func (s *Server) reloadAuthorization(closeCallouts bool) {
 	// This map will contain the names of accounts that have their streams
 	// import configuration changed.
 	var awcsti map[string]struct{}
@@ -2257,10 +2438,12 @@ func (s *Server) reloadAuthorization() {
 		routes    = routesa[:0]
 	)
 
-	// Gather clients that changed accounts. We will close them and they
-	// will reconnect, doing the right thing.
+	// Gather clients that changed accounts or need a fresh callout decision.
+	// We will close them and they will reconnect, doing the right thing.
 	for _, client := range s.clients {
 		if s.clientHasMovedToDifferentAccount(client) {
+			cclients = append(cclients, client)
+		} else if closeCallouts && client.isAuthorizedByCallout() {
 			cclients = append(cclients, client)
 		} else {
 			clients = append(clients, client)
@@ -2321,14 +2504,28 @@ func (s *Server) reloadAuthorization() {
 	}
 
 	for _, c := range clients {
+		callout := c.kind == CLIENT && s.trustedKeys == nil && c.isAuthorizedByCallout()
 		// Disconnect any unauthorized clients.
-		// Ignore internal clients.
-		if (c.kind == CLIENT || c.kind == LEAF) && !s.isClientAuthorized(c) {
+		// Ignore internal clients and clients already authorized by callout.
+		if (c.kind == CLIENT || c.kind == LEAF) && !callout && !s.isClientAuthorized(c) {
 			c.authViolation()
 			continue
 		}
 		// Check to make sure account is correct.
 		c.swapAccountAfterReload()
+		if callout {
+			// Refresh account limits for clients that skipped reauthentication.
+			c.mu.Lock()
+			acc := c.acc
+			c.mu.Unlock()
+			if acc.maxTotalConnectionsExceeded() {
+				c.maxAccountConnExceeded()
+				continue
+			}
+			c.mu.Lock()
+			c.applyAccountLimits()
+			c.mu.Unlock()
+		}
 		// Remove any unauthorized subscriptions and check for account imports.
 		c.processSubsOnConfigReload(awcsti)
 	}
@@ -2369,8 +2566,21 @@ func (s *Server) clientHasMovedToDifferentAccount(c *client) bool {
 		nu *NkeyUser
 		u  *User
 	)
+	// In operator mode the account comes from the JWT, not config
+	if s.trustedKeys != nil {
+		return false
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// A client authorized by the auth callout is not in the configured users,
+	// so check only whether its account still exists.
+	if c.flags.isSet(authCallout) {
+		if c.acc == nil {
+			return true
+		}
+		_, ok := s.accounts.Load(c.acc.Name)
+		return !ok
+	}
 	if c.opts.Nkey != _EMPTY_ {
 		if s.nkeys != nil {
 			nu = s.nkeys[c.opts.Nkey]
@@ -2394,6 +2604,48 @@ func (s *Server) clientHasMovedToDifferentAccount(c *client) bool {
 	}
 	// user/nkey no longer exists.
 	return true
+}
+
+// calloutInputsChanged checks server tags and authentication settings that
+// affect which clients use the callout.
+func calloutInputsChanged(curOpts, newOpts *Options) bool {
+	if newOpts.AuthCallout == nil {
+		return false
+	}
+	if !slices.Equal(curOpts.Tags, newOpts.Tags) {
+		return true
+	}
+	if curOpts.Username != newOpts.Username || curOpts.Password != newOpts.Password ||
+		curOpts.Authorization != newOpts.Authorization || curOpts.NoAuthUser != newOpts.NoAuthUser ||
+		curOpts.TLSMap != newOpts.TLSMap || curOpts.TLSVerify != newOpts.TLSVerify ||
+		curOpts.ProxyRequired != newOpts.ProxyRequired {
+		return true
+	}
+	return staticAuthChanged(curOpts.Users, newOpts.Users, curOpts.Nkeys, newOpts.Nkeys)
+}
+
+// staticAuthChanged compares authentication fields, ignoring permissions.
+// diffOptions must sort Users and Nkeys before this comparison.
+func staticAuthChanged(curUsers, newUsers []*User, curNkeys, newNkeys []*NkeyUser) bool {
+	if len(curUsers) != len(newUsers) || len(curNkeys) != len(newNkeys) {
+		return true
+	}
+	for i, u := range curUsers {
+		v := newUsers[i]
+		if u.Username != v.Username || u.Password != v.Password || u.Account.GetName() != v.Account.GetName() ||
+			!u.ConnectionDeadline.Equal(v.ConnectionDeadline) ||
+			u.ProxyRequired != v.ProxyRequired || !maps.Equal(u.AllowedConnectionTypes, v.AllowedConnectionTypes) {
+			return true
+		}
+	}
+	for i, u := range curNkeys {
+		v := newNkeys[i]
+		if u.Nkey != v.Nkey || u.Account.GetName() != v.Account.GetName() || u.ProxyRequired != v.ProxyRequired ||
+			!maps.Equal(u.AllowedConnectionTypes, v.AllowedConnectionTypes) {
+			return true
+		}
+	}
+	return false
 }
 
 // reloadClusterPermissions reconfigures the cluster's permssions
@@ -2780,12 +3032,12 @@ func (s *Server) reloadClusterPoolAndAccounts(co *clusterOption, opts *Options) 
 // fields that do not support reload.
 func validateClusterOpts(old, new ClusterOpts) error {
 	if old.Host != new.Host {
-		return fmt.Errorf("config reload not supported for cluster host: old=%s, new=%s",
-			old.Host, new.Host)
+		return fmt.Errorf("%w for cluster host: old=%s, new=%s",
+			ErrConfigReloadNotSupported, old.Host, new.Host)
 	}
 	if old.Port != new.Port {
-		return fmt.Errorf("config reload not supported for cluster port: old=%d, new=%d",
-			old.Port, new.Port)
+		return fmt.Errorf("%w for cluster port: old=%d, new=%d",
+			ErrConfigReloadNotSupported, old.Port, new.Port)
 	}
 	// Validate Cluster.Advertise syntax
 	if new.Advertise != "" {

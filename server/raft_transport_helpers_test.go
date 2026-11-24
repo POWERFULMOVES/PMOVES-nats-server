@@ -84,6 +84,20 @@ func (h *raftTransportHub) healPartitions() {
 	clear(h.partitions)
 }
 
+func (h *raftTransportHub) sufficientInterest(nodeID, subject string, qn int) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	partition := h.partitions[nodeID]
+	var c int
+	// Count our own vote subscription too, matching the default transport.
+	for id, transport := range h.transports {
+		if h.partitions[id] == partition && transport.sub != nil && transport.sub.HasInterest(subject) {
+			c++
+		}
+	}
+	return c >= qn
+}
+
 // Set a hook that is called back after a message is published. The after
 // message hook can expect the raftTransportHub to be unlocked. It is OK
 // to interact with the raftTransportHub inside the message hook. On the
@@ -101,6 +115,7 @@ func (h *raftTransportHub) publish(t *mockTransport, subject, reply string, msg 
 	afterMsgHook := h.afterMsg
 	sender := t.Node().ID()
 	partition := h.partitions[sender]
+	var subscriptions []*subscription
 
 	for id, transport := range h.transports {
 		if sender == id {
@@ -111,12 +126,16 @@ func (h *raftTransportHub) publish(t *mockTransport, subject, reply string, msg 
 			continue
 		}
 
-		res := transport.sub.Match(subject)
-		for _, sub := range res.psubs {
-			sub.icb(sub, nil, transport.acc, subject, reply, msg)
-		}
+		result := transport.sub.Match(subject)
+		subscriptions = append(subscriptions, result.psubs...)
 	}
 	h.mu.Unlock()
+
+	// Deliver without holding the hub lock, to avoid a lock inversion between
+	// Raft and hub locks.
+	for _, sub := range subscriptions {
+		sub.icb(sub, nil, nil, subject, reply, msg)
+	}
 
 	if afterMsgHook != nil {
 		afterMsgHook(subject, reply, msg)
@@ -149,6 +168,10 @@ func (t *mockTransport) Node() RaftNode {
 
 func (t *mockTransport) Account() *Account {
 	return t.acc
+}
+
+func (t *mockTransport) SufficientInterest(subject string, qn int) bool {
+	return t.hub.sufficientInterest(t.Node().ID(), subject, qn)
 }
 
 func (t *mockTransport) Publish(subject string, reply string, msg []byte) {

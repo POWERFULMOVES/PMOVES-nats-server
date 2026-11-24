@@ -1,4 +1,4 @@
-// Copyright 2018-2025 The NATS Authors
+// Copyright 2018-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -591,6 +591,104 @@ func TestGatewayRejectsInfoBeforeConnect(t *testing.T) {
 	}
 	if !strings.Contains(l, "Authorization Violation") {
 		t.Fatalf("Expected authorization violation, got %q", l)
+	}
+}
+
+// Verify that receiving A-/A+ on an inbound gateway connection closes the
+// connection with a protocol violation.
+func TestGatewayAccountSubUnsubOnInboundProtocolViolation(t *testing.T) {
+	o := testDefaultOptionsForGateway("A")
+	s := runGatewayServer(o)
+	defer s.Shutdown()
+
+	for _, proto := range []string{"A- foo\r\n", "A+ foo\r\n"} {
+		t.Run(strings.TrimSpace(proto), func(t *testing.T) {
+			gwconn, err := net.Dial("tcp", net.JoinHostPort(o.Gateway.Host, strconv.Itoa(o.Gateway.Port)))
+			if err != nil {
+				t.Fatalf("Error dialing server: %v", err)
+			}
+			defer gwconn.Close()
+
+			br := bufio.NewReaderSize(gwconn, maxBufSize)
+			if _, err := br.ReadString('\n'); err != nil {
+				t.Fatalf("Error receiving initial INFO from server: %v", err)
+			}
+
+			// Send a CONNECT so that the connection is registered as an
+			// inbound gateway, then the A-/A+ protocol.
+			if _, err := fmt.Fprintf(gwconn, "CONNECT {\"gateway\":\"B\",\"name\":\"x\"}\r\n%s", proto); err != nil {
+				t.Fatalf("Error sending gateway CONNECT: %v", err)
+			}
+
+			// The server should close the connection (protocol violation).
+			if err := gwconn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				t.Fatalf("Error setting read deadline: %v", err)
+			}
+			var rerr error
+			for rerr == nil {
+				_, rerr = br.ReadString('\n')
+			}
+			if ne, ok := rerr.(net.Error); ok && ne.Timeout() {
+				t.Fatalf("Expected connection to be closed by the server, got timeout")
+			}
+			waitForInboundGateways(t, s, 0, 2*time.Second)
+		})
+	}
+}
+
+// Verify that receiving a message (RMSG/HMSG) on an outbound gateway connection
+// closes the connection with a protocol violation before buffering any payload.
+func TestGatewayMsgOnOutboundProtocolViolation(t *testing.T) {
+	ob := testDefaultOptionsForGateway("B")
+	sb := runGatewayServer(ob)
+	defer sb.Shutdown()
+
+	oa := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+	sa := runGatewayServer(oa)
+	defer sa.Shutdown()
+
+	waitForOutboundGateways(t, sa, 1, 2*time.Second)
+	waitForInboundGateways(t, sb, 1, 2*time.Second)
+
+	for _, proto := range []string{"RMSG $G foo 2\r\n", "HMSG $G foo 0 2\r\n"} {
+		t.Run(strings.TrimSpace(proto), func(t *testing.T) {
+			// A's outbound connection to B.
+			gwa := sa.getOutboundGatewayConnection("B")
+			if gwa == nil {
+				t.Fatalf("Outbound gateway connection to B not found")
+			}
+			// B's inbound connection from A: what it writes is read by A's
+			// outbound connection, which should never receive an RMSG/HMSG.
+			var gws []*client
+			sb.getInboundGatewayConnections(&gws)
+			if len(gws) != 1 {
+				t.Fatalf("Expected 1 inbound gateway on B, got %v", len(gws))
+			}
+			gwb := gws[0]
+			gwb.mu.Lock()
+			gwb.enqueueProto([]byte(proto))
+			gwb.mu.Unlock()
+
+			// A's outbound connection should be closed immediately upon
+			// receiving the header line, without waiting for the payload.
+			checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+				gwa.mu.Lock()
+				closed := gwa.isClosed()
+				gwa.mu.Unlock()
+				if !closed {
+					return fmt.Errorf("Outbound gateway connection should have been closed")
+				}
+				return nil
+			})
+			// A should reconnect to B.
+			checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+				if gw := sa.getOutboundGatewayConnection("B"); gw == nil || gw == gwa {
+					return fmt.Errorf("Outbound gateway connection to B not re-established")
+				}
+				return nil
+			})
+			waitForInboundGateways(t, sb, 1, 2*time.Second)
+		})
 	}
 }
 
@@ -1338,6 +1436,8 @@ func TestGatewayImplicitReconnect(t *testing.T) {
 	// Shutdown s1, remove the gateway from A to B and restart.
 	s1.Shutdown()
 	o1.Gateway.Gateways = o1.Gateway.Gateways[:0]
+	// Only the gateway port needs to be reused, others could be taken in the meantime.
+	o1.Port, o1.Cluster.Port = -1, -1
 	s1 = runGatewayServer(o1)
 	defer s1.Shutdown()
 
@@ -6133,6 +6233,66 @@ func TestGatewaySingleOutbound(t *testing.T) {
 	}
 }
 
+func TestGatewayLegacyGRPrefixReservedOnClientIngress(t *testing.T) {
+	ob := testDefaultOptionsForGateway("B")
+	sb := runGatewayServer(ob)
+	defer sb.Shutdown()
+
+	oa := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+	oa.Users = []*User{{
+		Username:    "denied",
+		Password:    "pwd",
+		Permissions: &Permissions{Publish: &SubjectPermission{Deny: []string{"foo"}}},
+	}}
+	sa := runGatewayServer(oa)
+	defer sa.Shutdown()
+
+	waitForOutboundGateways(t, sa, 1, 2*time.Second)
+	waitForOutboundGateways(t, sb, 1, 2*time.Second)
+
+	ncb := natsConnect(t, fmt.Sprintf("nats://%s:%d", ob.Host, ob.Port))
+	defer ncb.Close()
+	subB := natsSubSync(t, ncb, "foo")
+	natsFlush(t, ncb)
+
+	errCh := make(chan string, 8)
+	nca := natsConnect(t, fmt.Sprintf("nats://denied:pwd@%s:%d", oa.Host, oa.Port),
+		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) { errCh <- err.Error() }))
+	defer nca.Close()
+	// Cluster B re-sends un-prefixed replies to gateways with interest, so
+	// also make sure nothing comes back to A.
+	subA := natsSubSync(t, nca, "foo")
+	natsFlush(t, nca)
+
+	expectViolation := func(what string) {
+		t.Helper()
+		select {
+		case e := <-errCh:
+			if !strings.Contains(e, "Permissions Violation") {
+				t.Fatalf("Unexpected error: %v", e)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("Expected permissions violation for %s", what)
+		}
+		for _, sub := range []*nats.Subscription{subB, subA} {
+			if m, err := sub.NextMsg(100 * time.Millisecond); err == nil {
+				t.Fatalf("Unexpected delivery on %q: %q", m.Subject, m.Data)
+			}
+		}
+	}
+
+	legacy := oldGWReplyPrefix + "abcd.foo"
+	for _, subj := range []string{"foo", string(sb.gateway.replyPfx) + "foo", legacy} {
+		natsPub(t, nca, subj, []byte("msg"))
+		natsFlush(t, nca)
+		expectViolation("publish on " + subj)
+	}
+	// The legacy prefix must also be rejected as a reply subject.
+	natsPubReq(t, nca, "bar", legacy, []byte("req"))
+	natsFlush(t, nca)
+	expectViolation("reply on " + legacy)
+}
+
 func TestGatewayReplyMapTracking(t *testing.T) {
 	// Increase the recSubExp value on servers so we have time
 	// to check the replies mapping structures.
@@ -6531,6 +6691,40 @@ func TestGatewayPings(t *testing.T) {
 	defer sb.Shutdown()
 
 	oa := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+	sa := RunServer(oa)
+	defer sa.Shutdown()
+
+	waitForInboundGateways(t, sa, 1, 2*time.Second)
+	waitForOutboundGateways(t, sa, 1, 2*time.Second)
+	waitForInboundGateways(t, sb, 1, 2*time.Second)
+	waitForOutboundGateways(t, sb, 1, 2*time.Second)
+
+	c := sa.getOutboundGatewayConnection("B")
+	ch := make(chan struct{}, 1)
+	c.mu.Lock()
+	c.nc = &capturePingConn{c.nc, ch}
+	c.mu.Unlock()
+
+	for i := 0; i < 5; i++ {
+		select {
+		case <-ch:
+		case <-time.After(250 * time.Millisecond):
+			t.Fatalf("Did not send PING")
+		}
+	}
+}
+
+func TestGatewayCustomPing(t *testing.T) {
+	pingInterval := 50 * time.Millisecond
+
+	ob := testDefaultOptionsForGateway("B")
+	ob.Gateway.PingInterval = pingInterval
+	ob.Gateway.MaxPingsOut = 2
+	sb := RunServer(ob)
+	defer sb.Shutdown()
+
+	oa := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+	oa.Gateway.PingInterval = pingInterval
 	sa := RunServer(oa)
 	defer sa.Shutdown()
 
@@ -7859,4 +8053,124 @@ func TestGatewayProcessRSubNoBlockingAccountFetch(t *testing.T) {
 	ei, ok = c2.gw.outsim.Load(accPub)
 	require_True(t, ok)
 	require_True(t, ei.(*outsie).sl.CacheEnabled())
+}
+
+func TestGatewayLogsRemoteURL(t *testing.T) {
+	o2 := testDefaultOptionsForGateway("B")
+	o2.ServerName = "gw-b"
+	o2.Gateway.Username = remoteURLLogUser
+	o2.Gateway.Password = remoteURLLogPassword
+	s2 := runGatewayServer(o2)
+	defer s2.Shutdown()
+
+	gwHost := fmt.Sprintf("localhost:%d", s2.GatewayAddr().Port)
+	u := &url.URL{Scheme: "nats", Host: gwHost, User: url.UserPassword(remoteURLLogUser, remoteURLLogPassword)}
+	o1 := testGatewayOptionsFromToWithURLs(t, "A", "B", []string{u.String()})
+	o1.Gateway.resolver = &localhostResolver{}
+	s1, l := runServerWithNoticeLogger(t, o1)
+	defer s1.Shutdown()
+
+	waitForOutboundGateways(t, s1, 1, 2*time.Second)
+	checkNoticeContains(t, l, `Creating outbound gateway connection to "B" (`+gwHost+")")
+
+	s2.Shutdown()
+	checkNoticeContains(t, l, "Gateway connection closed: "+ClientClosed.String()+" - Remote: "+s2.Name()+", Host: "+gwHost)
+	s1.Shutdown()
+	checkNoticeNotContains(t, l, remoteURLLogUser, remoteURLLogPassword)
+}
+
+// A message can still be in flight from the remote when the last subscription
+// on an interest-only account goes away. Its arrival must not produce an A-:
+// that would take the account out of interest-only mode on both sides, the
+// following A+ would leave the remote with no entry for the account, and an
+// interest-only remote then never sends on it again.
+func TestGatewayNoAccountUnsubInInterestOnlyMode(t *testing.T) {
+	ob := testDefaultOptionsForGateway("B")
+	sb := runGatewayServer(ob)
+	defer sb.Shutdown()
+
+	oa := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+	sa := runGatewayServer(oa)
+	defer sa.Shutdown()
+
+	waitForOutboundGateways(t, sa, 1, time.Second)
+	waitForOutboundGateways(t, sb, 1, time.Second)
+	waitForInboundGateways(t, sa, 1, time.Second)
+	waitForInboundGateways(t, sb, 1, time.Second)
+
+	ncA := natsConnect(t, sa.ClientURL())
+	defer ncA.Close()
+	sub := natsSubSync(t, ncA, "foo")
+	natsFlush(t, ncA)
+	checkGWInterestOnlyModeInterestOn(t, sb, "A", globalAccountName, "foo")
+
+	natsUnsub(t, sub)
+	natsFlush(t, ncA)
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		c := sb.getOutboundGatewayConnection("A")
+		ei, _ := c.gw.outsim.Load(globalAccountName)
+		if ei == nil {
+			return fmt.Errorf("no entry for account %q", globalAccountName)
+		}
+		if r := ei.(*outsie).sl.Match("foo"); len(r.psubs) != 0 {
+			return fmt.Errorf("interest on %q still registered", "foo")
+		}
+		return nil
+	})
+
+	// Deliver, on A, a message from B that crossed the RS- for "foo": the
+	// account now has no subscriptions at all.
+	var gws []*client
+	sa.getInboundGatewayConnections(&gws)
+	require_Len(t, len(gws), 1)
+	acc := sa.globalAccount()
+	sa.gatewayHandleSubjectNoInterest(gws[0], acc, []byte(acc.Name), []byte("foo"))
+
+	sub = natsSubSync(t, ncA, "bar")
+	natsFlush(t, ncA)
+	checkGWInterestOnlyMode(t, sb, "A", globalAccountName)
+	checkGWInterestOnlyModeInterestOn(t, sb, "A", globalAccountName, "bar")
+
+	ncB := natsConnect(t, sb.ClientURL())
+	defer ncB.Close()
+	natsPub(t, ncB, "bar", []byte("hello"))
+	natsFlush(t, ncB)
+	natsNexMsg(t, sub, time.Second)
+}
+
+// Same as above, but the message arrives while the account is switching to
+// interest-only mode, before the switch completes.
+func TestGatewayNoAccountUnsubWhileSwitchingToInterestOnlyMode(t *testing.T) {
+	ob := testDefaultOptionsForGateway("B")
+	sb := runGatewayServer(ob)
+	defer sb.Shutdown()
+
+	oa := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+	sa := runGatewayServer(oa)
+	defer sa.Shutdown()
+
+	waitForOutboundGateways(t, sa, 1, time.Second)
+	waitForOutboundGateways(t, sb, 1, time.Second)
+	waitForInboundGateways(t, sa, 1, time.Second)
+	waitForInboundGateways(t, sb, 1, time.Second)
+	checkGWInterestOnlyMode(t, sb, "A", globalAccountName)
+
+	var gws []*client
+	sa.getInboundGatewayConnections(&gws)
+	require_Len(t, len(gws), 1)
+	gwc := gws[0]
+	gwc.mu.Lock()
+	e := gwc.gw.insim[globalAccountName]
+	require_NotNil(t, e)
+	e.mode = Transitioning
+	gwc.mu.Unlock()
+
+	acc := sa.globalAccount()
+	sa.gatewayHandleSubjectNoInterest(gwc, acc, []byte(acc.Name), []byte("foo"))
+
+	gwc.mu.Lock()
+	e = gwc.gw.insim[globalAccountName]
+	gwc.mu.Unlock()
+	require_NotNil(t, e)
+	checkGWInterestOnlyMode(t, sb, "A", globalAccountName)
 }
